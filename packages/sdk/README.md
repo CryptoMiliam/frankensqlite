@@ -9,12 +9,16 @@ Current behavior:
   runtime through `@frankensqlite/worker`.
 - `execute`, `executeBatch`, `executeMany`, `query`, `prepare`, `export`, and `transaction`
   are exposed as Promise-based APIs.
-- `indexeddb-snapshot` provides opt-in, explicit whole-database checkpoints.
-  It is not a page-level VFS or automatic per-SQL-commit persistence.
+- `opfs-snapshot` and `indexeddb-snapshot` provide explicit whole-database
+  checkpoints. Call `db.checkpoint()` after committing writes you want to keep.
 - `memory` remains the default. Passing `opfs` or `indexeddb` still surfaces
   an explicit error; their page-level storage backends are not implemented.
 
 ## Example
+
+The package exports ES modules and CommonJS with matching TypeScript declarations.
+The default worker factory loads a dedicated browser module worker. Applications
+that bundle their own worker can use the `@frankensqlite/sdk/worker` entry.
 
 ```ts
 import { FrankenDB } from "@frankensqlite/sdk";
@@ -115,7 +119,8 @@ the batch settles; aborting a finished operation does not affect later work.
 
 ## Explicit browser checkpoints
 
-Use a stable name and explicitly await `checkpoint()` after committing SQL:
+Choose `opfs-snapshot` or `indexeddb-snapshot`, use a stable name and await
+`checkpoint()` after committing SQL.
 
 ```ts
 const db = await FrankenDB.open({
@@ -139,7 +144,9 @@ termination discards writes made since the last successful checkpoint. This
 explicit mode must not be confused with automatic IndexedDB/OPFS page
 persistence or native FrankenSQLite MVCC across browser tabs.
 
-The worker holds its request queue through export, hashing, and an atomic
+The worker holds its request queue through export, hashing and publication.
+With `opfs-snapshot`, a Web Lock protects the revision check and replacement
+of the checkpoint file. With `indexeddb-snapshot`, publication uses an atomic
 IndexedDB compare-and-swap transaction. The SDK resolves only after that
 transaction completes, not when its `put()` request succeeds. Publication
 requests `durability: "strict"` and rejects browsers that do not expose that
@@ -211,10 +218,19 @@ uses the production SDK/worker, a transactional IndexedDB model, and Node's
 SQLite reference engine; run it with an ESM TypeScript resolver honoring the
 workspace's `@frankensqlite/worker` alias. It is not a WASM certificate.
 
-At implementation time, model and reference-SQL tests passed; the actual
-Chromium local test page was blocked by the execution environment's managed
-URL policy. No policy was changed. Real browser/WASM and Rust release gates
-must still be executed before claiming browser persistence certification.
+To run the public SDK and worker against a built WASM core on both backends,
+set `FSQLITE_WASM_BROWSER_MODULE` to the web-target JavaScript binding. Its
+matching `_bg.wasm` file must be alongside it. Use the worker feature set
+documented in `crates/fsqlite-wasm/README.md`.
+
+```sh
+FSQLITE_WASM_BROWSER_MODULE=/path/to/frankensqlite_wasm.js \
+  node --test packages/worker/tests/snapshot-store.browser.test.mjs
+```
+
+The SQL cases checkpoint a row, insert another, then terminate the page and
+worker. A fresh worker must recover the acknowledged revision and only the
+checkpointed row, and pass `PRAGMA integrity_check`.
 
 ## Transactions and connection ownership
 
@@ -288,7 +304,10 @@ does not release an unsuccessfully rolled-back child into its parent.
 `close()` stops admitting new requests, completes previously admitted worker
 requests, and shares one completion promise across repeated calls. A worker
 crash or disposal rejects pending and future calls rather than leaving promises
-unsettled. Failed initialization also releases the worker's resources.
+unsettled. When the worker channel fails and can no longer acknowledge a close,
+the SDK terminates the worker automatically, releasing any exclusive snapshot
+lock. A fresh connection can reopen the last acknowledged checkpoint. Failed
+initialization also releases the worker's resources.
 
 ## Streaming imports
 
@@ -445,49 +464,49 @@ accounting rather than a JavaScript heap measurement. Stream `maxBatchBytes`
 and request accounting have different envelope allowances; choose stream chunks
 that fit both budgets. Independent connections still execute independently.
 
-## Manual npm Release
+## Test the packed SDK
 
-For v0.2.0, release preparation and publication are manual. No GitHub Actions
-run is required or used, and a green workflow is not release authorization.
-Publish the browser packages in dependency order:
-
-1. `@frankensqlite/core`
-2. `@frankensqlite/worker`
-3. `@frankensqlite/sdk`
-
-Start from the exact, clean release commit. Build the worker-compatible core
-archive and validate the worker and SDK against it, then publish the exact core
-and worker versions before packaging the SDK. Inspect the SDK package without
-publishing it, then create the release tarball in a dedicated artifact
-directory:
+From the workspace root, run `npm run test:packed-sdk` to install the SDK and
+worker archives in a fresh consumer and check ES module, CommonJS and strict
+TypeScript imports. To exercise browser SQL as well, supply a worker-compatible
+core tarball and install Playwright Chromium or set `FSQLITE_CHROMIUM_PATH`.
 
 ```bash
-npm pack --workspace @frankensqlite/sdk --dry-run
-mkdir -p artifacts/npm
-npm pack --workspace @frankensqlite/sdk --pack-destination artifacts/npm
+FSQLITE_WASM_CORE_TARBALL=/absolute/path/to/core.tgz npm run test:packed-sdk
 ```
 
-The package's `prepack` script reruns typechecking, tests, and the TypeScript
-build so the inspected or published package is built from the current source.
-The pack listing must contain the expected `dist/` entries, `README.md`,
-`LICENSE`, and `package.json`, and no source, test, or unrelated repository
-files. Install and smoke-test the resulting
-`artifacts/npm/frankensqlite-sdk-0.2.0.tgz`; that exact archive is the only SDK
-payload eligible for publication. Publish only after
-`@frankensqlite/core@0.2.0` and `@frankensqlite/worker@0.2.0` are available from
-the registry. Do not substitute an older `dist/` tree or a package built from
-a different commit.
+The browser test checkpoints a row with the default worker and reopens it with
+the exported SDK worker entry.
 
-After those checks and the project-wide release gates pass, publish the exact
-tested archive under the staging dist-tag:
+## Manual npm Release
+
+Start from the clean release commit. Build the worker-compatible core archive
+and verify its size budgets. Set `FSQLITE_WASM_CORE_TARBALL` to its absolute
+path and run the following commands from the repository root.
+[Required core build](https://github.com/Dicklesworthstone/frankensqlite/tree/main/packages/worker#required-core-build)
 
 ```bash
-npm publish artifacts/npm/frankensqlite-sdk-0.2.0.tgz --access public --tag next
+npm run typecheck:wasm-browser
+npm test
+FSQLITE_WASM_CORE_TARBALL="${FSQLITE_WASM_CORE_TARBALL:?set the path to the core archive}" npm run test:packed-sdk
+```
+
+After Chromium reopens the checkpoint, the last line prints the worker and SDK
+archive paths. Retain those files in the release artifact directory and set
+`WORKER_TARBALL` and `SDK_TARBALL` to their paths. Inspect each tar listing for
+the expected build output, package metadata, documentation and license. After
+the project-wide release gates pass, publish the tested archives in dependency
+order, confirming each version is available before publishing its dependent.
+
+```bash
+npm publish "${FSQLITE_WASM_CORE_TARBALL:?}" --access public --tag next
+npm publish "${WORKER_TARBALL:?}" --access public --tag next
+npm publish "${SDK_TARBALL:?}" --access public --tag next
 ```
 
 The manifest pins publication to the public npm registry with public access.
 After all three packages have been verified from clean registry installs,
-promote `latest` in dependency order: core, worker, then SDK.
+promote `latest` in the same dependency order.
 
 ## License
 

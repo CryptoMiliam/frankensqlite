@@ -12,25 +12,22 @@ impl Connection {
         let max_errors = integrity_check_error_limit(pragma.value.as_ref());
         let scope = integrity_check_table_scope(pragma.value.as_ref());
         let mut failures = Vec::new();
-        // bd-svwm7: a lock conflict is not a verdict. Stock SQLite fails the
-        // statement with SQLITE_BUSY, so busy_timeout and the autocommit retry
-        // apply; folding it into a row reported "database is busy" as though the
-        // database were damaged. Only genuine findings become rows.
-        if let Err(error) = self.validate_database_integrity(quick).await {
-            if error.is_transient() {
-                return Err(error);
-            }
-            failures.push(error.to_string());
+        let mut remaining = max_errors;
+        let namespace = pragma_schema_scope(pragma);
+        let schema = match scope.as_deref() {
+            Some(table) => self.integrity_table_database(table, namespace)?,
+            None if namespace == PragmaSchemaScope::Temp => "temp".to_owned(),
+            None => "main".to_owned(),
+        };
+        if is_builtin_schema(&schema) {
+            self.collect_integrity_findings(&schema, quick, scope.as_deref(), &mut remaining, &mut failures)
+                .await?;
         } else {
-            // Rows are only readable once the B-trees they live in are sound.
-            match self
-                .integrity_check_row_constraints(scope.as_deref(), max_errors)
-                .await
-            {
-                Ok(reports) => failures.extend(reports),
-                Err(error) if error.is_transient() => return Err(error),
-                Err(error) => failures.push(error.to_string()),
-            }
+            self.with_attached_connection_async(&schema, async |child| {
+                child.collect_integrity_findings(&schema, quick, scope.as_deref(), &mut remaining, &mut failures)
+                    .await
+            })
+            .await?;
         }
 
         // Qualified attached PRAGMAs already delegate to their child Connection.
@@ -39,6 +36,12 @@ impl Connection {
         // A table argument is a partial check, not a request to inspect the
         // same table name (or unrelated corruption) in every attached schema.
         if pragma.name.schema.is_none() && scope.is_none() {
+            // Stock visits main, TEMP and then the attached files in order.
+            // TEMP has connection-local rows and no separate file to lock.
+            if remaining > 0 && !self.temp_table_names.borrow().is_empty() {
+                self.collect_integrity_findings("temp", quick, None, &mut remaining, &mut failures)
+                    .await?;
+            }
             let attached_schemas = self
                 .attached_schemas
                 .borrow()
@@ -48,30 +51,11 @@ impl Connection {
                 .map(str::to_owned)
                 .collect::<Vec<_>>();
             for schema in attached_schemas {
-                // N caps all findings, not just structural errors, across
-                // the entire traversal. Do not reset the budget per schema.
-                if failures.len() >= max_errors {
-                    break;
-                }
-                let remaining = max_errors - failures.len();
-                match self
-                    .with_attached_connection_async(&schema, async |child| {
-                        // A sound B-tree does not establish that its stored
-                        // rows obey NOT NULL/CHECK constraints. Apply exactly
-                        // the same second phase as the main-database check.
-                        child.validate_database_integrity(quick).await?;
-                        child.integrity_check_row_constraints(None, remaining).await
-                    })
-                    .await
-                {
-                    // SQLite's row-constraint diagnostics are not prefixed
-                    // with the database name, including for attached tables.
-                    Ok(reports) => failures.extend(reports),
-                    Err(error) if error.is_transient() => return Err(error),
-                    Err(error) => {
-                        failures.push(format!("*** in database {schema} ***\n{error}"));
-                    }
-                }
+                self.with_attached_connection_async(&schema, async |child| {
+                    child.collect_integrity_findings(&schema, quick, None, &mut remaining, &mut failures)
+                        .await
+                })
+                .await?;
             }
         }
 
@@ -99,7 +83,12 @@ impl Connection {
         // only makes the condition discoverable so a user knows the one-time
         // first-open migration will reclaim it. Appended AFTER the verdict, so
         // an oracle that reads the first row still observes "ok".
-        for shadow in self.orphaned_fts5_content_shadow_names() {
+        for shadow in self.orphaned_fts5_content_shadow_names().into_iter().filter(|shadow| {
+            schema == "main" && scope.as_deref().is_none_or(|table| {
+                shadow.eq_ignore_ascii_case(table)
+                    || shadow.strip_suffix("_content").is_some_and(|name| name.eq_ignore_ascii_case(table))
+            })
+        }) {
             rows.push(Row {
                 values: vec![SqliteValue::Text(
                     format!(
@@ -111,6 +100,114 @@ impl Connection {
             });
         }
         Ok(rows)
+    }
+
+    fn integrity_table_database(&self, table: &str, scope: PragmaSchemaScope) -> Result<String> {
+        let contains = |conn: &Self, local_scope| {
+            conn.table_exists_for_scope(table, local_scope)
+                || conn.view_index_for_scope(table, local_scope).is_some()
+        };
+        if scope != PragmaSchemaScope::Main
+            && (contains(self, PragmaSchemaScope::Temp)
+                || canonical_sqlite_temp_schema_name(table).is_some()
+                || (scope == PragmaSchemaScope::Temp && is_sqlite_schema_name(table)))
+        {
+            return Ok("temp".to_owned());
+        }
+        if scope != PragmaSchemaScope::Temp
+            && (is_sqlite_schema_name(table) || contains(self, PragmaSchemaScope::Main))
+        {
+            return Ok("main".to_owned());
+        }
+        if scope == PragmaSchemaScope::Unqualified {
+            let children = self.attached_connections.borrow();
+            for alias in self.attached_schemas.borrow().all_schemas() {
+                if let Some(child) = children.get(&attached_schema_key(alias))
+                    && contains(child, PragmaSchemaScope::Main)
+                {
+                    return Ok(alias.to_owned());
+                }
+            }
+        }
+        let name = match scope {
+            PragmaSchemaScope::Main => format!("main.{table}"),
+            PragmaSchemaScope::Temp => format!("temp.{table}"),
+            PragmaSchemaScope::Unqualified => table.to_owned(),
+        };
+        Err(FrankenError::NoSuchTable { name })
+    }
+
+    async fn collect_integrity_findings(
+        &self,
+        schema: &str,
+        quick: bool,
+        scope: Option<&str>,
+        remaining: &mut usize,
+        rows: &mut Vec<String>,
+    ) -> Result<()> {
+        if *remaining == 0 {
+            // SQLite still opens a reader on every database named by the
+            // unqualified check. A capped report cannot hide a locked file.
+            return self.with_integrity_txn(async |_, _| Ok(())).await;
+        }
+        let mut reports = IntegrityCheckReports {
+            limit: *remaining,
+            ..Default::default()
+        };
+        // TEMP uses connection-local memory roots. Their numeric identifiers
+        // do not address pages in the main pager.
+        let temp = schema == "temp";
+        let structural = if temp {
+            Ok(())
+        } else {
+            self.validate_database_integrity_reporting(quick, scope, &mut reports).await
+        };
+        if let Err(error) = &structural && error.is_transient() {
+            return structural;
+        }
+        if !reports.findings.is_empty() {
+            // At the limit the error is the last rowid already recorded. A
+            // different structural failure before the limit belongs to the
+            // same grouped SQL row as the preceding rowid findings.
+            if reports.findings.len() < *remaining && let Err(error) = &structural {
+                reports.findings.push(error.to_string());
+            }
+            *remaining -= reports.findings.len();
+            rows.push(format!("*** in database {schema} ***\n{}", reports.findings.join("\n")));
+            // Ordering errors alone leave the completed tree walk readable.
+            // SQLite spends any remaining budget on stored row constraints.
+            if *remaining == 0 || structural.is_err() {
+                return Ok(());
+            }
+        }
+        if structural.is_ok() {
+            let n = reports.index_findings.len().min(*remaining);
+            rows.extend(reports.index_findings.into_iter().take(n));
+            *remaining -= n;
+            if *remaining == 0 {
+                return Ok(());
+            }
+        }
+        let result = match structural {
+            Err(error) => Err(error),
+            Ok(()) => self.integrity_check_row_constraints(scope, *remaining, temp).await,
+        };
+        match result {
+            Ok(findings) => {
+                *remaining -= findings.len();
+                rows.extend(findings);
+            }
+            Err(error) if error.is_transient() => return Err(error),
+            Err(error) => {
+                *remaining -= 1;
+                rows.push(if schema == "main" {
+                    error.to_string()
+                } else {
+                    format!("*** in database {schema} ***\n{error}")
+                });
+            }
+        }
+        Ok(())
     }
 
     /// bd-fjieg.4: stock `integrity_check` and `quick_check` both verify every
@@ -125,27 +222,19 @@ impl Connection {
         &self,
         only_table: Option<&str>,
         budget: usize,
+        temp: bool,
     ) -> Result<Vec<String>> {
-        let tables = {
-            let temp_table_names = self.temp_table_names.borrow();
-            let mut tables: Vec<TableSchema> = self
-                .schema
-                .borrow()
-                .iter()
-                .filter(|table| !temp_table_names.contains(&table.name.to_ascii_lowercase()))
-                .cloned()
-                .collect();
-            tables.extend(self.shadowed_main_tables.borrow().values().cloned());
-            tables.retain(|table| {
-                table.root_page > 0
-                    && only_table.is_none_or(|name| table.name.eq_ignore_ascii_case(name))
-            });
-            tables
-        };
+        let local = if temp { PragmaSchemaScope::Temp } else { PragmaSchemaScope::Main };
+        let tables = self.pragma_table_schemas_for_scope(local);
         let mut reports = Vec::new();
         for table in &tables {
             if reports.len() >= budget {
                 break;
+            }
+            if (!temp && table.root_page <= 0)
+                || only_table.is_some_and(|name| !table.name.eq_ignore_ascii_case(name))
+            {
+                continue;
             }
             let primary_key = if table.without_rowid || table.strict {
                 table.primary_key_constraints.first().cloned().unwrap_or_default()
@@ -164,10 +253,19 @@ impl Connection {
                 })
                 .map(|column| column.name.as_str())
                 .collect();
-            let strict_types = self.integrity_check_strict_type_predicates(table).await?;
+            let strict_types = self.integrity_check_strict_type_predicates(table, local).await?;
+            // bd-hja9y: stock SQLite's `PRAGMA integrity_check` / `quick_check`
+            // suppresses CHECK verification while `SQLITE_IgnoreChecks` is ON
+            // (`sqlite3.c`: `if( pTab->pCheck && (db->flags & SQLITE_IgnoreChecks)==0 )`),
+            // while still checking NOT NULL and STRICT types.
+            let check_constraints = if self.pragma_state.borrow().ignore_check_constraints {
+                &[][..]
+            } else {
+                table.check_constraints.as_slice()
+            };
             if not_null.is_empty()
                 && strict_types.is_empty()
-                && table.check_constraints.is_empty()
+                && check_constraints.is_empty()
             {
                 continue;
             }
@@ -178,16 +276,15 @@ impl Connection {
                 .map(|column| format!("typeof({}) = 'null'", quote_identifier(column)))
                 .chain(strict_types.iter().map(|(predicate, _)| predicate.clone()))
                 .chain(
-                    table
-                        .check_constraints
+                    check_constraints
                         .iter()
                         .map(|check| format!("NOT ({})", check.expr)),
                 )
                 .collect();
             let sql = format!(
-                "SELECT {} FROM main.{} NOT INDEXED WHERE {} LIMIT {}",
+                "SELECT {} FROM {} NOT INDEXED WHERE {} LIMIT {}",
                 predicates.join(", "),
-                quote_identifier(&table.name),
+                pragma_qualified_relation(local, &table.name),
                 predicates
                     .iter()
                     .map(|predicate| format!("({predicate})"))
@@ -287,7 +384,10 @@ impl Connection {
         if self.wal_checkpoint_blocked_by_active_concurrent_txns() {
             let log_frames =
                 i64::try_from(self.pager.wal_frame_count(&cx).await).unwrap_or(i64::MAX);
-            return Ok([1, log_frames, 0]);
+            // bd-s4lco: an open transaction pins frames the way a stock
+            // reader does. A PASSIVE checkpoint stopped by readers is not
+            // busy in stock (`0|log|done`); FULL, RESTART and TRUNCATE are.
+            return Ok([i64::from(mode != CheckpointMode::Passive), log_frames, 0]);
         }
 
         self.invalidate_cached_write_txn(&cx).await;
@@ -379,7 +479,7 @@ fn integrity_check_error_limit(value: Option<&fsqlite_ast::PragmaValue>) -> usiz
 }
 
 /// `PRAGMA integrity_check(T)` / `('T')` limits the check to one table.
-fn integrity_check_table_scope(value: Option<&fsqlite_ast::PragmaValue>) -> Option<String> {
+pub(super) fn integrity_check_table_scope(value: Option<&fsqlite_ast::PragmaValue>) -> Option<String> {
     let (fsqlite_ast::PragmaValue::Assign(expr) | fsqlite_ast::PragmaValue::Call(expr)) = value?;
     match expr {
         Expr::Column(col_ref, _) if col_ref.table.is_none() => Some(col_ref.column.to_string()),

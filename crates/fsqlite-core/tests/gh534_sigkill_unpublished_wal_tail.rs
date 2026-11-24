@@ -11,17 +11,16 @@
 //!   post-crash files), and `PRAGMA integrity_check` is `ok`;
 //! - a crash at any step of a commit leaves the commit either wholly present
 //!   or wholly absent, the same way stock reads it;
-//! - a writer killed within its first commits after a checkpointing close,
-//!   with a second database open beside it in both processes, leaves a state
-//!   the next opener commits on at once (the shape of the downstream repro,
-//!   `kill_during_commit_recovers`);
 //! - a connection that stayed open in another process across the crash still
 //!   commits, retrying at most a transaction refused with `BusySnapshot`;
 //! - a writer that is alive between its WAL sync and its publication is never
 //!   mistaken for a dead one: readers keep the published prefix meanwhile;
 //! - a recovery that dies partway is redone by the next opener;
-//! - a transaction whose snapshot predates the dead writer's commit is
-//!   refused at once with a retryable `BusySnapshot`, and its retry commits.
+//! - a transaction whose snapshot predates the dead writer's commit ends on
+//!   top of it, with the dead writer's rows intact, as stock's application
+//!   retry leaves them: one that returned nothing is replayed inside COMMIT
+//!   (bd-q4o7z, a3d329d47); one that read is refused at once with a retryable
+//!   `BusySnapshot`, and its retry commits (bd-c7onh).
 //!
 //! The writers are child processes killed for real (SIGKILL), or stopped at a
 //! named commit step by the `fault-injection` crash points, which abort the
@@ -190,38 +189,28 @@ fn sigkill_during_a_commit_loop_never_blocks_the_next_commit() {
     });
 }
 
-/// Two fresh WAL databases, `a.db` and `b.db`, each holding `items(1)` and each
-/// closed WITH its checkpoint, so the next writer's first commit starts a new
-/// WAL. Returns `(a, b)`.
-async fn create_pair_checkpointed(dir: &Path) -> (PathBuf, PathBuf) {
-    let mut made = Vec::new();
-    for name in ["a.db", "b.db"] {
-        let db = dir.join(name);
-        let conn = open(&db).await;
-        conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY)")
-            .await
-            .expect("create");
-        conn.execute("INSERT INTO items VALUES (1)")
-            .await
-            .expect("seed");
-        conn.close().await.expect("close with checkpoint");
-        made.push(db);
-    }
-    let b = made.pop().expect("b.db");
-    let a = made.pop().expect("a.db");
-    (a, b)
+/// Seed a WAL database at `dir/name` with `items(1)` and close it WITH its
+/// checkpoint so the next writer starts a fresh WAL generation.
+async fn init_checkpointed_db(dir: &Path, name: &str) -> PathBuf {
+    let db = dir.join(name);
+    let conn = open(&db).await;
+    conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY)")
+        .await
+        .expect("create");
+    conn.execute("INSERT INTO items VALUES (1)")
+        .await
+        .expect("seed");
+    conn.close().await.expect("close with checkpoint");
+    db
 }
 
-/// The downstream repro of GH#534: a writer holding two databases open commits
-/// single rows to the second; it is killed a few milliseconds into its first
-/// commits; the reopening process opens both databases again and commits.
-/// Recovery must complete within [`PROMPT`], on top of exactly the rows stock
-/// reads from a copy of the post-crash files, with `integrity_check` ok. Unlike
-/// the loop above, the databases were closed with a checkpoint (so the kill can
-/// land while the writer starts a new WAL) and a second database is open in both
-/// processes.
+/// GH#534 downstream multi-database shape: two WAL databases are initialized
+/// and closed with checkpoints, a writer holds both open while committing to
+/// the second and is SIGKILLed within its first few milliseconds, and the
+/// reopening process opens both databases and must commit immediately on top
+/// of exactly the rows stock SQLite sees.
 #[test]
-fn kill_during_commit_recovers() {
+fn sigkill_with_peer_database_after_checkpointed_close_recovers() {
     let trials: u64 = std::env::var("GH534_TRIALS")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -229,17 +218,105 @@ fn kill_during_commit_recovers() {
     asupersync::test_utils::run_test(|| async move {
         for trial in 0..trials {
             let dir = tempfile::tempdir().expect("tempdir");
-            let (peer, db) = create_pair_checkpointed(dir.path()).await;
-            let mut writer = ChildProcess::spawn("writer_beside_peer", &db, &[]);
+            let peer = init_checkpointed_db(dir.path(), "peer.db").await;
+            let db = init_checkpointed_db(dir.path(), "b.db").await;
+            let mut writer = ChildProcess::spawn("peer_writer", &db, &[]);
             writer.witness("committing");
             std::thread::sleep(Duration::from_millis(1 + trial % 8));
             writer.sigkill();
             let stock_rows = stock_count_of_copy(&db, &dir.path().join("stock"));
-            assert!(stock_rows >= 1, "trial {trial}: stock reads {stock_rows} rows");
-            let _peer = open(&peer).await;
-            assert_next_writer_commits_on_top(&db, stock_rows, &format!("pair trial {trial}")).await;
+            assert!(
+                stock_rows >= 1,
+                "peer trial {trial}: stock reads {stock_rows} rows"
+            );
+            let _peer_conn = open(&peer).await;
+            assert_next_writer_commits_on_top(&db, stock_rows, &format!("peer-db trial {trial}"))
+                .await;
         }
     });
+}
+
+/// GH#534 deterministic stale-SHM construction: commit row 1, preserve the
+/// `-shm` image, commit row 2, then restore the earlier `-shm` so both index
+/// header copies are valid and equal at the older `mxFrame` while row 2's
+/// valid commit frame sits past `mxFrame` in the WAL. Reopening must adopt
+/// row 2 and allow an immediate commit without `BusyRecovery`.
+#[test]
+fn stale_shm_snapshot_recovers_unpublished_committed_tail() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = create(dir.path()).await;
+        let shm_path = sidecar(&db, "-shm");
+        let stale_shm_bytes = std::fs::read(&shm_path).expect("read initial -shm");
+
+        let writer = open(&db).await;
+        let (res, _) = commit_one(&writer, 2).await;
+        res.expect("commit row 2");
+        writer.close_without_checkpoint().await.expect("close");
+
+        std::fs::write(&shm_path, &stale_shm_bytes).expect("restore stale -shm");
+
+        let stock_rows = stock_count_of_copy(&db, &dir.path().join("stock"));
+        assert_eq!(stock_rows, 2, "stock recovers committed row 2 past mxFrame");
+        assert_next_writer_commits_on_top(&db, stock_rows, "stale-shm").await;
+    });
+}
+
+/// A killed writer's `-shm` locks are gone by the time it is reaped, as a
+/// stock process's are. Our locks are OFD locks, which live as long as their
+/// open file description; the description that was also mapped kept the dead
+/// writer's WRITE, reader-mark and DMS locks for several ms after waitpid
+/// returned (measured 2026-11-16: still held 9 ms after the reap). The next
+/// opener then took the dead writer for a live one and read only the
+/// published prefix, without the durable commit stock reads (the 1-in-100
+/// failure of the test above), and a stock opener took itself for a second
+/// connection instead of the first attacher that rebuilds the index.
+#[test]
+fn a_killed_writers_shm_locks_are_gone_when_it_is_reaped() {
+    let trials: u64 = std::env::var("GH534_TRIALS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(40);
+    asupersync::test_utils::run_test(|| async move {
+        let mut held = Vec::new();
+        for trial in 0..trials {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db = create(dir.path()).await;
+            let mut writer = ChildProcess::spawn("writer", &db, &[]);
+            writer.witness("committing");
+            std::thread::sleep(Duration::from_millis(1 + (trial * 7_919) % 40));
+            writer.sigkill();
+            // At once: nothing of this process holds a lock on the file.
+            let shm = std::fs::File::open(sidecar(&db, "-shm")).expect("open -shm");
+            for (byte, name) in [(120, "WRITE"), (128, "DMS")] {
+                if let Some(lock_type) = ofd_lock_conflict(&shm, byte) {
+                    held.push(format!("trial {trial}: {name} {lock_type}"));
+                }
+            }
+        }
+        assert!(
+            held.is_empty(),
+            "a reaped writer's -shm locks were still held: {held:?}"
+        );
+    });
+}
+
+/// The type of a lock another open file description holds on `byte`, if any.
+fn ofd_lock_conflict(file: &std::fs::File, byte: i64) -> Option<&'static str> {
+    use nix::libc;
+    let mut probe = libc::flock {
+        l_type: libc::c_short::try_from(libc::F_WRLCK).expect("F_WRLCK fits"),
+        l_whence: libc::c_short::try_from(libc::SEEK_SET).expect("SEEK_SET fits"),
+        l_start: byte,
+        l_len: 1,
+        l_pid: 0,
+    };
+    nix::fcntl::fcntl(file, nix::fcntl::FcntlArg::F_OFD_GETLK(&mut probe)).expect("F_OFD_GETLK");
+    match i32::from(probe.l_type) {
+        libc::F_UNLCK => None,
+        libc::F_RDLCK => Some("read"),
+        _ => Some("write"),
+    }
 }
 
 #[cfg(feature = "fault-injection")]
@@ -388,48 +465,152 @@ fn a_recovery_that_dies_partway_is_redone_by_the_next_opener() {
     });
 }
 
+/// Every `items` id, in order.
 #[cfg(feature = "fault-injection")]
-#[test]
-fn a_transaction_begun_before_the_crash_gets_a_prompt_retryable_conflict() {
-    asupersync::test_utils::run_test(|| async {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db = create(dir.path()).await;
-        let mut writer = ChildProcess::spawn(
-            "writer",
-            &db,
-            &[
-                (CRASH_POINT_ENV, SYNC_BEFORE_PUBLISH),
-                (CRASH_AFTER_ENV, "3"),
-                (CRASH_ACTION_ENV, "pause"),
-            ],
+async fn ids(conn: &Connection) -> Vec<i64> {
+    conn.query("SELECT id FROM items ORDER BY id")
+        .await
+        .expect("ids")
+        .iter()
+        .map(|row| match row.values() {
+            [SqliteValue::Integer(id)] => *id,
+            other => panic!("unexpected id row {other:?}"),
+        })
+        .collect()
+}
+
+/// Every `items` id as stock reads a copy of the files (see
+/// [`stock_count_of_copy`], which also checks stock's integrity).
+#[cfg(feature = "fault-injection")]
+fn stock_ids_of_copy(db: &Path, into: &Path) -> Vec<i64> {
+    stock_count_of_copy(db, into);
+    let stock = rusqlite::Connection::open(into.join("b.db")).expect("stock open copy");
+    let mut ids = stock
+        .prepare("SELECT id FROM items ORDER BY id")
+        .expect("stock prepare");
+    ids.query_map([], |row| row.get(0))
+        .expect("stock ids")
+        .map(|id| id.expect("stock id"))
+        .collect()
+}
+
+/// How a transaction begun before the dead writer's crash ends.
+#[cfg(feature = "fault-injection")]
+struct BegunBeforeTheCrash {
+    commit: Result<usize, FrankenError>,
+    commit_took: Duration,
+    rows: Vec<i64>,
+    stock_rows: Vec<i64>,
+}
+
+/// The writer's third commit (id 4) is durable in the WAL but never
+/// published. A transaction binds its snapshot on the published prefix
+/// (ids 1-3), INSERTs 500 and, with `read`, reads the table; then the writer
+/// is SIGKILLed and the transaction COMMITs. A refused COMMIT is retried as
+/// an application would: ROLLBACK, then the same transaction again. The rows
+/// are what fsqlite and stock (from a copy of the files) read at the end.
+#[cfg(feature = "fault-injection")]
+async fn begun_before_the_crash(read: bool) -> BegunBeforeTheCrash {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = create(dir.path()).await;
+    let mut writer = ChildProcess::spawn(
+        "writer",
+        &db,
+        &[
+            (CRASH_POINT_ENV, SYNC_BEFORE_PUBLISH),
+            (CRASH_AFTER_ENV, "3"),
+            (CRASH_ACTION_ENV, "pause"),
+        ],
+    );
+    writer.wait_paused();
+    // Bind a snapshot while the writer is alive and holds WRITE.
+    let conn = open(&db).await;
+    conn.execute("BEGIN").await.expect("begin");
+    conn.execute("INSERT INTO items VALUES (500)")
+        .await
+        .expect("insert on the published prefix");
+    if read {
+        assert_eq!(
+            ids(&conn).await,
+            [1, 2, 3, 500],
+            "the snapshot predates the writer's durable commit"
         );
-        writer.wait_paused();
-        // Bind a snapshot while the writer is alive and holds WRITE.
-        let conn = open(&db).await;
-        conn.execute("BEGIN").await.expect("begin");
-        conn.execute("INSERT INTO items VALUES (500)")
-            .await
-            .expect("insert on the published prefix");
-        writer.sigkill();
-        let started = Instant::now();
-        let error = conn
-            .execute("COMMIT")
-            .await
-            .expect_err("the snapshot predates a durable commit");
-        let took = started.elapsed();
-        assert!(
-            matches!(error, FrankenError::BusySnapshot { .. }),
-            "refused with {error:?}"
-        );
-        assert!(took < Duration::from_secs(1), "refused after {took:?}");
+    }
+    writer.sigkill();
+    let started = Instant::now();
+    let commit = conn.execute("COMMIT").await;
+    let commit_took = started.elapsed();
+    if commit.is_err() {
         let _ = conn.execute("ROLLBACK").await;
         let (result, took) = commit_one(&conn, 500).await;
         result.expect("the retried transaction commits");
         assert!(took < PROMPT, "retry took {took:?}");
-        assert_eq!(count(&conn).await.expect("count"), 5, "1 + 3 + 1");
-        assert_eq!(integrity(&conn).await, "ok");
-        conn.close_without_checkpoint().await.expect("close");
-        assert_eq!(stock_count_of_copy(&db, &dir.path().join("stock")), 5);
+    }
+    let rows = ids(&conn).await;
+    assert_eq!(integrity(&conn).await, "ok");
+    conn.close_without_checkpoint().await.expect("close");
+    let stock_rows = stock_ids_of_copy(&db, &dir.path().join("stock"));
+    BegunBeforeTheCrash {
+        commit,
+        commit_took,
+        rows,
+        stock_rows,
+    }
+}
+
+/// bd-q4o7z's COMMIT replay (a3d329d47) re-runs a transaction that returned
+/// nothing on a fresh snapshot within busy_timeout, as the application's
+/// retry would. So a write-only transaction whose snapshot predates the dead
+/// writer's durable commit commits at once on top of it (bd-c7onh). Stock
+/// refuses the same interleaving with SQLITE_BUSY_SNAPSHOT and the
+/// application retries: the rows end the same. A lost update (the dead
+/// writer's row 4 missing, or its pages overwritten from the stale snapshot)
+/// fails the row check.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn a_write_only_transaction_begun_before_the_crash_is_replayed_on_top_of_it() {
+    asupersync::test_utils::run_test(|| async {
+        let outcome = begun_before_the_crash(false).await;
+        if let Err(error) = &outcome.commit {
+            panic!("the replayed COMMIT was refused: {error:?}");
+        }
+        assert!(
+            outcome.commit_took < PROMPT,
+            "the replayed COMMIT took {:?}",
+            outcome.commit_took
+        );
+        assert_eq!(outcome.rows, [1, 2, 3, 4, 500], "1, the dead writer's 2-4, and 500");
+        assert_eq!(outcome.stock_rows, outcome.rows, "stock reads the same rows");
+    });
+}
+
+/// A transaction that returned rows is not replayed (what it returned could
+/// change), so its COMMIT is refused at once with a retryable `BusySnapshot`,
+/// and its retry commits on top of the dead writer's commit.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn a_transaction_that_read_before_the_crash_gets_a_prompt_retryable_conflict() {
+    asupersync::test_utils::run_test(|| async {
+        let outcome = begun_before_the_crash(true).await;
+        let error = outcome
+            .commit
+            .as_ref()
+            .expect_err("the snapshot predates a durable commit");
+        assert!(
+            matches!(error, FrankenError::BusySnapshot { .. }),
+            "refused with {error:?}"
+        );
+        assert!(
+            outcome.commit_took < Duration::from_secs(1),
+            "refused after {:?}",
+            outcome.commit_took
+        );
+        assert_eq!(
+            outcome.rows,
+            [1, 2, 3, 4, 500],
+            "1, the dead writer's 2-4, and the retry's 500"
+        );
+        assert_eq!(outcome.stock_rows, outcome.rows, "stock reads the same rows");
     });
 }
 
@@ -463,10 +644,8 @@ fn gh534_child_process() {
                 witness("done", &(last - 1).to_string());
                 expect_line("exit");
             }
-            // The downstream repro's writer: a second database open beside the
-            // one it commits single rows to, until it is killed.
-            "writer_beside_peer" => {
-                let _peer = open(&db.with_file_name("a.db")).await;
+            "peer_writer" => {
+                let _peer_conn = open(&db.with_file_name("peer.db")).await;
                 let conn = open(&db).await;
                 witness("committing", "");
                 for id in 2..=i64::MAX {

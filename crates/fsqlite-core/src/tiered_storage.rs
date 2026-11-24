@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::{Cx, cap};
+use fsqlite_types::sync_primitives::Instant;
 use fsqlite_types::{
     IdempotencyKey, ObjectId, Oti, RemoteCap, Saga, SymbolReadPath, SymbolRecord,
     SystematicLayoutError, reconstruct_systematic_happy_path, source_symbol_count,
@@ -26,6 +27,7 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use crate::decode_proofs::{EcsDecodeProof, RejectedSymbol, SymbolDigest, SymbolRejectionReason};
 use crate::remote_effects::Executor as RemoteAdmissionExecutor;
+use crate::replication_sender::validate_codec_esi;
 
 const BEAD_ID: &str = "bd-1hi.29";
 const FETCH_SYMBOLS_COMPUTATION: &str = "fsqlite:tiered:fetch_symbols:v1";
@@ -366,7 +368,7 @@ impl TieredStorage {
     {
         let local_records = self.l2_records_for_object(object_id);
         if !local_records.is_empty() {
-            match recover_object_hybrid(&local_records) {
+            match recover_object_hybrid(cx, &local_records) {
                 Ok(local) => {
                     if let Some(proof) = local.decode_proof.clone() {
                         self.record_decode_proof(proof);
@@ -379,7 +381,8 @@ impl TieredStorage {
                         decode_proof: local.decode_proof,
                     });
                 }
-                Err(failure) => {
+                Err(HybridRecoverFailure::Operational(error)) => return Err(error),
+                Err(HybridRecoverFailure::Decode(failure)) => {
                     self.record_decode_proof(failure.proof);
                     debug!(
                         bead_id = BEAD_ID,
@@ -432,9 +435,10 @@ impl TieredStorage {
         }
 
         let merged = merge_symbol_sets(&local_records, &fetched);
-        let recovered = match recover_object_hybrid(&merged) {
+        let recovered = match recover_object_hybrid(cx, &merged) {
             Ok(value) => value,
-            Err(failure) => {
+            Err(HybridRecoverFailure::Operational(error)) => return Err(error),
+            Err(HybridRecoverFailure::Decode(failure)) => {
                 let detail = failure.reason.clone();
                 self.record_decode_proof(failure.proof);
                 return Err(FrankenError::DatabaseCorrupt {
@@ -445,7 +449,12 @@ impl TieredStorage {
         if let Some(proof) = recovered.decode_proof.clone() {
             self.record_decode_proof(proof);
         }
-        let write_back_count = self.write_back_repairs(&local_records, &fetched);
+        let write_back_count = self.write_back_repairs(
+            &local_records,
+            &fetched,
+            &merged,
+            recovered.decode_proof.as_ref(),
+        );
 
         Ok(FetchOutcome {
             bytes: recovered.bytes,
@@ -544,14 +553,38 @@ impl TieredStorage {
         })
     }
 
-    fn write_back_repairs(&mut self, local: &[SymbolRecord], fetched: &[SymbolRecord]) -> usize {
+    fn write_back_repairs(
+        &mut self,
+        local: &[SymbolRecord],
+        fetched: &[SymbolRecord],
+        merged: &[SymbolRecord],
+        decode_proof: Option<&EcsDecodeProof>,
+    ) -> usize {
+        // Successful systematic validation checked every merged record,
+        // including the repair tail. A fallback proof instead names the
+        // accepted subset. Bind admission to the exact selected record: an
+        // accepted ESI must not authorize a different fetched payload.
+        // Complete source runs can bypass decoding, but unsupported extras
+        // must not enter the cache and obstruct a later repair attempt.
+        let accepted_by_esi: BTreeMap<u32, &SymbolRecord> = merged
+            .iter()
+            .filter(|record| validate_codec_esi(record.esi).is_ok())
+            .filter(|record| {
+                decode_proof
+                    .is_none_or(|proof| proof.symbols_received.binary_search(&record.esi).is_ok())
+            })
+            .map(|record| (record.esi, record))
+            .collect();
         let local_by_esi: BTreeMap<u32, &SymbolRecord> =
             local.iter().map(|record| (record.esi, record)).collect();
         let mut repairs_by_esi = BTreeMap::<u32, SymbolRecord>::new();
         for record in fetched {
+            if accepted_by_esi.get(&record.esi).copied() != Some(record) {
+                continue;
+            }
             let needs_repair = match local_by_esi.get(&record.esi) {
                 None => true,
-                Some(existing) => !existing.verify_integrity() && record.verify_integrity(),
+                Some(existing) => prefer_symbol_record(existing, record),
             };
             if needs_repair {
                 merge_symbol_record_by_esi(&mut repairs_by_esi, record.clone());
@@ -657,8 +690,15 @@ fn derive_evict_key(segment_id: u64, records: &[SymbolRecord], ecs_epoch: u64) -
     IdempotencyKey::derive(ecs_epoch, &request_bytes)
 }
 
+fn symbol_record_is_intact(record: &SymbolRecord) -> bool {
+    // Public record fields can contain malformed remote responses. The checksum
+    // routine assumes the wire shape, so reject truncated payloads before it.
+    usize::try_from(record.oti.t).ok() == Some(record.symbol_data.len())
+        && record.verify_integrity()
+}
+
 fn prefer_symbol_record(existing: &SymbolRecord, candidate: &SymbolRecord) -> bool {
-    !existing.verify_integrity() && candidate.verify_integrity()
+    !symbol_record_is_intact(existing) && symbol_record_is_intact(candidate)
 }
 
 fn merge_symbol_record_by_esi(by_esi: &mut BTreeMap<u32, SymbolRecord>, record: SymbolRecord) {
@@ -730,91 +770,200 @@ struct FallbackSymbolEvidence {
     symbol_digests: Vec<SymbolDigest>,
 }
 
-fn recover_object_hybrid(
+#[derive(Debug)]
+enum HybridRecoverFailure {
+    Decode(Box<FallbackDecodeFailure>),
+    Operational(FrankenError),
+}
+
+fn recover_object_hybrid<Caps: cap::SubsetOf<cap::All>>(
+    cx: &Cx<Caps>,
     records: &[SymbolRecord],
-) -> std::result::Result<HybridRecoverResult, Box<FallbackDecodeFailure>> {
-    match reconstruct_systematic_happy_path(records) {
-        Ok(bytes) => Ok(HybridRecoverResult {
+) -> std::result::Result<HybridRecoverResult, HybridRecoverFailure> {
+    cx.checkpoint()
+        .map_err(|_| HybridRecoverFailure::Operational(FrankenError::Abort))?;
+    let recovered = match reconstruct_systematic_happy_path(records) {
+        Ok(bytes) => HybridRecoverResult {
             bytes,
             read_path: SymbolReadPath::SystematicFastPath,
             decode_proof: None,
-        }),
+        },
         Err(reason) => {
-            let fallback = fallback_decode_records(records, &reason)?;
-            Ok(HybridRecoverResult {
-                bytes: fallback.bytes,
+            let decoded = fallback_decode_records(cx, records, &reason)?;
+            HybridRecoverResult {
+                bytes: decoded.bytes,
                 read_path: SymbolReadPath::FullDecodeFallback { reason },
-                decode_proof: Some(fallback.proof),
-            })
+                decode_proof: Some(decoded.proof),
+            }
         }
+    };
+    cx.checkpoint()
+        .map_err(|_| HybridRecoverFailure::Operational(FrankenError::Abort))?;
+    Ok(recovered)
+}
+
+fn fallback_decode_records<Caps: cap::SubsetOf<cap::All>>(
+    cx: &Cx<Caps>,
+    records: &[SymbolRecord],
+    fast_path_error: &SystematicLayoutError,
+) -> std::result::Result<FallbackDecodeSuccess, HybridRecoverFailure> {
+    let started = Instant::now();
+    let result = fallback_decode_records_inner(cx, records, fast_path_error);
+    let timing_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    match result {
+        Ok(mut decoded) => {
+            decoded.proof.timing_ns = timing_ns;
+            let digests = decoded.proof.symbol_digests.clone();
+            decoded.proof = decoded.proof.with_symbol_digests(digests);
+            Ok(decoded)
+        }
+        Err(HybridRecoverFailure::Decode(mut failure)) => {
+            failure.proof.timing_ns = timing_ns;
+            let digests = failure.proof.symbol_digests.clone();
+            failure.proof = failure.proof.with_symbol_digests(digests);
+            Err(HybridRecoverFailure::Decode(failure))
+        }
+        Err(error) => Err(error),
     }
 }
 
-fn fallback_decode_records(
+fn fallback_decode_records_inner<Caps: cap::SubsetOf<cap::All>>(
+    cx: &Cx<Caps>,
     records: &[SymbolRecord],
-    systematic_reason: &SystematicLayoutError,
-) -> std::result::Result<FallbackDecodeSuccess, Box<FallbackDecodeFailure>> {
-    let evidence = collect_fallback_symbol_evidence(records)?;
+    fast_path_error: &SystematicLayoutError,
+) -> std::result::Result<FallbackDecodeSuccess, HybridRecoverFailure> {
+    use asupersync::raptorq::decoder::{InactivationDecoder, ReceivedSymbol};
+
+    use crate::replication_sender::{MAX_REPAIR_WORK_BYTES, repair_parameters};
+
+    let checkpoint = || {
+        cx.checkpoint()
+            .map_err(|_| HybridRecoverFailure::Operational(FrankenError::Abort))
+    };
+    checkpoint()?;
+    let evidence =
+        collect_fallback_symbol_evidence(records).map_err(HybridRecoverFailure::Decode)?;
+    checkpoint()?;
     let k_source = u32::try_from(evidence.source_symbols).unwrap_or(u32::MAX);
-    let available_symbols = evidence.accepted_esis.len();
-    let required_symbols = evidence
-        .source_symbols
-        .saturating_add(DEFAULT_FALLBACK_DECODE_SLACK);
-    if available_symbols < required_symbols {
-        let detail = format!(
-            "systematic_reason={systematic_reason}; insufficient_symbols_for_fallback: available={available_symbols} required={required_symbols} slack_decode={DEFAULT_FALLBACK_DECODE_SLACK}"
-        );
-        return Err(FallbackDecodeFailure {
-            reason: detail,
-            proof: build_fallback_decode_proof_from_parts(
-                evidence.object_id,
-                k_source,
-                &evidence.accepted_esis,
-                &evidence.rejected_symbols,
-                &evidence.symbol_digests,
-                false,
-                Some(u32::try_from(available_symbols).unwrap_or(u32::MAX)),
-            ),
-        }
-        .into());
-    }
-
-    let mut out = Vec::with_capacity(evidence.source_symbols.saturating_mul(evidence.symbol_size));
-    for expected_esi in 0..evidence.source_symbols {
-        let expected_esi_u32 = u32::try_from(expected_esi).unwrap_or(u32::MAX);
-        let Some(record) = evidence.accepted_by_esi.get(&expected_esi_u32) else {
-            let detail = format!(
-                "systematic_reason={systematic_reason}; missing_source_symbol: esi={expected_esi_u32}"
-            );
-            return Err(FallbackDecodeFailure {
-                reason: detail,
-                proof: build_fallback_decode_proof_from_parts(
-                    evidence.object_id,
-                    k_source,
-                    &evidence.accepted_esis,
-                    &evidence.rejected_symbols,
-                    &evidence.symbol_digests,
-                    false,
-                    Some(u32::try_from(available_symbols).unwrap_or(u32::MAX)),
-                ),
-            }
-            .into());
-        };
-        out.extend_from_slice(&record.symbol_data);
-    }
-    out.truncate(evidence.transfer_len);
-
-    Ok(FallbackDecodeSuccess {
-        bytes: out,
-        proof: build_fallback_decode_proof_from_parts(
+    // Native ECS repair schedules follow the durable object identity (§3.5.9).
+    let seed = xxh3_64(evidence.object_id.as_bytes());
+    let proof = |decode_success| {
+        EcsDecodeProof::from_esis(
             evidence.object_id,
             k_source,
             &evidence.accepted_esis,
-            &evidence.rejected_symbols,
-            &evidence.symbol_digests,
-            true,
-            Some(k_source),
-        ),
+            decode_success,
+            None, // This path does not measure matrix rank.
+            0,
+            seed,
+        )
+        .with_rejected_symbols(evidence.rejected_symbols.clone())
+        .with_symbol_digests(evidence.symbol_digests.clone())
+    };
+    let fail = |reason: String| {
+        HybridRecoverFailure::Decode(Box::new(FallbackDecodeFailure {
+            reason,
+            proof: proof(false),
+        }))
+    };
+
+    let required = evidence
+        .source_symbols
+        .checked_add(DEFAULT_FALLBACK_DECODE_SLACK)
+        .ok_or_else(|| fail("fallback_symbol_budget_overflow".to_owned()))?;
+    if evidence.accepted_by_esi.len() < required {
+        return Err(fail(format!(
+            "insufficient_symbols_for_fallback: have={}, required={required}, fast_path={fast_path_error}",
+            evidence.accepted_by_esi.len(),
+        )));
+    }
+
+    // source_symbol_count has already validated the flat, single-block OTI.
+    // Validate K/T and bound the decoder's dense work before constructing its
+    // constraint matrix. Resource refusal is operational, not a reason to
+    // fetch more repair symbols. Insufficient local sets above may still fetch
+    // a complete systematic run that needs no dense solve.
+    let _params = repair_parameters(
+        evidence.source_symbols,
+        evidence.symbol_size,
+        evidence.accepted_by_esi.len(),
+        MAX_REPAIR_WORK_BYTES,
+    )
+    .map_err(|error| match error {
+        FrankenError::TooBig => HybridRecoverFailure::Operational(FrankenError::TooBig),
+        error => fail(format!("unsupported_fallback_parameters: {error}")),
+    })?;
+
+    let padded_len = evidence
+        .source_symbols
+        .checked_mul(evidence.symbol_size)
+        .ok_or_else(|| fail("fallback_output_size_overflow".to_owned()))?;
+    if evidence.transfer_len > padded_len {
+        return Err(fail(
+            "fallback_transfer_length_exceeds_source_block".to_owned(),
+        ));
+    }
+
+    let decoder = InactivationDecoder::new(evidence.source_symbols, evidence.symbol_size, seed);
+    let mut received = decoder.constraint_symbols();
+    for (&esi, record) in &evidence.accepted_by_esi {
+        checkpoint()?;
+        if esi < k_source {
+            received.push(ReceivedSymbol::source(esi, record.symbol_data.clone()));
+        } else {
+            // Use canonical wire ESI: the decoder applies the K..K' padding map.
+            let (columns, coefficients) = decoder
+                .repair_equation(esi)
+                .map_err(|error| fail(format!("invalid_fallback_repair_esi {esi}: {error:?}")))?;
+            received.push(ReceivedSymbol::repair(
+                esi,
+                columns,
+                coefficients,
+                record.symbol_data.clone(),
+            ));
+        }
+    }
+
+    checkpoint()?;
+    // Elimination is synchronous. Check cancellation at ingestion and around
+    // the solve; this API cannot interrupt an individual elimination midway.
+    let decoded = decoder.decode(&received);
+    checkpoint()?;
+    let decoded = decoded.map_err(|error| fail(format!("raptorq_fallback_failed: {error:?}")))?;
+    if decoded.source.len() != evidence.source_symbols
+        || decoded
+            .source
+            .iter()
+            .any(|symbol| symbol.len() != evidence.symbol_size)
+    {
+        return Err(fail("fallback_decoded_source_shape_mismatch".to_owned()));
+    }
+    for (&esi, record) in evidence.accepted_by_esi.range(..k_source) {
+        checkpoint()?;
+        let source_index = usize::try_from(esi)
+            .map_err(|_| fail("fallback_source_index_out_of_range".to_owned()))?;
+        if decoded.source[source_index] != record.symbol_data {
+            return Err(fail(format!(
+                "fallback_source_consistency_mismatch: esi={esi}"
+            )));
+        }
+    }
+
+    let mut bytes = Vec::with_capacity(evidence.transfer_len);
+    for source in decoded.source {
+        checkpoint()?;
+        let remaining = evidence.transfer_len - bytes.len();
+        bytes.extend_from_slice(&source[..remaining.min(source.len())]);
+        if bytes.len() == evidence.transfer_len {
+            break;
+        }
+    }
+    if bytes.len() != evidence.transfer_len {
+        return Err(fail("fallback_decoded_transfer_length_mismatch".to_owned()));
+    }
+    Ok(FallbackDecodeSuccess {
+        bytes,
+        proof: proof(true),
     })
 }
 
@@ -891,6 +1040,7 @@ fn collect_fallback_symbol_evidence(
         let rejection = if record.object_id != first.object_id
             || record.oti != first.oti
             || record.symbol_data.len() != symbol_size
+            || validate_codec_esi(record.esi).is_err()
         {
             Some(SymbolRejectionReason::FormatViolation)
         } else if !record.verify_integrity() {
@@ -940,66 +1090,19 @@ fn build_fallback_decode_proof_from_parts(
     decode_success: bool,
     intermediate_rank: Option<u32>,
 ) -> EcsDecodeProof {
-    let seed = deterministic_fallback_seed(object_id, k_source);
-    let timing_ns = deterministic_fallback_timing_ns(
-        object_id,
-        k_source,
-        accepted_esis,
-        rejected_symbols,
-        decode_success,
-    );
+    // The measured wrapper supplies elapsed time after validation/decoding.
     let proof = EcsDecodeProof::from_esis(
         object_id,
         k_source,
         accepted_esis,
         decode_success,
         intermediate_rank,
-        timing_ns,
-        seed,
+        0,
+        xxh3_64(object_id.as_bytes()),
     );
     proof
         .with_rejected_symbols(rejected_symbols.to_vec())
         .with_symbol_digests(symbol_digests.to_vec())
-}
-
-fn deterministic_fallback_seed(object_id: ObjectId, k_source: u32) -> u64 {
-    let mut material = Vec::with_capacity(40);
-    material.extend_from_slice(b"fsqlite:tiered:fallback:seed:v1");
-    material.extend_from_slice(object_id.as_bytes());
-    material.extend_from_slice(&k_source.to_le_bytes());
-    xxh3_64(&material)
-}
-
-fn deterministic_fallback_timing_ns(
-    object_id: ObjectId,
-    k_source: u32,
-    accepted_esis: &[u32],
-    rejected_symbols: &[RejectedSymbol],
-    decode_success: bool,
-) -> u64 {
-    let mut material =
-        Vec::with_capacity(48 + accepted_esis.len() * 4 + rejected_symbols.len() * 5);
-    material.extend_from_slice(b"fsqlite:tiered:fallback:timing:v1");
-    material.extend_from_slice(object_id.as_bytes());
-    material.extend_from_slice(&k_source.to_le_bytes());
-    material.push(u8::from(decode_success));
-    for esi in accepted_esis {
-        material.extend_from_slice(&esi.to_le_bytes());
-    }
-    for item in rejected_symbols {
-        material.extend_from_slice(&item.esi.to_le_bytes());
-        material.push(rejection_reason_code(item.reason));
-    }
-    xxh3_64(&material)
-}
-
-fn rejection_reason_code(reason: SymbolRejectionReason) -> u8 {
-    match reason {
-        SymbolRejectionReason::HashMismatch => 1,
-        SymbolRejectionReason::InvalidAuthTag => 2,
-        SymbolRejectionReason::DuplicateEsi => 3,
-        SymbolRejectionReason::FormatViolation => 4,
-    }
 }
 
 #[cfg(test)]
@@ -1145,51 +1248,54 @@ mod tests {
         symbol_size: usize,
         repair_symbols: usize,
     ) -> Vec<SymbolRecord> {
-        let symbol_size_u32 = u32::try_from(symbol_size).expect("symbol_size fits u32");
-        let transfer_len_u64 = u64::try_from(payload.len()).expect("payload len fits u64");
+        use asupersync::raptorq::systematic::SystematicEncoder;
+
+        assert!(symbol_size > 0);
         let oti = Oti {
-            f: transfer_len_u64,
+            f: u64::try_from(payload.len()).expect("test payload length fits u64"),
             al: 1,
-            t: symbol_size_u32,
+            t: u32::try_from(symbol_size).expect("test symbol size fits u32"),
             z: 1,
             n: 1,
         };
-
-        let source_symbols = payload.len().div_ceil(symbol_size);
-        let mut out = Vec::new();
-        for idx in 0..source_symbols {
-            let start = idx * symbol_size;
-            let end = (start + symbol_size).min(payload.len());
-            let mut symbol = vec![0_u8; symbol_size];
-            symbol[..end - start].copy_from_slice(&payload[start..end]);
-            let esi = u32::try_from(idx).expect("source esi fits u32");
-            let flags = if idx == 0 {
-                SymbolRecordFlags::SYSTEMATIC_RUN_START
-            } else {
-                SymbolRecordFlags::empty()
-            };
-            out.push(SymbolRecord::new(object_id, oti, esi, symbol, flags));
-        }
-
-        for repair_idx in 0..repair_symbols {
-            let repair_esi_usize = source_symbols.saturating_add(repair_idx);
-            let esi = u32::try_from(repair_esi_usize).expect("repair esi fits u32");
-            let mut symbol = vec![0_u8; symbol_size];
-            let esi_low = u8::try_from(esi & 0xFF).expect("masked to u8");
-            for (offset, byte) in symbol.iter_mut().enumerate() {
-                let offset_low = u8::try_from(offset & 0xFF).expect("masked to u8");
-                *byte = esi_low ^ offset_low;
-            }
-            out.push(SymbolRecord::new(
+        let source: Vec<Vec<u8>> = payload
+            .chunks(symbol_size)
+            .map(|chunk| {
+                let mut symbol = vec![0; symbol_size];
+                symbol[..chunk.len()].copy_from_slice(chunk);
+                symbol
+            })
+            .collect();
+        let mut records = Vec::with_capacity(source.len() + repair_symbols);
+        for (index, symbol) in source.iter().enumerate() {
+            records.push(SymbolRecord::new(
                 object_id,
                 oti,
-                esi,
-                symbol,
-                SymbolRecordFlags::empty(),
+                u32::try_from(index).expect("test source ESI fits u32"),
+                symbol.clone(),
+                if index == 0 {
+                    SymbolRecordFlags::SYSTEMATIC_RUN_START
+                } else {
+                    SymbolRecordFlags::empty()
+                },
             ));
         }
-
-        out
+        if repair_symbols > 0 && !source.is_empty() {
+            let encoder =
+                SystematicEncoder::new(&source, symbol_size, xxh3_64(object_id.as_bytes()))
+                    .expect("real native ECS fixture encoder");
+            for offset in 0..repair_symbols {
+                let esi = u32::try_from(source.len() + offset).expect("test repair ESI fits u32");
+                records.push(SymbolRecord::new(
+                    object_id,
+                    oti,
+                    esi,
+                    encoder.repair_symbol(esi),
+                    SymbolRecordFlags::empty(),
+                ));
+            }
+        }
+        records
     }
 
     fn rejected_esis_set(proof: &EcsDecodeProof) -> BTreeSet<u32> {
@@ -1208,6 +1314,156 @@ mod tests {
                 &proof.rejected_symbols,
             )
             .ok
+    }
+
+    #[test]
+    fn test_fallback_recovers_missing_sources_and_exact_transfer_length() {
+        // K=9 exercises RFC padding; T=65536 exercises Native OTI sizes that
+        // cannot be represented by the page-FEC codec's u16 symbol size.
+        for (payload_len, symbol_size) in
+            [(1_usize, 8_usize), (65, 64), (513, 64), (65_537, 65_536)]
+        {
+            let object_id =
+                object_id_from_u64(u64::try_from(payload_len).expect("length fits u64"));
+            let mut payload: Vec<u8> = (0..payload_len)
+                .map(|index| u8::try_from(index % 251).expect("value fits u8"))
+                .collect();
+            *payload.last_mut().expect("nonempty payload") = 0;
+            let mut records = make_symbol_records(object_id, &payload, symbol_size, 16);
+            let k = u32::try_from(payload_len.div_ceil(symbol_size)).expect("K fits u32");
+            records.retain(|record| record.esi != 0 && record.esi != k - 1);
+
+            let mut storage = TieredStorage::new(DurabilityMode::local());
+            storage.insert_l2_segment(500, records);
+            let cx = Cx::<cap::All>::new().restrict::<cap::None>();
+            let recovered = storage
+                .fetch_object(&cx, object_id, 1, Option::<&mut MockRemoteTier>::None, None)
+                .expect("local repair symbols must recover erased sources without remote access");
+            assert_eq!(recovered.bytes, payload);
+            assert_eq!(recovered.bytes.len(), payload_len);
+            assert!(!recovered.remote_used);
+            assert_eq!(recovered.write_back_count, 0);
+            assert!(matches!(
+                recovered.read_path,
+                SymbolReadPath::FullDecodeFallback { .. }
+            ));
+            let proof = recovered.decode_proof.expect("actual decoder proof");
+            assert!(proof.decode_success);
+            assert_eq!(proof.seed, xxh3_64(object_id.as_bytes()));
+            assert_eq!(proof.intermediate_rank, None);
+            assert!(!proof.source_esis.contains(&0));
+            assert!(!proof.source_esis.contains(&(k - 1)));
+            assert!(decode_proof_report_ok(&proof));
+        }
+    }
+
+    #[test]
+    fn test_fallback_ignores_corrupt_symbols_while_recovering_erasures() {
+        let object_id = object_id_from_u64(0xEC5_0001);
+        let payload: Vec<u8> = (0_u16..513)
+            .map(|value| u8::try_from(value % 251).expect("value fits u8"))
+            .collect();
+        let mut records = make_symbol_records(object_id, &payload, 64, 16);
+        records.retain(|record| record.esi != 1 && record.esi != 8);
+        let corrupt_esi = 9;
+        records
+            .iter_mut()
+            .find(|record| record.esi == corrupt_esi)
+            .expect("repair symbol")
+            .symbol_data[0] ^= 0x80;
+
+        let cx = Cx::<cap::All>::new();
+        let recovered = recover_object_hybrid(&cx, &records)
+            .expect("valid repairs must recover missing sources despite a corrupt repair");
+        assert_eq!(recovered.bytes, payload);
+        let proof = recovered.decode_proof.expect("decoder proof");
+        assert!(!proof.symbols_received.contains(&corrupt_esi));
+        assert!(proof.rejected_symbols.contains(&RejectedSymbol {
+            esi: corrupt_esi,
+            reason: SymbolRejectionReason::HashMismatch,
+        }));
+        assert!(decode_proof_report_ok(&proof));
+    }
+
+    #[test]
+    fn test_fallback_rejects_corruption_that_exhausts_decode_budget() {
+        let object_id = object_id_from_u64(0xEC5_0002);
+        let payload = b"insufficient verified native symbols";
+        let mut records = make_symbol_records(object_id, payload, 8, 2);
+        records.retain(|record| record.esi != 0);
+        records[0].symbol_data[0] ^= 0x80;
+
+        let cx = Cx::<cap::All>::new();
+        let error = recover_object_hybrid(&cx, &records).expect_err("verified budget exhausted");
+        let HybridRecoverFailure::Decode(failure) = error else {
+            panic!("symbol loss is a decode failure");
+        };
+        assert!(failure.reason.contains("insufficient_symbols_for_fallback"));
+        assert!(!failure.proof.decode_success);
+        assert_eq!(failure.proof.intermediate_rank, None);
+        assert!(
+            failure
+                .proof
+                .rejected_symbols
+                .iter()
+                .any(|rejected| rejected.reason == SymbolRejectionReason::HashMismatch)
+        );
+        assert!(decode_proof_report_ok(&failure.proof));
+    }
+
+    #[test]
+    fn test_cancelled_local_recovery_does_not_escalate_or_write_back() {
+        let object_id = object_id_from_u64(0xEC5_0003);
+        let full = make_symbol_records(object_id, b"cancel before fountain decode", 8, 16);
+        let mut records = full.clone();
+        records.retain(|record| record.esi != 0);
+        let mut storage = TieredStorage::new(DurabilityMode::local());
+        storage.insert_l2_segment(501, records);
+        let mut remote = MockRemoteTier::default();
+        remote.set_object_symbols(object_id, full);
+        let cx = Cx::<cap::All>::new();
+        cx.cancel();
+
+        assert!(matches!(
+            storage.fetch_object(&cx, object_id, 1, Some(&mut remote), Some(remote_cap(17))),
+            Err(FrankenError::Abort)
+        ));
+        assert_eq!(remote.fetch_calls(), 0);
+        assert!(!storage.l2_segment_exists(storage.write_back_segment_id()));
+        assert!(storage.take_decode_audit_entries().is_empty());
+    }
+
+    #[test]
+    fn test_oversized_local_fallback_does_not_fetch_or_write_back() {
+        let object_id = object_id_from_u64(0xEC5_0004);
+        // K=4096 is valid RFC metadata, but its dense solve exceeds the
+        // existing 64 MiB work budget. Source 0 is missing; the K+2 remaining
+        // one-byte symbols pass count admission. All-zero source and repair
+        // equations avoid invoking a large fixture encoder just to test the
+        // resource guard that must run before any constraint matrix is built.
+        let oti = Oti {
+            f: 4096,
+            al: 1,
+            t: 1,
+            z: 1,
+            n: 1,
+        };
+        let records: Vec<SymbolRecord> = (1..4099)
+            .map(|esi| SymbolRecord::new(object_id, oti, esi, vec![0], SymbolRecordFlags::empty()))
+            .collect();
+        let mut storage = TieredStorage::new(DurabilityMode::local());
+        storage.insert_l2_segment(502, records.clone());
+        let mut remote = MockRemoteTier::default();
+        remote.set_object_symbols(object_id, records);
+        let cx = Cx::<cap::All>::new();
+
+        assert!(matches!(
+            storage.fetch_object(&cx, object_id, 1, Some(&mut remote), Some(remote_cap(18))),
+            Err(FrankenError::TooBig)
+        ));
+        assert_eq!(remote.fetch_calls(), 0);
+        assert!(!storage.l2_segment_exists(storage.write_back_segment_id()));
+        assert!(storage.take_decode_audit_entries().is_empty());
     }
 
     #[test]
@@ -1541,6 +1797,149 @@ mod tests {
     }
 
     #[test]
+    fn test_fetch_caches_only_accepted_fallback_symbols() {
+        let object_id = object_id_from_u64(0xEC5_0010);
+        let payload: Vec<u8> = (0_u16..513)
+            .map(|value| u8::try_from(value % 251).expect("value fits u8"))
+            .collect();
+        let mut records = make_symbol_records(object_id, &payload, 64, 16);
+        let canonical_oti = records[0].oti;
+        records.retain(|record| record.esi != 0);
+        for record in &mut records {
+            match record.esi {
+                9 => record.symbol_data[0] ^= 0x80,
+                10 => {
+                    *record = SymbolRecord::new(
+                        object_id,
+                        Oti {
+                            f: canonical_oti.f + 1,
+                            ..canonical_oti
+                        },
+                        record.esi,
+                        record.symbol_data.clone(),
+                        SymbolRecordFlags::empty(),
+                    );
+                    assert!(record.verify_integrity());
+                }
+                11 => {
+                    // Simulate a truncated response after valid encoding; the
+                    // safe constructor deliberately rejects this shape.
+                    record.symbol_data.truncate(63);
+                }
+                _ => {}
+            }
+        }
+        let unsupported_esis = [crate::replication_sender::MAX_REPLICATION_ESI + 1, u32::MAX];
+        for esi in unsupported_esis {
+            let unsupported = SymbolRecord::new(
+                object_id,
+                canonical_oti,
+                esi,
+                vec![0; 64],
+                SymbolRecordFlags::empty(),
+            );
+            assert!(unsupported.verify_integrity());
+            records.push(unsupported);
+        }
+
+        let mut storage = TieredStorage::new(DurabilityMode::local());
+        let mut remote = MockRemoteTier::default();
+        remote.set_object_symbols(object_id, records);
+        let cx = Cx::<cap::All>::new();
+        let recovered = storage
+            .fetch_object(&cx, object_id, 1, Some(&mut remote), Some(remote_cap(19)))
+            .expect("valid repairs recover the erased source despite rejected extras");
+        assert_eq!(recovered.bytes, payload);
+        assert!(recovered.remote_used);
+        assert_eq!(recovered.write_back_count, 21);
+        let proof = recovered.decode_proof.expect("repair decode proof");
+        for (esi, reason) in [
+            (9, SymbolRejectionReason::HashMismatch),
+            (10, SymbolRejectionReason::FormatViolation),
+            (11, SymbolRejectionReason::FormatViolation),
+            (unsupported_esis[0], SymbolRejectionReason::FormatViolation),
+            (unsupported_esis[1], SymbolRejectionReason::FormatViolation),
+        ] {
+            assert!(
+                proof
+                    .rejected_symbols
+                    .contains(&RejectedSymbol { esi, reason })
+            );
+            assert!(!proof.symbols_received.contains(&esi));
+        }
+
+        let cached = storage.l2_records_for_object(object_id);
+        assert_eq!(cached.len(), 21);
+        assert!(cached.iter().all(|record| {
+            record.verify_integrity()
+                && record.oti == canonical_oti
+                && record.symbol_data.len() == 64
+                && ![9, 10, 11].contains(&record.esi)
+                && !unsupported_esis.contains(&record.esi)
+        }));
+        let local_replay = storage
+            .fetch_object(&cx, object_id, 2, Option::<&mut MockRemoteTier>::None, None)
+            .expect("only accepted repair symbols should suffice for local replay");
+        assert_eq!(local_replay.bytes, payload);
+        assert!(!local_replay.remote_used);
+        assert_eq!(remote.fetch_calls(), 1);
+    }
+
+    #[test]
+    fn test_fast_path_cache_preserves_selected_duplicate_records() {
+        let object_id = object_id_from_u64(0xEC5_0011);
+        let payload = b"selected-symbol-records";
+        let expected = make_symbol_records(object_id, payload, 8, 0);
+        let mut fetched = expected.clone();
+        let mut corrupt_first = expected[1].clone();
+        corrupt_first.symbol_data[0] ^= 0x80;
+        fetched.insert(1, corrupt_first);
+        let mut truncated_first = expected[1].clone();
+        truncated_first.symbol_data.truncate(7);
+        fetched.insert(1, truncated_first.clone());
+        let selected = expected.last().expect("nonempty fixture");
+        let mut different_payload = selected.symbol_data.clone();
+        different_payload[0] ^= 0x40;
+        let conflicting_duplicate = SymbolRecord::new(
+            object_id,
+            selected.oti,
+            selected.esi,
+            different_payload,
+            SymbolRecordFlags::empty(),
+        );
+        assert!(conflicting_duplicate.verify_integrity());
+        fetched.push(conflicting_duplicate);
+        for esi in [crate::replication_sender::MAX_REPLICATION_ESI + 1, u32::MAX] {
+            let unsupported = SymbolRecord::new(
+                object_id,
+                selected.oti,
+                esi,
+                vec![0; 8],
+                SymbolRecordFlags::empty(),
+            );
+            assert!(unsupported.verify_integrity());
+            fetched.push(unsupported);
+        }
+
+        let mut storage = TieredStorage::new(DurabilityMode::local());
+        storage.insert_l2_segment(421, vec![truncated_first]);
+        let mut remote = MockRemoteTier::default();
+        remote.set_object_symbols(object_id, fetched);
+        let cx = Cx::<cap::All>::new();
+        let recovered = storage
+            .fetch_object(&cx, object_id, 1, Some(&mut remote), Some(remote_cap(20)))
+            .expect("selected intact systematic records should recover the object");
+        assert_eq!(recovered.bytes, payload);
+        assert_eq!(recovered.write_back_count, expected.len());
+        assert!(matches!(
+            recovered.read_path,
+            SymbolReadPath::SystematicFastPath
+        ));
+        assert!(recovered.decode_proof.is_none());
+        assert_eq!(storage.l2_records_for_object(object_id), expected);
+    }
+
+    #[test]
     fn test_fetch_repairs_corrupt_local_symbol_and_persists_healed_copy() {
         let object_id = object_id_from_u64(72);
         let payload = b"repair-corrupt-local-symbol";
@@ -1840,9 +2239,15 @@ mod tests {
 
         let proof_a = run_once();
         let proof_b = run_once();
+        let without_timing = |mut proof: EcsDecodeProof| {
+            proof.timing_ns = 0;
+            let digests = proof.symbol_digests.clone();
+            proof.with_symbol_digests(digests)
+        };
         assert_eq!(
-            proof_a, proof_b,
-            "proof artifacts must be stable for identical fallback input sets"
+            without_timing(proof_a),
+            without_timing(proof_b),
+            "replay inputs must be stable after excluding measured elapsed time"
         );
     }
 
@@ -1855,7 +2260,6 @@ mod tests {
             rng_seed: RngSeed::Fixed(0x0BAD_C0DE_u64),
             ..ProptestConfig::default()
         });
-
         let strategy = (
             prop::collection::vec(proptest::num::u8::ANY, 17..96),
             prop::collection::vec(0_u8..7, 0..4),
@@ -1865,94 +2269,38 @@ mod tests {
         runner
             .run(&strategy, |(payload, dropped_raw, corrupted_raw)| {
                 let object_id = object_id_from_u64(77);
-                let full = make_symbol_records(object_id, &payload, 8, 4);
-
+                let full = make_symbol_records(object_id, &payload, 8, 16);
                 let dropped: BTreeSet<u32> = dropped_raw.into_iter().map(u32::from).collect();
                 let corrupted: BTreeSet<u32> = corrupted_raw.into_iter().map(u32::from).collect();
-
-                let mut remote_records = Vec::new();
+                let mut records = Vec::new();
                 let mut expected_rejected = BTreeSet::new();
-                let mut accepted_esis = BTreeSet::new();
-
                 for mut record in full {
-                    if dropped.contains(&record.esi) {
+                    // Every case loses a source, plus up to six additional
+                    // distinct inputs. Genuine repairs must reconstruct it.
+                    if record.esi == 0 || dropped.contains(&record.esi) {
                         continue;
                     }
-                    // Always force the non-systematic fallback path while preserving
-                    // source-symbol availability semantics for success/failure checks.
-                    if record.esi == 0 {
-                        record = SymbolRecord::new(
-                            record.object_id,
-                            record.oti,
-                            record.esi,
-                            record.symbol_data.clone(),
-                            SymbolRecordFlags::empty(),
-                        );
-                    }
                     if corrupted.contains(&record.esi) {
-                        if let Some(first) = record.symbol_data.first_mut() {
-                            *first ^= 0x5A;
-                        }
+                        record.symbol_data[0] ^= 0x5A;
                         expected_rejected.insert(record.esi);
-                    } else {
-                        accepted_esis.insert(record.esi);
                     }
-                    remote_records.push(record);
+                    records.push(record);
                 }
+                records.reverse();
 
-                let source_symbols = payload.len().div_ceil(8);
-                let required_symbols = source_symbols.saturating_add(DEFAULT_FALLBACK_DECODE_SLACK);
-                let has_complete_source_run = (0..source_symbols).all(|index| {
-                    let esi = u32::try_from(index).expect("source index fits in u32");
-                    accepted_esis.contains(&esi)
-                });
-                let expect_success =
-                    accepted_esis.len() >= required_symbols && has_complete_source_run;
-
-                let mut storage = TieredStorage::new(DurabilityMode::local());
-                let mut remote = MockRemoteTier::default();
-                remote.set_object_symbols(object_id, remote_records);
                 let cx = Cx::<cap::All>::new();
-
-                let result = storage.fetch_object(
-                    &cx,
-                    object_id,
-                    56,
-                    Some(&mut remote),
-                    Some(remote_cap(12)),
-                );
-
-                if expect_success {
-                    let outcome =
-                        result.expect("decode should succeed when enough valid symbols remain");
-                    let used_fallback =
-                        matches!(outcome.read_path, SymbolReadPath::FullDecodeFallback { .. });
-                    prop_assert!(used_fallback);
-                    prop_assert_eq!(outcome.bytes, payload);
-                    let proof = outcome
-                        .decode_proof
-                        .expect("fallback-success path should emit decode proof");
-                    prop_assert!(proof.decode_success);
-                    prop_assert_eq!(rejected_esis_set(&proof), expected_rejected);
-                    prop_assert!(decode_proof_report_ok(&proof));
-                } else {
-                    let is_corrupt_error =
-                        matches!(result, Err(FrankenError::DatabaseCorrupt { .. }));
-                    prop_assert!(is_corrupt_error);
-                    let audit = storage.take_decode_audit_entries();
-                    let Some(failure_entry) = audit.iter().find(|entry| !entry.decode_success)
-                    else {
-                        return Err(proptest::test_runner::TestCaseError::fail(
-                            "expected failure decode proof artifact",
-                        ));
-                    };
-                    prop_assert_eq!(rejected_esis_set(&failure_entry.proof), expected_rejected);
-                    prop_assert!(decode_proof_report_ok(&failure_entry.proof));
-                }
-
+                let recovered = recover_object_hybrid(&cx, &records)
+                    .expect("bounded loss with sixteen genuine repair symbols");
+                prop_assert_eq!(recovered.bytes, payload);
+                let proof = recovered.decode_proof.expect("fountain fallback proof");
+                prop_assert!(proof.decode_success);
+                prop_assert_eq!(proof.seed, xxh3_64(object_id.as_bytes()));
+                prop_assert_eq!(proof.intermediate_rank, None);
+                prop_assert_eq!(rejected_esis_set(&proof), expected_rejected);
+                prop_assert!(decode_proof_report_ok(&proof));
                 Ok(())
             })
-            .expect("seeded SymbolRecord corruption property should hold");
+            .expect("seeded SymbolRecord corruption and erasure recovery should hold");
     }
 
     #[test]

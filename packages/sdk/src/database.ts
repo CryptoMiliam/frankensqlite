@@ -299,11 +299,10 @@ export class FrankenDB {
       );
     } catch (error: unknown) {
       try {
-        client.dispose();
+        client.dispose(undefined, { cause: error });
       } catch (cleanupError: unknown) {
         throw new AggregateError(
-          [error, cleanupError],
-          "FrankenSQLite initialization and worker cleanup both failed",
+          [error, cleanupError], "FrankenSQLite initialization and worker cleanup both failed",
           { cause: error },
         );
       }

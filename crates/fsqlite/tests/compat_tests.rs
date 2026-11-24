@@ -594,7 +594,7 @@ fn transaction_execute_params_compat() {
 }
 
 #[test]
-fn transaction_failed_commit_keeps_transaction_open_for_explicit_rollback() {
+fn transaction_failed_commit_leaves_the_transaction_as_the_engine_left_it() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("compat_failed_commit_keeps_tx_open.db");
@@ -627,17 +627,23 @@ fn transaction_failed_commit_keeps_transaction_open_for_explicit_rollback() {
             .await
             .unwrap();
 
-        let loser_err = match tx_b.execute("UPDATE t SET v = v + 1 WHERE id = 1;").await {
+        let (loser_err, refused_at_commit) = match tx_b
+            .execute("UPDATE t SET v = v + 1 WHERE id = 1;")
+            .await
+        {
             Ok(changes) => {
                 assert_eq!(changes, 1);
                 tx_a.commit().await.unwrap();
-                tx_b.commit().await.expect_err(
-                "second compat transaction should fail transiently once the stale snapshot resolves",
-            )
+                (
+                        tx_b.commit().await.expect_err(
+                            "second compat transaction should fail transiently once the stale snapshot resolves",
+                        ),
+                        true,
+                    )
             }
             Err(err) => {
                 tx_a.commit().await.unwrap();
-                err
+                (err, false)
             }
         };
 
@@ -645,16 +651,32 @@ fn transaction_failed_commit_keeps_transaction_open_for_explicit_rollback() {
             loser_err.is_transient(),
             "losing compat transaction should fail transiently, got {loser_err:?}"
         );
-        assert!(
-            conn_b.in_transaction(),
-            "failed compat commit must leave the underlying transaction open for caller-directed recovery"
-        );
-
-        tx_b.rollback().await.unwrap();
-        assert!(
-            !conn_b.in_transaction(),
-            "explicit rollback should close the failed compat transaction"
-        );
+        if refused_at_commit && matches!(loser_err, FrankenError::BusySnapshot { .. }) {
+            // bd-reality-check-1022-llk6g.5.1: a COMMIT refused with
+            // BusySnapshot can never commit, so the engine rolls it back and
+            // the compat handle is finalized.
+            assert!(
+                !conn_b.in_transaction(),
+                "a COMMIT refused with BusySnapshot ends the underlying transaction"
+            );
+            assert!(
+                matches!(
+                    tx_b.rollback().await,
+                    Err(FrankenError::NoActiveTransaction)
+                ),
+                "the finalized compat handle has nothing left to roll back"
+            );
+        } else {
+            assert!(
+                conn_b.in_transaction(),
+                "a statement-level conflict leaves the underlying transaction open for caller-directed recovery"
+            );
+            tx_b.rollback().await.unwrap();
+            assert!(
+                !conn_b.in_transaction(),
+                "explicit rollback should close the failed compat transaction"
+            );
+        }
 
         let row = conn_a
             .query_row("SELECT v FROM t WHERE id = 1")
@@ -1318,7 +1340,7 @@ fn gh294_read_only_namespace_recovery_changes_only_ns_use() {
         );
         let repaired = open_with_flags(target_str, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .await
-            .expect("corrupt quiescent namespace state must be repairable");
+            .expect("corrupt quiescent namespace state must not block read-only open");
         let repaired_row = repaired
             .query_row("SELECT value FROM copied_probe")
             .await
@@ -1350,31 +1372,36 @@ fn gh294_read_only_namespace_recovery_changes_only_ns_use() {
                 );
             }
         }
-        assert_ne!(
+        // bd-j2dtf: this read-only open used to repair the record, the one
+        // file it changed. GH#535 forbids that write, and stock has no such
+        // file, so a read-only open now reads the database sidecar-less and
+        // leaves the corrupt record for a writable opener to rebind. The
+        // name keeps its bead reference (bd-13m32): no other file changes.
+        assert_eq!(
             after_recovery
                 .get(&namespace_use_name)
-                .expect("snapshot rebound namespace use artifact")
+                .expect("snapshot namespace use artifact after the read-only open")
                 .bytes,
             b"corrupt copied namespace state",
-            "GH #294 namespace recovery must replace the corrupt namespace identity"
+            "a read-only open must not rewrite the namespace identity (GH#535)"
         );
 
         let rebound = open_with_flags(target_str, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .await
-            .expect("rebound namespace identity must remain valid for a new read-only open");
+            .expect("a second read-only open beside the corrupt record must succeed");
         let rebound_row = rebound
             .query_row("SELECT value FROM copied_probe")
             .await
-            .expect("query through the persisted rebound namespace identity");
+            .expect("query beside the corrupt namespace record");
         assert_eq!(rebound_row.get(0), Some(&SqliteValue::Integer(17)));
         rebound
             .close_without_checkpoint()
             .await
-            .expect("close read-only rebound namespace verification connection");
+            .expect("close the second read-only connection");
         assert_eq!(
             snapshot_directory_files(dir.path()),
             after_recovery,
-            "GH #294 valid rebound verification must not mutate any artifact"
+            "GH #294 a second read-only open must not mutate any artifact"
         );
 
         assert_eq!(
@@ -1416,6 +1443,7 @@ fn gh294_read_only_namespace_recovery_changes_only_ns_use() {
             .expect("close copied-database read-write connection");
 
         let missing = dir.path().join("readonly_namespace_missing_main.db");
+        let missing_str = missing.to_str().unwrap();
         for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
             std::fs::copy(
                 suffixed_path(&source, suffix),
@@ -1423,19 +1451,51 @@ fn gh294_read_only_namespace_recovery_changes_only_ns_use() {
             )
             .expect("copy orphan namespace sidecar");
         }
-        let missing_result = open_with_flags(
-            missing.to_str().unwrap(),
+        // A WAL or rollback journal beside the missing main database may hold
+        // committed data: stale namespace state must not create a replacement
+        // while either survives.
+        for survivor in ["-wal", "-journal"] {
+            std::fs::write(suffixed_path(&missing, survivor), b"surviving bytes")
+                .expect("write surviving companion");
+            let missing_result = open_with_flags(
+                missing_str,
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+            )
+            .await;
+            assert!(
+                matches!(missing_result, Err(FrankenError::CannotOpen { .. })),
+                "a surviving {survivor} must refuse the open: {:?}",
+                missing_result.as_ref().err()
+            );
+            assert!(
+                !missing.exists(),
+                "stale namespace state must not create a replacement while {survivor} survives"
+            );
+            std::fs::remove_file(suffixed_path(&missing, survivor))
+                .expect("remove surviving companion");
+        }
+        // bd-w4pr1.21: with the main file, WAL and journal all gone (a database
+        // deleted the SQLite way) nothing can be lost, so the quiescent record
+        // gives way and the database is created, as stock SQLite does.
+        let created = open_with_flags(
+            missing_str,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
         )
-        .await;
-        assert!(matches!(
-            missing_result,
-            Err(FrankenError::CannotOpen { .. })
-        ));
+        .await
+        .expect("a deleted database is created again beside stale namespace sidecars");
+        created
+            .execute("CREATE TABLE fresh(x INTEGER)")
+            .await
+            .expect("write the recreated database");
         assert!(
-            !missing.exists(),
-            "stale namespace state must not create a replacement for a missing main database"
+            created
+                .query_row("SELECT value FROM copied_probe")
+                .await
+                .is_err(),
+            "the recreated database must not resurrect the copied table"
         );
+        created.close().await.expect("close the recreated database");
+        assert!(missing.exists(), "the main database is created");
     });
 }
 

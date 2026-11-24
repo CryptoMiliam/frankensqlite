@@ -47,8 +47,8 @@ use fsqlite_types::record::{
 use fsqlite_types::value::SqliteValue;
 
 use crate::connection::{
-    Connection, ImplicitAutoindexSlot, affinity_char_to_type, codegen_error_to_franken,
-    collect_primary_key_desc_flags, column_def_is_exact_integer, implicit_autoindex_layout,
+    Connection, ImplicitAutoindexSlot, affinity_char_to_type,
+    column_def_is_exact_integer, implicit_autoindex_layout,
     validate_builtin_persisted_index_expr_functions,
 };
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
@@ -57,11 +57,11 @@ use crate::connection::{
     qualified_unique_constraint_label, unshadowed_hidden_rowid_alias,
 };
 use fsqlite_types::{
-    DATABASE_HEADER_SIZE, DatabaseHeader, PageNumber, PageSize, without_rowid_storage_order,
+    DATABASE_HEADER_SIZE, DatabaseHeader, PageNumber, PageSize,
 };
 use fsqlite_vdbe::codegen::{
     CheckConstraint, ColumnInfo, FkActionType, FkDef, IndexSchema, TableSchema,
-    bind_explicit_index, without_rowid_pk_indices,
+    bind_explicit_index,
 };
 use fsqlite_vdbe::engine::MemDatabase;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native", unix))]
@@ -1195,6 +1195,7 @@ pub async fn persist_to_sqlite_with_header_and_master_entries<S: BuildHasher>(
         extra_master_entries,
         original_ddl,
         None,
+        None,
     )
     .await
 }
@@ -1225,6 +1226,37 @@ pub async fn persist_to_reserved_sqlite_with_header_and_master_entries<S: BuildH
         extra_master_entries,
         original_ddl,
         Some(expected_identity),
+        None,
+    )
+    .await
+}
+
+/// Like [`persist_to_reserved_sqlite_with_header_and_master_entries`], but
+/// optionally activates page-level encryption on the staged pager before any
+/// schema or user row pages are written.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+pub async fn persist_to_reserved_sqlite_with_header_and_master_entries_and_cipher<S: BuildHasher>(
+    cx: &Cx,
+    path: &Path,
+    expected_identity: FileIdentity,
+    schema: &[TableSchema],
+    db: &MemDatabase,
+    header_template: &DatabaseHeader,
+    extra_master_entries: &[SqliteMasterEntry],
+    original_ddl: &HashMap<String, String, S>,
+    page_cipher: Option<fsqlite_pager::ActivePageCipher>,
+) -> Result<()> {
+    persist_to_sqlite_with_header_and_master_entries_impl(
+        cx,
+        path,
+        schema,
+        db,
+        header_template,
+        extra_master_entries,
+        original_ddl,
+        Some(expected_identity),
+        page_cipher,
     )
     .await
 }
@@ -1240,6 +1272,7 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
     extra_master_entries: &[SqliteMasterEntry],
     original_ddl: &HashMap<String, String, S>,
     expected_empty_identity: Option<FileIdentity>,
+    page_cipher: Option<fsqlite_pager::ActivePageCipher>,
 ) -> Result<()> {
     if expected_empty_identity.is_none() && path.exists() {
         // Legacy overwrite callers deliberately replace their own target.
@@ -1261,12 +1294,156 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
     } else {
         SimplePager::open_with_cx(cx, vfs, path, header_template.page_size).await?
     };
+    if let Some(active_cipher) = page_cipher {
+        pager
+            .initialize_empty_encrypted_page1(cx, active_cipher, header_template.reserved_per_page)
+            .await?;
+    }
+    persist_into_open_pager(
+        cx,
+        &pager,
+        schema,
+        db,
+        header_template,
+        extra_master_entries,
+        original_ddl,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Persist `MemDatabase` + schema into a fresh in-memory SQLite database image
+/// and return the compacted bytes together with the final page-1 header
+/// (bd-6873b).
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+#[allow(clippy::too_many_arguments)]
+pub async fn persist_to_memory_image_bytes<S: BuildHasher>(
+    cx: &Cx,
+    schema: &[TableSchema],
+    db: &MemDatabase,
+    header_template: &DatabaseHeader,
+    extra_master_entries: &[SqliteMasterEntry],
+    original_ddl: &HashMap<String, String, S>,
+    page_cipher: Option<fsqlite_pager::ActivePageCipher>,
+) -> Result<(Vec<u8>, DatabaseHeader)> {
+    let vfs = fsqlite_vfs::MemoryVfs::new();
+    let pager =
+        SimplePager::open_with_cx(cx, vfs, Path::new(":memory:"), header_template.page_size)
+            .await?;
+    if let Some(active_cipher) = page_cipher {
+        pager
+            .initialize_empty_encrypted_page1(cx, active_cipher, header_template.reserved_per_page)
+            .await?;
+    }
+    persist_into_open_pager(
+        cx,
+        &pager,
+        schema,
+        db,
+        header_template,
+        extra_master_entries,
+        original_ddl,
+    )
+    .await?;
+    // Read back the authoritative committed page-1 header after `txn.commit()`
+    // so pager-stamped counters (e.g. `change_counter` / `version_valid_for`)
+    // match the exported image byte-for-byte for both plaintext and encrypted
+    // databases.
+    let committed_header = {
+        let mut read_txn = pager.begin(cx, TransactionMode::ReadOnly).await?;
+        let page1 = read_txn.get_page(cx, PageNumber::ONE).await?;
+        let header_bytes: &[u8; DATABASE_HEADER_SIZE] = page1
+            .as_ref()
+            .get(..DATABASE_HEADER_SIZE)
+            .and_then(|slice| slice.try_into().ok())
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "compacted in-memory page 1 shorter than database header".to_owned(),
+            })?;
+        let header = DatabaseHeader::from_bytes(header_bytes).map_err(|err| {
+            FrankenError::DatabaseCorrupt {
+                detail: format!("invalid compacted in-memory database header: {err}"),
+            }
+        })?;
+        let _ = read_txn.rollback(cx).await;
+        header
+    };
+    let bytes = pager.export_database_bytes(cx).await?;
+    Ok((bytes, committed_header))
+}
+
+#[allow(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    clippy::cast_possible_truncation
+)]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+async fn persist_into_open_pager<V: fsqlite_vfs::Vfs, S: BuildHasher>(
+    cx: &Cx,
+    pager: &SimplePager<V>,
+    schema: &[TableSchema],
+    db: &MemDatabase,
+    header_template: &DatabaseHeader,
+    extra_master_entries: &[SqliteMasterEntry],
+    original_ddl: &HashMap<String, String, S>,
+) -> Result<()>
+where
+    V::File: 'static,
+{
     let mut txn = pager.begin(cx, TransactionMode::Immediate).await?;
 
     let page_size = header_template.page_size;
     let page_size_usize = page_size.as_usize();
     let usable_size = page_size.usable(header_template.reserved_per_page);
     let full_page_size = page_size.get();
+    let auto_vacuum_mode = header_template.auto_vacuum_mode();
+    let uses_pointer_map = auto_vacuum_mode.uses_pointer_map();
+    let mut preallocated_table_roots: HashMap<usize, PageNumber> = HashMap::new();
+    let mut preallocated_index_roots: HashMap<(usize, usize), PageNumber> = HashMap::new();
+    let mut largest_root_page: u32 = if uses_pointer_map { 1 } else { 0 };
+    if uses_pointer_map {
+        txn.set_auto_vacuum_state(auto_vacuum_mode, 1);
+        // Pass 1 (bd-1q134): in auto-vacuum mode, allocate every table and index
+        // root page before inserting any rows so all roots sit contiguously in
+        // `3..=largest_root_page` (skipping pointer-map/lock-byte pages) and no
+        // non-root data or overflow page is ever placed below `largest_root_page`.
+        for (table_idx, table) in schema.iter().enumerate() {
+            if db.get_table(table.root_page).is_none() {
+                continue;
+            }
+            let table_root = txn.allocate_page(cx).await?;
+            txn.write_ptrmap_entry(
+                cx,
+                table_root,
+                fsqlite_types::PtrMapEntry {
+                    kind: fsqlite_types::PtrMapType::RootPage,
+                    parent: None,
+                },
+            )
+            .await?;
+            largest_root_page = largest_root_page.max(table_root.get());
+            preallocated_table_roots.insert(table_idx, table_root);
+            for (idx_pos, index) in table.indexes.iter().enumerate() {
+                let is_expression_index =
+                    index.columns.is_empty() && !index.key_expressions.is_empty();
+                if index.columns.is_empty() && !is_expression_index {
+                    continue;
+                }
+                let idx_root = txn.allocate_page(cx).await?;
+                txn.write_ptrmap_entry(
+                    cx,
+                    idx_root,
+                    fsqlite_types::PtrMapEntry {
+                        kind: fsqlite_types::PtrMapType::RootPage,
+                        parent: None,
+                    },
+                )
+                .await?;
+                largest_root_page = largest_root_page.max(idx_root.get());
+                preallocated_index_roots.insert((table_idx, idx_pos), idx_root);
+            }
+        }
+        txn.set_auto_vacuum_state(auto_vacuum_mode, largest_root_page);
+    }
 
     // Track (type, name, tbl_name, root_page, create_sql) for sqlite_master entries.
     // Extended from just tables to also include indexes, views, and triggers.
@@ -1275,7 +1452,7 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
     let mut master_entries: Vec<SqliteMasterEntry> = Vec::new();
 
     // Write each table's data into its own B-tree.
-    for table in schema {
+    for (table_idx, table) in schema.iter().enumerate() {
         let Some(mem_table) = db.get_table(table.root_page) else {
             continue;
         };
@@ -1309,8 +1486,13 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
             None
         };
 
-        // Allocate a fresh root page for this table in the on-disk file.
-        let root_page = txn.allocate_page(cx).await?;
+        // Allocate a fresh root page for this table in the on-disk file (or use
+        // the pre-allocated contiguous root in auto-vacuum mode).
+        let root_page = if let Some(&pre) = preallocated_table_roots.get(&table_idx) {
+            pre
+        } else {
+            txn.allocate_page(cx).await?
+        };
 
         if let Some(pk) = without_rowid_pk.as_ref() {
             // Index root (0x0A), not a table root (0x0D). Flipping only the
@@ -1377,9 +1559,10 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
             // serialized record. Leading-PK tables give the identity permutation
             // (physical == declared), so this is a no-op for them. bd-w4pr1.31:
             // the record leaves VIRTUAL generated columns out, as stock's does.
-            let mut storage_order = without_rowid_storage_order(&pk.indices, table.columns.len());
-            storage_order
-                .retain(|&declared_idx| !table.columns[declared_idx].is_virtual_generated());
+            let mut storage_order = pk.indices.clone();
+            storage_order.extend((0..table.columns.len()).filter(|col| {
+                !pk.indices.contains(col) && !table.columns[*col].is_virtual_generated()
+            }));
             let mut pk_rows: Vec<Vec<SqliteValue>> = mem_table
                 .iter_rows()
                 .map(|(_synthetic_rowid, values)| {
@@ -1491,7 +1674,7 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
         // root pages that must contain valid B-tree data. Skipping them causes
         // "wrong # of entries in index" and "page N: never used" errors when
         // stock SQLite runs integrity_check (issue #55).
-        for index in &table.indexes {
+        for (idx_pos, index) in table.indexes.iter().enumerate() {
             let is_expression_index = index.columns.is_empty() && !index.key_expressions.is_empty();
             if index.columns.is_empty() && !is_expression_index {
                 continue;
@@ -1513,18 +1696,28 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                 Vec::new()
             };
             // Allocate and initialize root page as leaf index page (0x0A).
-            let idx_root = txn.allocate_page(cx).await?;
+            let idx_root = if let Some(&pre) = preallocated_index_roots.get(&(table_idx, idx_pos)) {
+                pre
+            } else {
+                txn.allocate_page(cx).await?
+            };
             init_leaf_index_page(cx, &mut txn, idx_root, page_size_usize, usable_size).await?;
 
             // Parse the partial index WHERE clause (if any) so we can skip
-            // rows that don't satisfy the predicate.
+            // rows that don't satisfy the predicate. bd-65jog: its row-value
+            // comparisons are expanded, as every reader of it expands them.
             let partial_predicate = index
                 .where_clause
                 .as_deref()
                 .map(fsqlite_parser::expr::parse_expr)
                 .transpose()
-                .ok()
-                .flatten();
+                .map_err(|error| FrankenError::DatabaseCorrupt {
+                    detail: format!("invalid predicate for index `{}`: {error}", index.name),
+                })?
+                .map(|mut predicate| {
+                    fsqlite_ast::row_value::lower_row_values_in_expr(&mut predicate);
+                    predicate
+                });
 
             // Populate the index B-tree from table rows.
             {
@@ -1579,16 +1772,20 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                 let mut index_collations: Vec<Option<String>> = (0..key_terms)
                     .map(|term| index.key_collations.get(term).cloned().flatten())
                     .collect();
-                // GH #340: metadata for the row-locator suffix. A rowid table's
-                // suffix is one synthetic integer, so one ASC/BINARY entry
-                // describes it. A WITHOUT ROWID table's suffix is its whole
-                // primary key, and each of those columns carries its own
-                // declared direction and collation — the single trailing entry
-                // that used to be pushed here described a rowid this branch
-                // does not write.
-                if let Some(pk) = without_rowid_pk.as_ref() {
-                    index_desc_flags.extend(pk.desc_flags.iter().copied());
-                    index_collations.extend(pk.collations.iter().cloned());
+                // The payload and the comparator must use the same locator.
+                let mut suffix_columns = Vec::new();
+                if let Some(pk) = &without_rowid_pk {
+                    // SQLite's convertToWithoutRowidTable leaves appended PK
+                    // fields ASC on implicit UNIQUE autoindexes (bAscKeyBug,
+                    // ticket bba7b69f9849b5bf); explicit CREATE INDEX inherits
+                    // the declared PK direction (bd-l7z39).
+                    let inherits_pk_direction =
+                        parse_autoindex_ordinal(&index.name, &table.name).is_none();
+                    for slot in index.without_rowid_locator_slots(table, &pk.indices, &pk.collations) {
+                        suffix_columns.push(pk.indices[slot]);
+                        index_desc_flags.push(inherits_pk_direction && pk.desc_flags[slot]);
+                        index_collations.push(pk.collations[slot].clone());
+                    }
                 } else {
                     index_desc_flags.push(false);
                     index_collations.push(None);
@@ -1723,12 +1920,8 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                         } else {
                             values
                         };
-                        // For partial indexes, skip rows that don't match
-                        // the WHERE predicate. If evaluation fails, include
-                        // the row (safe default).
-                        if let Some(ref predicate) = partial_predicate
-                            && let Ok(result) = eval_join_expr(predicate, eval_row, &col_map)
-                            && !is_sqlite_truthy(&result)
+                        if let Some(predicate) = &partial_predicate
+                            && !is_sqlite_truthy(&eval_join_expr(predicate, eval_row, &col_map)?)
                         {
                             continue;
                         }
@@ -1754,14 +1947,8 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                                 }
                             }
                         }
-                        // GH #340: append the row locator. A rowid table
-                        // appends its rowid; a WITHOUT ROWID table appends
-                        // every primary-key column in declared PK order, which
-                        // is the only way the entry can identify its row —
-                        // there is no rowid to point at. This matches the
-                        // ordinary index-backfill path.
-                        if let Some(pk) = without_rowid_pk.as_ref() {
-                            for &col_idx in &pk.indices {
+                        if table.without_rowid {
+                            for &col_idx in &suffix_columns {
                                 key_values.push(
                                     values.get(col_idx).cloned().unwrap_or(SqliteValue::Null),
                                 );
@@ -1909,20 +2096,45 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
     // Fix up the database header on page 1: update page_count,
     // change_counter, and schema_cookie so sqlite3 validates the file.
     {
+        if uses_pointer_map {
+            let live_free = txn.live_freelist_pages();
+            if !live_free.is_empty() {
+                let orig_db_size = txn.live_db_size();
+                let outcome = fsqlite_btree::freelist::ptrmap_compact_full(
+                    cx,
+                    &mut TransactionPageIo::new(&mut txn),
+                    orig_db_size,
+                    largest_root_page,
+                    &live_free,
+                    usable_size,
+                    full_page_size,
+                )
+                .await?;
+                if outcome.pages_reclaimed > 0 {
+                    txn.apply_auto_vacuum_truncation(
+                        outcome.new_db_size,
+                        outcome.remaining_freelist,
+                        &outcome.relocated_src_pages,
+                    )?;
+                }
+            }
+        }
+
         let mut hdr_page = txn.get_page(cx, PageNumber::ONE).await?.into_vec();
 
-        // Discover the current page count by allocating one more page.
-        // The extra page is included in the commit (the pager does not
-        // support free_page), so the exported file has one trailing empty
-        // page. This is benign: SQLite tolerates pages beyond the last
-        // B-tree node, and the page_count header excludes it.
-        let next_page = txn.allocate_page(cx).await?.get();
-        let max_page = next_page.saturating_sub(1).max(1);
+        // Use the pager transaction's authoritative live page count without
+        // allocating a dummy trailing page (bd-1q134, bd-6873b).
+        let max_page = txn.live_db_size().max(1);
 
         let mut final_header = header_template.clone();
         final_header.page_count = max_page;
         final_header.freelist_trunk = 0;
         final_header.freelist_count = 0;
+        if uses_pointer_map {
+            final_header.largest_root_page = largest_root_page;
+            final_header.incremental_vacuum =
+                u32::from(auto_vacuum_mode == fsqlite_types::AutoVacuumMode::Incremental);
+        }
         final_header.change_counter = final_header.change_counter.max(1);
         final_header.schema_cookie = final_header.schema_cookie.max(1);
         final_header.version_valid_for = final_header.change_counter;
@@ -2172,6 +2384,7 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                 };
                 if !column_indices.is_empty() {
                     mem_table.add_unique_column_group_labeled(
+                        cx,
                         column_indices,
                         slot.key_collations().to_vec(),
                         qualified_unique_constraint_label(
@@ -2179,7 +2392,7 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                             slot.columns().iter().map(String::as_str),
                         ),
                         slot.is_primary_key(),
-                    );
+                    )?;
                 }
             }
             if cursor.first(cx).await? {
@@ -2386,9 +2599,6 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 struct WithoutRowidPkLayout {
     /// Declared-order column positions of the primary key.
-    ///
-    /// `without_rowid_pk_indices` guarantees these are the *leading* columns,
-    /// which is what makes "key = leading N columns" well defined.
     indices: Vec<usize>,
     /// One flag per PK column: true when that column is declared `DESC`.
     desc_flags: Vec<bool>,
@@ -2406,77 +2616,24 @@ struct WithoutRowidPkLayout {
 /// another is precisely how an image ends up contradicting itself and failing
 /// `quick_check` — the failure class GH #340 was filed for.
 ///
-/// Collations mirror the runtime table-cursor registration, which takes the
-/// *column's* declared `COLLATE` (see the `without_rowid` branch that builds
-/// `index_collations_by_root_page` in `connection.rs`). A `COLLATE` written on
-/// the PK term itself is not consulted there, so it is not consulted here
-/// either; diverging would make the rebuilt order disagree with the order the
-/// engine uses to read it back. That inherited limitation is the runtime's,
-/// not one introduced by this repair.
-///
-/// Refuses rather than guesses. An unparseable DDL, a PK this builder cannot
-/// place, or a direction vector whose arity disagrees with the key all produce
-/// a typed refusal, because the alternative is a silently mis-ordered image
-/// that still passes as "successful VACUUM".
+/// Like the integrity reader, resolve effective collations on the PK terms,
+/// including table-level overrides of the columns' declared collations.
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 fn resolve_without_rowid_pk_layout(
     table: &TableSchema,
     create_sql: &str,
 ) -> Result<WithoutRowidPkLayout> {
-    // Leading-PK placement is fsqlite's storage rule for WITHOUT ROWID tables.
-    // Reuse the codegen helper that already owns it instead of restating it:
-    // two copies of this rule silently drifting apart is a worse failure than
-    // the one being fixed.
-    let indices = without_rowid_pk_indices(table).map_err(codegen_error_to_franken)?;
-
-    let Some(Statement::CreateTable(create)) = parse_single_statement(create_sql) else {
-        return Err(FrankenError::not_implemented(format!(
-            "WITHOUT ROWID table `{}` cannot be rebuilt: its CREATE TABLE text does not parse, \
-             so the primary-key direction its b-tree must be keyed by is unknown",
-            table.name
-        )));
-    };
-    let CreateTableBody::Columns {
-        columns: column_defs,
-        constraints,
-    } = &create.body
-    else {
-        return Err(FrankenError::not_implemented(format!(
-            "WITHOUT ROWID table `{}` cannot be rebuilt from a CREATE TABLE ... AS SELECT form: \
-             it declares no primary-key columns to key the table b-tree by",
-            table.name
-        )));
-    };
-
-    let desc_flags = collect_primary_key_desc_flags(column_defs, constraints)
-        .into_iter()
-        .next()
-        .unwrap_or_default();
-    if desc_flags.len() != indices.len() {
-        return Err(FrankenError::not_implemented(format!(
-            "WITHOUT ROWID table `{}` declares {} primary-key column(s) but its CREATE TABLE text \
-             yields {} sort direction(s); refusing to rebuild rather than key the table b-tree by \
-             a direction vector that does not describe it",
-            table.name,
-            indices.len(),
-            desc_flags.len()
-        )));
-    }
-
-    let collations = indices
-        .iter()
-        .map(|&col_idx| {
-            table
-                .columns
-                .get(col_idx)
-                .and_then(|column| column.collation.clone())
+    let primary = Connection::without_rowid_primary_key_from_ddl(table, create_sql)?;
+    let indices = primary.columns.iter().map(|name| {
+        table.column_index(name).ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: format!("unknown primary-key column {name} of {}", table.name),
         })
-        .collect();
-
+    }).collect::<Result<Vec<_>>>()?;
+    let desc_flags = (0..indices.len()).map(|slot| primary.key_term_descending(slot)).collect();
     Ok(WithoutRowidPkLayout {
         indices,
         desc_flags,
-        collations,
+        collations: primary.key_collations,
     })
 }
 

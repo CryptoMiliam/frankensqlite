@@ -163,6 +163,89 @@ fn bd_gu1bi_utf8_cast_blob_expression_index_integrity_matches_stock() {
     });
 }
 
+#[test]
+fn cast_blob_writes_searchable_index_entries_in_the_database_encoding() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::TempDir::new().unwrap();
+        for (encoding, header) in [("UTF-8", 1), ("UTF-16le", 2), ("UTF-16be", 3)] {
+            let oracle = rusqlite::Connection::open_in_memory().unwrap();
+            oracle
+                .execute_batch(&format!("PRAGMA encoding='{encoding}'; CREATE TABLE seed(x)"))
+                .unwrap();
+            let blob: String = oracle
+                .query_row("SELECT hex(CAST('café🎵' AS BLOB))", [], |r| r.get(0))
+                .unwrap();
+            let predicate = format!("CAST(y AS BLOB) = x'{blob}'");
+            let schema = "CREATE TABLE t(k INTEGER PRIMARY KEY, y TEXT) WITHOUT ROWID";
+            for native_origin in [false, true] {
+                let path = dir.path().join(format!("{encoding}-{native_origin}.db"));
+                let init = format!("PRAGMA encoding='{encoding}'; {schema}");
+                if !native_origin {
+                    rusqlite::Connection::open(&path)
+                        .unwrap()
+                        .execute_batch(&init)
+                        .unwrap();
+                }
+                let db = Connection::open(path.to_str().unwrap()).await.unwrap();
+                if native_origin {
+                    db.execute(&init).await.unwrap();
+                }
+                let sql = "SELECT CAST(?1 AS BLOB)";
+                let prepared = db.prepare(sql).await.unwrap();
+                for (native, reference) in [
+                    (SqliteValue::from("café🎵"), rusqlite::types::Value::Text("café🎵".to_owned())),
+                    (SqliteValue::Integer(-12), rusqlite::types::Value::Integer(-12)),
+                    (SqliteValue::Float(1.25), rusqlite::types::Value::Real(1.25)),
+                    (SqliteValue::from(vec![0, 255]), rusqlite::types::Value::Blob(vec![0, 255])),
+                    (SqliteValue::Null, rusqlite::types::Value::Null),
+                ] {
+                    let expected: Option<Vec<u8>> = oracle.query_row(sql, [reference], |row| row.get(0)).unwrap();
+                    let result = prepared.query_with_params(&[native]).await.unwrap();
+                    assert_eq!(result.len(), 1);
+                    assert_eq!(result[0].values(), &[expected.map_or(SqliteValue::Null, SqliteValue::from)]);
+                }
+                drop(prepared);
+                db.execute("INSERT INTO t VALUES(1,'café🎵'),(2,'other')")
+                    .await
+                    .unwrap();
+                db.execute(&format!("CREATE INDEX p ON t(k) WHERE {predicate}"))
+                    .await
+                    .unwrap();
+                db.execute("CREATE INDEX e ON t(CAST(y AS BLOB))")
+                    .await
+                    .unwrap();
+                db.execute("UPDATE t SET y='other' WHERE k=1").await.unwrap();
+                db.execute("UPDATE t SET y='café🎵' WHERE k=2").await.unwrap();
+                db.execute("INSERT INTO t VALUES(3,'café🎵')").await.unwrap();
+                db.close().await.unwrap();
+
+                assert_eq!(header_text_encoding(&path), header);
+                let stock = rusqlite::Connection::open(&path).unwrap();
+                for index in ["p", "e"] {
+                    let sql = format!(
+                        "SELECT k FROM t INDEXED BY {index} WHERE {predicate} ORDER BY k"
+                    );
+                    let mut stmt = stock.prepare(&sql).unwrap();
+                    let keys = stmt
+                        .query_map([], |r| r.get::<_, i64>(0))
+                        .unwrap()
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .unwrap();
+                    assert_eq!(keys, [2, 3], "{encoding} {native_origin} {index}");
+                }
+                let verdict: String = stock
+                    .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(verdict, "ok", "{encoding} {native_origin}");
+                drop(stock);
+                let reopened = Connection::open(path.to_str().unwrap()).await.unwrap();
+                assert_eq!(integrity_check(&reopened).await, ["ok"]);
+                reopened.close().await.unwrap();
+            }
+        }
+    });
+}
+
 // --- P2: stock-legal unpaired surrogate in a plain-indexed column ----------
 
 /// UTF-16le fixture with an unpaired high surrogate (U+D800) in an indexed TEXT
@@ -197,5 +280,59 @@ fn bd_gu1bi_utf16le_unpaired_surrogate_plain_index_integrity_matches_stock() {
             "surrogate fixture did not persist UTF-16le (byte @56)"
         );
         assert_fsqlite_integrity_ok(&path, "surrogate-utf16le").await;
+    });
+}
+
+#[test]
+fn unrelated_update_and_vacuum_preserve_malformed_utf16_units() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        for (encoding, lone, malformed, valid) in [
+            ("UTF-16le", "00D8", "00D84100", "00D841DC"),
+            ("UTF-16be", "D800", "D8000041", "D800DC41"),
+        ] {
+            let path = dir.path().join(format!("{encoding}.db"));
+            let backup = dir.path().join(format!("{encoding}-backup.db"));
+            let stock = rusqlite::Connection::open(&path).unwrap();
+            stock.execute_batch(&format!(
+                "PRAGMA encoding='{encoding}'; CREATE TABLE t(id INTEGER PRIMARY KEY,y TEXT,n INT);
+                 INSERT INTO t VALUES(1,CAST(x'{lone}' AS TEXT),0),(2,CAST(x'{malformed}' AS TEXT),0),
+                                     (3,CAST(x'{valid}' AS TEXT),0);
+                 CREATE UNIQUE INDEX iy ON t(y);"
+            )).unwrap();
+            let query = "SELECT hex(CAST(y AS BLOB)) FROM t ORDER BY id";
+            let read = |db: &rusqlite::Connection| {
+                db.prepare(query).unwrap().query_map([], |row| row.get::<_, String>(0))
+                    .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+            };
+            let expected = read(&stock);
+            assert_eq!(expected, [lone, malformed, valid]);
+            drop(stock);
+
+            let db = Connection::open(path.to_str().unwrap()).await.unwrap();
+            for (id, raw) in [(1, lone), (2, malformed), (3, valid)] {
+                for access in ["NOT INDEXED", "INDEXED BY iy"] {
+                    let sql = format!("SELECT id FROM t {access} WHERE y=CAST(x'{raw}' AS TEXT)");
+                    let found = db.query(&sql).await.unwrap();
+                    assert_eq!(found.len(), 1, "{encoding} {raw} {access}");
+                    assert_eq!(found[0].values(), &[SqliteValue::Integer(id)]);
+                }
+            }
+            db.execute("UPDATE t SET n=n+1").await.unwrap();
+            db.execute("BEGIN").await.unwrap();
+            db.execute("UPDATE t SET n=n+2").await.unwrap();
+            db.execute("ROLLBACK").await.unwrap();
+            db.execute_with_params("VACUUM INTO ?1", &[SqliteValue::from(backup.to_str().unwrap())])
+                .await.unwrap();
+            db.close().await.unwrap();
+            for file in [&path, &backup] {
+                let reopened = rusqlite::Connection::open(file).unwrap();
+                assert_eq!(read(&reopened), expected, "stock reopen of {}", file.display());
+                let changed: i64 = reopened.query_row("SELECT count(*) FROM t WHERE n=1", [], |r| r.get(0)).unwrap();
+                assert_eq!(changed, 3);
+                let verdict: String = reopened.query_row("PRAGMA integrity_check", [], |r| r.get(0)).unwrap();
+                assert_eq!(verdict, "ok");
+            }
+        }
     });
 }

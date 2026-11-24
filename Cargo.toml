@@ -132,33 +132,33 @@ unnecessary_literal_bound = { level = "allow", priority = 1 }
 
 [workspace.dependencies]
 # Internal crates
-fsqlite-types = { version = "0.5.0", path = "crates/fsqlite-types", default-features = false }
-fsqlite-error = { version = "0.5.0", path = "crates/fsqlite-error" }
-fsqlite-vfs = { version = "0.5.0", path = "crates/fsqlite-vfs", default-features = false }
-fsqlite-pager = { version = "0.5.0", path = "crates/fsqlite-pager", default-features = false }
-fsqlite-wal = { version = "0.5.0", path = "crates/fsqlite-wal", default-features = false }
-fsqlite-mvcc = { version = "0.5.0", path = "crates/fsqlite-mvcc", default-features = false }
-fsqlite-btree = { version = "0.5.0", path = "crates/fsqlite-btree", default-features = false }
-fsqlite-ast = { version = "0.5.0", path = "crates/fsqlite-ast" }
-fsqlite-parser = { version = "0.5.0", path = "crates/fsqlite-parser" }
-fsqlite-planner = { version = "0.5.0", path = "crates/fsqlite-planner", default-features = false }
-fsqlite-vdbe = { version = "0.5.0", path = "crates/fsqlite-vdbe", default-features = false }
-fsqlite-func = { version = "0.5.0", path = "crates/fsqlite-func" }
-fsqlite-ext-fts3 = { version = "0.5.0", path = "crates/fsqlite-ext-fts3" }
-fsqlite-ext-fts5 = { version = "0.5.0", path = "crates/fsqlite-ext-fts5" }
-fsqlite-ext-rtree = { version = "0.5.0", path = "crates/fsqlite-ext-rtree" }
-fsqlite-ext-json = { version = "0.5.0", path = "crates/fsqlite-ext-json" }
-fsqlite-ext-session = { version = "0.5.0", path = "crates/fsqlite-ext-session" }
-fsqlite-ext-icu = { version = "0.5.0", path = "crates/fsqlite-ext-icu" }
-fsqlite-ext-misc = { version = "0.5.0", path = "crates/fsqlite-ext-misc" }
-fsqlite-core = { version = "0.5.0", path = "crates/fsqlite-core", default-features = false }
-fsqlite = { version = "0.5.0", path = "crates/fsqlite", default-features = false }
-fsqlite-cli = { version = "0.5.0", path = "crates/fsqlite-cli" }
-fsqlite-harness = { version = "0.5.0", path = "crates/fsqlite-harness" }
-fsqlite-e2e = { version = "0.5.0", path = "crates/fsqlite-e2e" }
-fsqlite-observability = { version = "0.5.0", path = "crates/fsqlite-observability" }
-fsqlite-c-api = { version = "0.5.0", path = "crates/fsqlite-c-api" }
-fsqlite-wasm = { version = "0.5.0", path = "crates/fsqlite-wasm" }
+fsqlite-types = { version = "0.5.1", path = "crates/fsqlite-types", default-features = false }
+fsqlite-error = { version = "0.5.1", path = "crates/fsqlite-error" }
+fsqlite-vfs = { version = "0.5.1", path = "crates/fsqlite-vfs", default-features = false }
+fsqlite-pager = { version = "0.5.1", path = "crates/fsqlite-pager", default-features = false }
+fsqlite-wal = { version = "0.5.1", path = "crates/fsqlite-wal", default-features = false }
+fsqlite-mvcc = { version = "0.5.1", path = "crates/fsqlite-mvcc", default-features = false }
+fsqlite-btree = { version = "0.5.1", path = "crates/fsqlite-btree", default-features = false }
+fsqlite-ast = { version = "0.5.1", path = "crates/fsqlite-ast" }
+fsqlite-parser = { version = "0.5.1", path = "crates/fsqlite-parser" }
+fsqlite-planner = { version = "0.5.1", path = "crates/fsqlite-planner", default-features = false }
+fsqlite-vdbe = { version = "0.5.1", path = "crates/fsqlite-vdbe", default-features = false }
+fsqlite-func = { version = "0.5.1", path = "crates/fsqlite-func" }
+fsqlite-ext-fts3 = { version = "0.5.1", path = "crates/fsqlite-ext-fts3" }
+fsqlite-ext-fts5 = { version = "0.5.1", path = "crates/fsqlite-ext-fts5" }
+fsqlite-ext-rtree = { version = "0.5.1", path = "crates/fsqlite-ext-rtree" }
+fsqlite-ext-json = { version = "0.5.1", path = "crates/fsqlite-ext-json" }
+fsqlite-ext-session = { version = "0.5.1", path = "crates/fsqlite-ext-session" }
+fsqlite-ext-icu = { version = "0.5.1", path = "crates/fsqlite-ext-icu" }
+fsqlite-ext-misc = { version = "0.5.1", path = "crates/fsqlite-ext-misc" }
+fsqlite-core = { version = "0.5.1", path = "crates/fsqlite-core", default-features = false }
+fsqlite = { version = "0.5.1", path = "crates/fsqlite", default-features = false }
+fsqlite-cli = { version = "0.5.1", path = "crates/fsqlite-cli" }
+fsqlite-harness = { version = "0.5.1", path = "crates/fsqlite-harness" }
+fsqlite-e2e = { version = "0.5.1", path = "crates/fsqlite-e2e" }
+fsqlite-observability = { version = "0.5.1", path = "crates/fsqlite-observability" }
+fsqlite-c-api = { version = "0.5.1", path = "crates/fsqlite-c-api" }
+fsqlite-wasm = { version = "0.5.1", path = "crates/fsqlite-wasm" }
 
 # External dependencies
 ftui = { version = "0.10.0", default-features = false }
@@ -175,7 +175,7 @@ tracing = "0.1"
 simdutf8 = "0.1"
 tracing-subscriber = "0.3.23"
 bitflags = { version = "2.13", features = ["serde"] }
-smallvec = "1.15"
+smallvec = "1.16"
 memchr = "2.8"
 parking_lot = "0.13"
 web-time = "1.1"
@@ -185,7 +185,7 @@ blake3 = "1.8"
 crossbeam-epoch = "0.9"
 crossbeam-deque = "0.8"
 sha2 = "0.11"
-nix = { version = "0.31", default-features = false, features = ["fs", "process", "signal", "socket", "uio", "user"] }
+nix = { version = "0.32", default-features = false, features = ["fs", "process", "signal", "socket", "uio", "user"] }
 libc = "0.2"
 # Safe wrappers for Windows console calls (the shell's colour prompt, GH#532).
 winapi-util = "0.1.11"
@@ -218,11 +218,11 @@ futures-lite = "2.6.1"
 
 # Dev dependencies
 criterion = { version = "0.8", features = ["html_reports"] }
-proptest = "1.11"
-insta = { version = "1.48", features = ["json", "yaml"] }
+proptest = "1.12"
+insta = { version = "1.49", features = ["json", "yaml"] }
 tempfile = "3.27"
-toml = "1.1"
-syn = { version = "3.0.5", features = ["full", "visit"] }
+toml = "1.2"
+syn = { version = "3.0.10", features = ["full", "visit"] }
 proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
 
 # Native release builds (published CLI binaries included) are optimized for

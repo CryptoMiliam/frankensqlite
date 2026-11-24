@@ -65,7 +65,7 @@ signature fails closed rather than silently downgrading authenticity.
 | Memory safety | Manual (C) | Core engine is safe Rust; `unsafe` is limited to `fsqlite-vfs` (mmap/shm) and the optional `fsqlite-c-api` shim (FFI) |
 | Data races | Possible (careful C) | Prevented inside the Rust engine by ownership and type-system checks |
 | File format | SQLite 3.x | SQLite 3.x layout; UTF-8 and UTF-16le/be text encodings are admitted for reads and writes, with parity verification deepest on the UTF-8 surface |
-| Self-healing storage | No | Native file-backed connections can generate WAL repair symbols asynchronously; automatic FEC recovery is not wired to the compatibility WAL reader |
+| Self-healing storage | No | Opt-in (`PRAGMA raptorq_repair_symbols = N`, default 0): native file-backed connections with a blocking pool generate WAL repair symbols asynchronously, and a writable open of an opted-in database repairs damaged WAL frames from them; the main database file is not covered |
 | Page-level encryption | No (commercial SEE extension) | Not currently available: the XChaCha20-Poly1305 DEK/KEK implementation exists in `fsqlite-pager`, but no `PRAGMA key`/`rekey` dispatch is wired into `Connection` |
 | SQL dialect | Full | Large and growing subset; parser coverage exceeds full execution parity today |
 | Extensions | FTS3/4/5, R-tree, JSON1, etc. | FTS5, JSON1, R-tree/geopoly, ICU, and misc (`generate_series`) wired in live engine; session is a library facade; FTS3/4 are helper-level only |
@@ -181,9 +181,11 @@ The `crates/fsqlite-wasm/` crate provides experimental WebAssembly support and i
 Two TypeScript packages sit on top of it: `packages/worker` (`@frankensqlite/worker`, the dedicated
 module worker that owns one WASM `FrankenDB` and its message protocol) and `packages/sdk`
 (`@frankensqlite/sdk`, the Promise-based browser client: `FrankenDB.open()`, `execute`, `query`,
-`prepare`, `transaction`, `export`). Only `memory` persistence is implemented; `opfs` and
-`indexeddb` raise explicit errors, and the opt-in `indexeddb-snapshot` mode saves explicit
-whole-database checkpoints rather than per-commit pages.
+`prepare`, `transaction`, `export`). The engine runs in memory. To persist a
+whole-database checkpoint, open a named database with `persistence: "opfs-snapshot"`
+or `"indexeddb-snapshot"` and await `db.checkpoint()` after committing your writes.
+Reopening the same name and backend loads the last stored checkpoint. The
+page-level `opfs` and `indexeddb` modes raise an unsupported-mode error.
 
 ---
 
@@ -285,10 +287,10 @@ None of them is deleted when the last connection closes.
 | `app.db-shm` | The first WAL-index access. | Standard SQLite WAL-index and WAL lock bytes. |
 | `app.db-journal` | Write transactions in a rollback journal mode. | Standard rollback journal; removed at commit in `DELETE` mode, as in stock SQLite. |
 | `app.db-fsqlite-ns-gate`, `app.db-fsqlite-ns-use` | Every native read-write open, including one that only reads. | The namespace admission sidecars described above. `-ns-gate` is an empty lock file; `-ns-use` is a 40-byte record of the main file's device and inode, optionally followed by a transition ledger. |
-| `app.db-wal-cert` | WAL commits. | Append-only commit certificates of the parallel WAL path: WAL salts, frame range, database identity and a BLAKE3 digest of the frames per commit. The database identity means a certificate never applies to a replaced or copied file. |
+| `app.db-wal-cert` | WAL commits. | Append-only commit certificates of the parallel WAL path: WAL salts, frame range, database identity and a digest of the frames per commit. Records are version 5, with an XXH3-128 digest; version 4 records, with a BLAKE3 digest, are still read and verified. The digest binds a certificate to its exact frames; it is a checksum, not a signature. The database identity means a certificate never applies to a replaced or copied file. |
 | `app.db-wal-cert-head` | Checkpoints, including the one at close. | The latest certificate record, kept as the anchor when `-wal-cert` has nothing for the current WAL generation. |
 | `app.db.fsqlite-migration-state` | The end of every native read-write open. | JSON marker of the first-open migration pass (below). |
-| `app.db-wal-fec`, `app.db-wal-fec.lock` | WAL fsync on native runtimes with a blocking pool (the `fsqlite` shell has one), and assigning `PRAGMA raptorq_repair_symbols`. | RaptorQ repair symbols for durable WAL ranges (see Crash Recovery), and an empty lock file that serializes changes to them. |
+| `app.db-wal-fec`, `app.db-wal-fec.lock` | Assigning `PRAGMA raptorq_repair_symbols`, and, once a database is opted in with a nonzero value, WAL fsync on native runtimes with a blocking pool (the `fsqlite` shell has one). A default database has neither. | RaptorQ repair symbols for durable WAL ranges (see Crash Recovery), and an empty lock file that serializes changes to them. |
 
 A stock-created database in a rollback journal mode gets only the namespace
 pair and the migration marker. A database switched from WAL to a rollback
@@ -315,8 +317,10 @@ every process closed:
   namespace pair and the migration marker are recreated when missing. Without
   `-wal-cert` and `-wal-cert-head`, recovery of a `-wal` that still holds
   uncheckpointed frames falls back to the conservative WAL scan, which can
-  drop the newest committed batch. Without `-wal-fec`, the repair symbols are
-  regenerated and the configured symbol count reverts to the default. Without
+  drop the newest committed batch. Without `-wal-fec`, the configured symbol
+  count reverts to the default, 0: the database is no longer opted in, and no
+  repair symbols are generated until `PRAGMA raptorq_repair_symbols` is
+  assigned again. Without
   the migration marker, the next open runs the migration pass again.
 - A damaged certificate file is not treated as missing. Bytes after the last
   whole record of `-wal-cert` make every statement fail with
@@ -660,7 +664,7 @@ Each cursor maintains a stack of `(page_number, cell_index)` pairs representing 
 
 Deleted pages go onto a freelist rather than being returned to the OS. The freelist is structured as trunk pages, each containing up to `(usable_page_size / 4) - 2` leaf page numbers. In the current non-concurrent allocation path, when no other local transaction is active, allocation draws from the committed freelist first. In default file-backed concurrent transactions, when the transaction is the sole active local transaction and its snapshot is current, allocation reuses committed free pages at or below the current database size. Freelist reuse under sustained concurrent overlap is regression-kept: `page_count` growth stays bounded under racing writer churn (the unbounded-EOF-growth defect tracked in [#302](https://github.com/Dicklesworthstone/frankensqlite/issues/302) is fixed). `VACUUM` rebuilds the database and can reclaim space, but the current insertion-based builder can retain pages freed during its own construction or leave trailing pages, and page 1 of the rebuilt image may report a zero `freelist_count` that disagrees with the freelist actually present. The result is a valid, integrity-checkable database; the current builder does not promise a zero-freelist, header-consistent, or fixed-point compact image ([#301](https://github.com/Dicklesworthstone/frankensqlite/issues/301)).
 
-`PRAGMA auto_vacuum=FULL` and `INCREMENTAL` are not supported as durable settings. The mode currently changes connection-local readback only and returns to `NONE` after reopen; FrankenSQLite does not yet write the pointer-map pages required to enable either mode safely ([#265](https://github.com/Dicklesworthstone/frankensqlite/issues/265)). An existing database that stock SQLite created with auto-vacuum enabled opens and reads normally, but every write to it fails with a "not implemented" error naming `auto_vacuum`: writing it without maintaining its pointer map would corrupt it for stock SQLite (bd-1q134, bd-w4pr1.1). To make such a file writable, run `PRAGMA auto_vacuum = NONE; VACUUM;` on it with stock `sqlite3`.
+FrankenSQLite reads and writes databases created by either engine with `auto_vacuum=FULL` or `INCREMENTAL`. Set the mode before creating the first table. To enable it on a populated database in `NONE` mode, set `PRAGMA auto_vacuum=FULL` or `INCREMENTAL` and run `VACUUM` on the same connection. The mode persists when either engine reopens the file. FULL reclaims free pages at commit. In INCREMENTAL mode, run `PRAGMA incremental_vacuum` to reclaim them.
 
 ---
 
@@ -907,31 +911,38 @@ Savepoints are implemented as a stack. ROLLBACK TO undoes changes back to the sa
 
 ### Crash Recovery
 
-The crash model makes six explicit assumptions: (1) process crash at any point, (2) `fsync()` is a durability barrier, (3) writes may be reordered unless constrained by fsync barriers, (4) torn writes at sector granularity (512B or 4KB), (5) bitrot and corruption exist (checksums detect them; RaptorQ repair is a Native-mode design, not current compatibility-runtime behavior), (6) file metadata durability may require directory `fsync()`.
+The crash model makes six explicit assumptions: (1) process crash at any point, (2) `fsync()` is a durability barrier, (3) writes may be reordered unless constrained by fsync barriers, (4) torn writes at sector granularity (512B or 4KB), (5) bitrot and corruption exist (checksums detect them; an opted-in database's WAL frames are also repaired from RaptorQ symbols at open, as in 3 below, while RaptorQ repair of the main database file is a Native-mode design), (6) file metadata durability may require directory `fsync()`.
 
 The WAL provides crash recovery with the following guarantees:
 
 1. **Atomic commit:** A transaction is either fully visible or fully invisible after crash recovery. Partial commits cannot occur. In Native mode, a commit is committed if and only if its `CommitMarker` is durable.
 2. **Durability:** Once `COMMIT` returns, the data survives power loss (assuming `PRAGMA synchronous = FULL`). A configurable durability policy (`PRAGMA durability = local`, `PRAGMA durability = quorum(M)`) is a Native-mode design target, **not current behavior**: no such PRAGMA is dispatched, and unrecognised PRAGMAs are silently ignored, so setting it has no effect.
-3. **Repair symbol generation (live native path; automatic recovery pending):** Native file-backed connections with a caller-owned runtime and blocking pool enqueue durable WAL ranges for background RaptorQ encoding. A group becomes protected only after its `.wal-fec` record and repair symbols are written and synced, after the primary WAL durability acknowledgment. Startup can regenerate missing or torn sidecar entries from surviving, validated WAL frames. Ordinary WAL recovery still stops at checksum failures and does not invoke the FEC decoder; `bd-1hi.11` tracks that missing integration.
+3. **Repair symbols and repair at open (opt-in native path):** Generation is off by default. A database opts in with `PRAGMA raptorq_repair_symbols = N` (N > 0), which persists N in the `.wal-fec` sidecar's header. Native file-backed connections to an opted-in database, with a caller-owned runtime and blocking pool, enqueue durable WAL ranges for background RaptorQ encoding. A group becomes protected only after its `.wal-fec` record and repair symbols are written and synced, after the primary WAL durability acknowledgment. Startup can regenerate missing or torn sidecar entries from surviving, validated WAL frames. When a writable open finds WAL frames that fail their checksums inside protected groups, it decodes them from the sidecar under the pager's exclusive maintenance fence, rewrites only the changed frames, syncs them and reads them back, before WAL replay. When a group lost more frames than it has repair symbols, or the sidecar is damaged, nothing is repaired, and replay cuts the WAL at the first bad frame as before. Read-only opens never repair.
 4. **Recovery procedure:**
    - On database open, check for a WAL file.
    - Read the WAL header; validate magic number and checksums.
    - Replay all committed frames (those with a nonzero "database size" field in the frame header, indicating a commit boundary).
-   - Validate frame checksums. RaptorQ repair from available repair symbols is the Native-mode design; it is not attempted by the current compatibility recovery path.
+   - Validate frame checksums; replay stops at the first frame that fails them. For an opted-in database, a writable open first repairs the frames its repair symbols can recover (step 3).
    - Discard any frames after the last commit boundary (incomplete transaction).
    - Rebuild the WAL index from the replayed frames.
 
-The CLI supplies the required blocking pool. Library consumers must supply one
-through their asupersync runtime; in-memory databases and runtimes without a
-blocking pool do not generate these sidecars. `PRAGMA raptorq_repair_symbols`
-controls the repair budget, with `0` disabling generation. Work is admitted at
+`PRAGMA raptorq_repair_symbols` controls the repair budget. The default, `0`,
+generates nothing: no `.wal-fec` and no lock file. The CLI supplies the
+blocking pool an opted-in database needs. Library consumers must supply one
+through their asupersync runtime. A connection without one (`fsqlite::blocking`,
+the C API, a runtime built without blocking threads) refuses to opt a database
+in, and refuses to open an opted-in database for writing, with an error that
+names the PRAGMA; in-memory databases never generate. Work is admitted at
 WAL fsync boundaries: `synchronous=FULL` provides one for each commit, while
 `NORMAL` can defer it. Await connection close to drain pending work; dropping
-the connection only cancels it. Generation and shutdown regression coverage is
-in `crates/fsqlite-core/tests/wal_fec_commit_pipeline.rs` and the CLI's
-`test_shell_runtime_generates_wal_fec_before_exit`. This is not a claim of
-automatic corruption repair or a measured end-to-end performance guarantee.
+the connection only cancels it. Generation is off by default because it costs
+CPU on every commit, on background threads after each commit's fsync.
+Generation and shutdown regression coverage is in
+`crates/fsqlite-core/tests/wal_fec_commit_pipeline.rs` and the CLI's
+`test_shell_runtime_generates_wal_fec_before_exit`; repair at open, and its
+fallbacks, in `crates/fsqlite-core/tests/wal_fec_live_recovery_e2e.rs`. Repair
+covers WAL frames only, not the main database file, and this is not a measured
+end-to-end performance guarantee.
 
 For offline recovery, `crates/fsqlite-wal` builds a separate `fsqlite-recover`
 binary (`cargo build -p fsqlite-wal --bin fsqlite-recover`). By default it
@@ -1235,7 +1246,7 @@ FTS5 provides full-text indexing with BM25 ranking:
 - **Query syntax:** Boolean operators (`AND`, `OR`, `NOT`), phrase matching (`"exact phrase"`), prefix queries (`prefix*`), column filters (`title: search_term`), NEAR queries (`NEAR(a b, 10)`). Column-qualified `MATCH` honors the column restriction (the earlier defect in [#249](https://github.com/Dicklesworthstone/frankensqlite/issues/249) is fixed and regression-kept).
 - **Ranking:** BM25 by default, configurable via auxiliary functions
 - **Auxiliary functions:** `highlight()` wraps matches in markup, `snippet()` extracts context around matches
-- **Content modes:** Regular (FTS5 stores a copy), external content (references an existing table), contentless (index-only, no original text stored). The contentless `delete-all` control command is supported ([#253](https://github.com/Dicklesworthstone/frankensqlite/issues/253) fixed); stored-content tables reject it, matching stock SQLite.
+- **Content modes.** Regular tables store a copy of the content. External-content tables read from an existing table. Contentless tables keep only the index by default. With `content='', contentless_unindexed=1`, columns declared `UNINDEXED` retain their SQLite values and storage classes across reopen. Indexed columns return `NULL` and remain searchable with `MATCH`. Contentless tables support the `delete-all` command. Both engines reject that command on stored-content tables. [Issue #253](https://github.com/Dicklesworthstone/frankensqlite/issues/253)
 - **Index structure:** A B-tree of terms mapping to document/position lists, with incremental merge for write performance
 
 Upgrading from 0.1.x with a `porter`-tokenized table requires an FTS rebuild;
@@ -1350,6 +1361,12 @@ All aggregate functions also work as window functions when used with an `OVER` c
 | `unixepoch(time, modifier...)` | Unix timestamp (integer seconds) |
 | `strftime(format, time, modifier...)` | Custom formatting |
 | `timediff(a, b)` | Difference between two timestamps |
+
+As in SQLite 3.54.1, `datetime('2024-12-31 24:00')` returns
+`2025-01-01 00:00:00`, and `datetime('2024-12-31 24:01')` returns NULL.
+Earlier FrankenSQLite builds could store incorrect date or datetime index
+entries for these inputs. After upgrading, run `REINDEX index_name;` on each
+affected expression index, then run `PRAGMA integrity_check;`.
 
 ### Math Functions
 
@@ -1689,11 +1706,11 @@ Each pointer-map page holds `usable_size / 5` entries (819 entries for
 4096-byte pages). Pointer-map pages recur at regular intervals: pages 2, 822,
 1642, ... (group size = entries_per_page + 1 = 820).
 
-The format above describes SQLite's on-disk contract, not a current
-FrankenSQLite feature. FrankenSQLite does not yet create or maintain
-pointer-map pages or relocate pages for auto-vacuum. Setting
-`auto_vacuum = FULL` or `auto_vacuum = INCREMENTAL` is currently
-connection-local and is not persisted in the database header ([#265](https://github.com/Dicklesworthstone/frankensqlite/issues/265)).
+FrankenSQLite maintains these pointer maps when it writes auto-vacuum
+databases. On Linux, both engines reopened the same file after FrankenSQLite
+created an overflow index, deleted its largest row, and reclaimed the free
+pages. Both reported `integrity_check=ok` and `quick_check=ok`.
+See the [cross-engine results for FULL and INCREMENTAL modes](docs/planning/STATE_OF_THE_CODEBASE_AND_NEXT_STEPS.md#compound-writes-and-historical-reads-2026-11-21).
 
 ---
 
@@ -1739,7 +1756,7 @@ The current user-facing runtime is the compatibility/pager-backed path over stan
 
 ### Compatibility Runtime (Current)
 
-The database file uses the standard SQLite `.db` layout, and WAL frames use the standard SQLite WAL format. An existing C SQLite database opens without conversion when its header declares encoding 1 (UTF-8) or encodings 2/3 (UTF-16le/UTF-16be); mixed-encoding ATTACH is rejected. A FrankenSQLite-written database remains readable by C SQLite without conversion. Native public connections with a caller-owned blocking pool can emit a separate `.wal-fec` sidecar containing RaptorQ repair symbols after WAL fsync; the standard recovery path does not yet consume those symbols. The core `.db` remains SQLite-compatible when checkpointed. This mode is the default and is used for conformance testing against C SQLite within that supported surface.
+The database file uses the standard SQLite `.db` layout, and WAL frames use the standard SQLite WAL format. An existing C SQLite database opens without conversion when its header declares encoding 1 (UTF-8) or encodings 2/3 (UTF-16le/UTF-16be); mixed-encoding ATTACH is rejected. A FrankenSQLite-written database remains readable by C SQLite without conversion. A database opted in with `PRAGMA raptorq_repair_symbols = N` (off by default) gets a separate `.wal-fec` sidecar containing RaptorQ repair symbols after WAL fsync, written by native connections with a caller-owned blocking pool; a writable open repairs damaged WAL frames from those symbols before WAL replay (see Crash Recovery). The core `.db` remains SQLite-compatible when checkpointed. This mode is the default and is used for conformance testing against C SQLite within that supported surface.
 
 ### Native Mode (Design / Partial Implementation)
 
@@ -2997,14 +3014,14 @@ Every ambitious project has risks. Here they are, along with the mitigations tha
 | Memory safety | Manual | Compile-time guaranteed | Manual (C) | Manual (C++) | Compile-time guaranteed |
 | File format | SQLite 3.x | SQLite 3.x with UTF-8 and UTF-16le/be encodings (Compat), or ECS (Native target) | SQLite 3.x (compatible) | Own format | SQLite 3.x (compatible) |
 | Page encryption | Commercial (SEE) | XChaCha20-Poly1305 implemented in `fsqlite-pager` but not wired to the public API | No | No | No |
-| Self-healing storage | No | Background WAL repair symbol generation on supported native runtimes; automatic recovery pending | No | No | No |
+| Self-healing storage | No | Opt-in WAL repair symbols on supported native runtimes, with repair of damaged WAL frames at open | No | No | No |
 | Cross-process MVCC | No | Shared-memory coordination | No | Yes | No |
 | Embeddable | Yes | Yes | Yes | Yes | Yes |
 | Extensions | Loadable + built-in | Built-in | Built-in + WASM | Built-in | Limited |
-| WASM target | Via Emscripten | Experimental (`fsqlite-wasm` cdylib + npm package; in-memory, no OPFS/IndexedDB persistence yet) | Yes | Yes | Yes |
+| WASM target | Via Emscripten | Experimental (`fsqlite-wasm` cdylib + npm package, in-memory SQL with explicit OPFS or IndexedDB checkpoints) | Yes | Yes | Yes |
 | Async I/O | No | Yes (asupersync + Cx) | Yes | No | Yes (io_uring) |
 
-FrankenSQLite's target combines SQLite file format compatibility, concurrent writers via MVCC with SSI, page-level encryption, self-healing storage, and Rust memory safety. The current compatibility runtime covers SQLite databases in UTF-8 and UTF-16le/be encodings; parts of the durability design remain active work, and page encryption plus RaptorQ self-healing are not yet reachable from the public API. Limbo (another Rust SQLite) focuses on async I/O with io_uring but retains the single-writer model. libsql is a C fork that inherits the original codebase's complexity. DuckDB targets analytics workloads with a columnar storage format incompatible with SQLite.
+FrankenSQLite's target combines SQLite file format compatibility, concurrent writers via MVCC with SSI, page-level encryption, self-healing storage, and Rust memory safety. The current compatibility runtime covers SQLite databases in UTF-8 and UTF-16le/be encodings; parts of the durability design remain active work: page encryption is not yet reachable from the public API, and RaptorQ self-healing reaches it only as opt-in repair of WAL frames at open. Limbo (another Rust SQLite) focuses on async I/O with io_uring but retains the single-writer model. libsql is a C fork that inherits the original codebase's complexity. DuckDB targets analytics workloads with a columnar storage format incompatible with SQLite.
 
 ---
 
@@ -3162,12 +3179,22 @@ still serves as an authoritative reference.
   together, and close all old-engine processes before starting new ones. The
   reverse guard will ship with the next cross-process contract change, as a
   one-way namespace-record upgrade.
-- **External-content FTS5 has a residual projection gap.** The
-  content-table-rename lifecycle defect
-  ([#211](https://github.com/Dicklesworthstone/frankensqlite/issues/211)) is
-  fixed — the connection stays usable and renaming back recovers — but
-  external-content column projection can still return NULL even with the
-  content table present (tracked as bd-c6jre).
+- **Export affected 0.4.x generated-column tables before upgrading.** The old
+  row format reserved a slot for each `VIRTUAL` generated column. A 0.5.0
+  reader follows SQLite's layout and can return shifted values for columns
+  that follow a virtual column in an old file, even when
+  `PRAGMA integrity_check` returns `ok`. Use the original writer release
+  on a preserved copy to read the writable columns, then restore them into
+  a fresh database with explicit `INSERT` column lists. Compare the values
+  before switching readers. The 0.4.x shell's `.dump` emits generated values
+  that SQLite rejects on import.
+- **FTS5 can return NULL for missing external content.** A MATCH query
+  can still return NULL for projected document columns when a matching
+  content row is missing or its source table has been renamed. Stock
+  SQLite reports an error in those cases. Simple single-table MATCH queries
+  that only select hit rowids or count them can read the index alone, even
+  when the content schema is missing a document column. The remaining
+  projection behavior is tracked in bd-c6jre. [GH#211](https://github.com/Dicklesworthstone/frankensqlite/issues/211)
 - **The workspace is developed on a pinned nightly.** `rust-toolchain.toml`
   names the dated nightly the whole workspace (tests, benches, optional
   features such as `nightly-simd`) is built with. The published library crates
@@ -3181,11 +3208,9 @@ still serves as an authoritative reference.
   x86_64 and Windows.
 - **Rust is still the primary supported surface.** An optional `fsqlite-c-api` crate exists for C/C++ embedding, but the main documented API and most verification effort are still centered on the Rust crates.
 - **No loadable extensions.** Extension support is configured at compile time via Cargo features; dynamic `dlopen`-based loading is not planned.
-- **WASM support is experimental.** The `fsqlite-wasm` crate now builds a
-  wasm-bindgen browser package and npm artifact, but browser persistence
-  backends such as OPFS and IndexedDB are still planned work. The current WASM
-  lane is focused on a compact in-memory package, feature-gated diagnostics,
-  and honest size-budget reporting.
+- **WASM support is experimental.** The worker can checkpoint the in-memory
+  database to OPFS or IndexedDB. Writes committed after the last checkpoint
+  stay in memory. Page-level persistence on each SQL commit remains planned.
 - **MVCC adds memory overhead.** Multiple page versions consume more RAM than single-version SQLite. Cache eviction and GC mitigate this but introduce background work.
 - **No row-level locking.** Two transactions modifying different rows on the
   same page can still conflict at the page level. The safe write-merge ladder is
@@ -3311,7 +3336,7 @@ an idle transaction. Public active/idle lifetime enforcement remains tracked by
 A: Serializable Snapshot Isolation detects write skew -- a class of anomaly where two transactions each read data the other writes, producing a result impossible under serial execution. Plain Snapshot Isolation misses this. FrankenSQLite applies the conservative Cahill/Fekete rule at page granularity: a transaction that would become a dangerous rw-antidependency pivot is aborted. PostgreSQL's SSI work is prior art, but its measured overhead is not evidence for FrankenSQLite; this implementation's cost is covered by the release matrix. You can downgrade to plain SI with `PRAGMA fsqlite.serializable = OFF`.
 
 **Q: What does RaptorQ actually buy me in practice?**
-A: Native file-backed connections can now generate repair symbols in a separate `.wal-fec` sidecar after durable WAL commits, using a caller-owned blocking pool. This prepares recovery data; it does not yet repair corrupt databases automatically. The compatibility WAL reader still does not call the decoder (`bd-1hi.11`). Fountain-coded replication and version-chain compression remain Native-mode design goals, and the generation pipeline's end-to-end performance work remains open (`bd-1hi.10`).
+A: A database opted in with `PRAGMA raptorq_repair_symbols = N` (off by default) gets repair symbols in a separate `.wal-fec` sidecar after durable WAL commits, generated by native file-backed connections with a caller-owned blocking pool. A writable open of such a database repairs WAL frames that fail their checksums from those symbols, when no group lost more frames than it has symbols, instead of cutting the WAL at the first bad frame. The main database file is not covered. Fountain-coded replication and version-chain compression remain Native-mode design goals, and the generation pipeline's end-to-end performance work remains open (`bd-1hi.10`).
 
 **Q: What is the difference between Compatibility and Native mode?**
 A: Today, the stable user-facing runtime is the compatibility/pager-backed path over standard SQLite files (UTF-8 or UTF-16le/be encodings). Native mode refers to the ECS/content-addressed durability design and partial implementation work present in the repo. It is not yet a mature public `PRAGMA fsqlite.mode` toggle on `Connection`.

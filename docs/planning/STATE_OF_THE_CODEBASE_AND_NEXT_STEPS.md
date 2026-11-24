@@ -1,8 +1,291 @@
 # State Of The Codebase And Next Steps
 
+## Encoded index writes, backups and TEMP schema ownership, 2026-11-22
+
+FrankenSQLite previously wrote a UTF-8 key when a UTF-16 database's index
+expression cast text to BLOB. Stock SQLite then missed qualifying rows in
+the saved index. On Linux `ee8809bd0` (CLI build `30097323753220078`),
+all 354 comparisons with SQLite 3.54.1 passed across UTF-8, UTF-16LE and
+UTF-16BE, including indexed writes, transaction rollback and independently
+reopened backups. The backup cases include WITHOUT ROWID tables whose
+secondary index stores a composite primary key. On the same build, all 16
+checkpoint comparisons passed with a reader holding a WAL snapshot across
+PASSIVE, FULL, RESTART and TRUNCATE. The optional per-page XXH3 check in
+specification §7.7 remains open on `bd-fjieg`. On `17f3faa49`, setting
+`PRAGMA page_checksum=ON` before creating the first table left database
+header byte 20 at zero after reopen. Section 7.4 requires 16 reserved
+bytes per page when checksums are enabled.
+
+The Linux CLI at `17f3faa49` (build `30097323753220111`) also matched
+SQLite 3.54.1 on 168 malformed UTF-16 checks. An unrelated UPDATE used to
+replace an unpaired surrogate in the saved text even though both engines
+reported `integrity_check=ok`. Both engines now recover the original bytes
+after UPDATE, rollback and VACUUM INTO. A UNIQUE index can still distinguish
+two different stored keys with the same UTF-8 projection. Nine raw TEXT,
+BLOB and NULL controls passed on the same binary.
+
+On that build, all 80 schema and 40 trigger and AUTOINCREMENT ownership
+checks matched SQLite. Renaming a TEMP table preserves the same-named main
+table, its dependent objects and its rowid high-water mark. After issuing
+and deleting rowid 100, the next main row received 101 while the TEMP table
+shadowed it, and the following row received 102 after the TEMP rename.
+Fresh processes confirmed the persistent rows and catalog. The 354
+encoded-write and 16 active-reader checkpoint comparisons passed again.
+
+## TEMP spill cancellation and rollback, 2026-11-22
+
+A failed disk read during a TEMP table rewrite could discard the original
+spill location. On `066f8f355` the rewrite reads every needed row before
+changing any location. Failing the second read left all 25 stored rows
+and their UNIQUE index entries intact. Retrying with a live statement
+context recovered the rows. The injected failure and cancellation test
+passed on Linux (RCH `30097323753220135`, `bd-ragyd`).
+
+Rolling back a TEMP column addition and a UNIQUE index also restores
+the prior row width and constraints. Both engines then accepted a duplicate
+key and applied a new column default to both rows, including the previously
+spilled 16,384-byte row. The final CLI repeated all 667 encoding, schema,
+ownership, checkpoint and raw-text comparisons above. All 56 tests in
+13 affected integration suites passed (RCH `30097323753220125`), including
+all nine TEMP-storage and five mmap tests. The types suite passed all 593
+tests and the VDBE suite passed all 1,263 active tests. Its sole ignored
+test is a manual performance benchmark.
+
+## Compound writes, integrity checks and historical reads, 2026-11-21 through 2026-11-22
+
+Stock SQLite reopened a database written by the previous engine and found
+`5,5` after a compound INSERT that should have stored `5,7,10`. Both files
+passed `integrity_check`. On `39ef96b0f`, all four compound INSERT tests
+passed against bundled SQLite 3.54.1, including both database creators,
+recursive CTEs, bound RETURNING and rollback after a later row failed.
+The compound reader now also applies the snapshot specified by each SELECT
+arm. All four historical-query tests passed, including reads at different
+commit sequences in one query and restoration of the live view afterward
+(Linux RCH `30097323753219011`, `bd-wiffk`, `bd-cglsc`). Durable history
+across file reopen remains open on `bd-cd7jt`.
+
+With file-backed temporary storage and a one-page cache, the previous CLI
+failed to create an index on a 1,048,577-byte BLOB. On `269f4b0ac`
+(Linux CLI build `30097323753219225`), FrankenSQLite built the index on
+files created by each engine. Fresh FrankenSQLite and SQLite 3.54.1
+processes read all three rows in index order and passed `integrity_check`
+on both files. Both readers also recovered every byte of a separate
+1,048,577-byte mixed-byte BLOB through the index (`bd-46l13`).
+
+Both shells dumped and restored the mixed-byte database on Linux
+`4ab88f36f`. For all four combinations of dumper and restorer, both
+engines read the original 1,048,577 bytes through the restored index.
+A separate compound INSERT produced NULL, integer, real, quoted Unicode
+text and a BLOB with embedded zeros. Across both database creators,
+dumpers and restorers, both readers recovered the expected storage
+classes, values and index order after an UPDATE.
+
+On Linux `585ef19cb`, the same forced-spill index workload succeeded on
+stock-created FULL and INCREMENTAL auto-vacuum databases. After deletion,
+FULL shrank from 517 pages to 4. INCREMENTAL kept 513 pages on its
+freelist until explicit reclamation reduced the file to 4 pages. Both
+readers passed `integrity_check` and `quick_check`. All six core
+auto-vacuum oracle tests and both stock-database write guards passed
+(`bd-1q134`).
+
+The previous CLI also reported `ok` on three saved corrupt WAL databases.
+On `4ab88f36f` (Linux build `30097323753219356`), both `integrity_check`
+and `quick_check` identified a stock-reported rowid on each file. On eight
+constructed databases, all 16 checks matched SQLite's tree, page, cell and
+signed rowid. This includes right children whose first key is too small,
+where SQLite reports the preceding divider. All five regression tests
+passed, including healthy collated and WITHOUT ROWID trees (`bd-3koph`).
+One saved file contains two independent errors. On November 22 the Linux
+CLI from `f0479acb4` (RCH build `30097323753219668`) reported both in
+SQLite's order at a limit of two. All 108 comparisons across the three
+saved WAL families matched SQLite 3.54.1, including capped checks across
+two attached copies. A migration that repaired an orphan but left a rowid
+error kept its backup and withheld its completion marker (`bd-vojth`).
+
+On `6afdf69c3`, all 144 table-specific checks matched SQLite 3.54.1,
+including missing names, TEMP shadowing and tables shared by attachments.
+The preceding implementation disagreed in 104 cases. In 56 further checks,
+both engines reported stored CHECK violations in main, TEMP and attachment
+order and stopped at the requested limit. Eight releasing-lock cases
+also verified that the aggregate check honors the connection's busy
+timeout even after main has filled the error limit.
+
+The same CLI matched SQLite on ten attached-database `secure_delete`
+cases, including ON, OFF, FAST, a held writer and a later attachment.
+After checkpoint and close, the free space in each database file retained
+or erased the deleted marker as SQLite did. Both readers also recovered
+the surviving rows after rollback in all eight combinations of database
+creator, writer and journal mode (`bd-d4fr8`).
+
+On November 22, the previous CLI returned `ok` for an unconditional
+index missing a stored entry. It disagreed with SQLite 3.54.1 in 20 of
+52 checks on each engine's files. On `913e81be4`, all 104 checks matched.
+Both shells inspected the damaged table, an unaffected table and an
+attached copy, then reopened the files after each engine ran `REINDEX`.
+The cases cover rowid and WITHOUT ROWID tables, ordinary and expression
+indexes, and a healthy partial index. Twelve further checks matched the
+order and limits for a table with two short indexes and a CHECK violation
+(`bd-rhhl9`). Full `integrity_check` also detects a short secondary index
+on WITHOUT ROWID tables as of `5b42b1ebf`. An equal-size index that omitted
+a qualifying row still passed at that point. On November 22, the Linux CLI
+at `2fd6b3a6e` named the missing rows on files created by either engine.
+All 72 index-membership and healthy-file comparisons matched SQLite,
+including UTF-16 expression indexes, partial predicates, and composite
+primary keys with different collations. All 240 short-index, scope, limit
+and repair checks also passed. An index on a generated column that refers
+to a later declaration passed on the healthy stock file. The full check
+holds one secondary index's expected keys in memory while switching from
+the table scan to index lookups. Peak memory on large tables remains unmeasured.
+
+Migration preserved the original backup byte for byte in both repair
+cases. When the only defect was an orphan page, it repaired the file and
+recorded completion. When a secondary index still lacked a qualifying row,
+the full check named that row and migration left the completion marker
+absent (RCH CLI build `30097323753220028`, `bd-rhhl9`). On the same
+source, all 39 tests in ten integration targets passed on Linux,
+including both direct and prepared PRAGMAs (RCH `30097323753220039`).
+
+Native writes at `5b42b1ebf` also exposed an encoding defect. On a UTF-16
+database, a partial index whose predicate casts text to BLOB can omit a row
+that qualifies in the database's byte order. Stock SQLite reported the
+missing row on both UTF-16LE and UTF-16BE files. The same schema and data
+passed on UTF-8 and on files created by stock in all three encodings.
+The reader at `2fd6b3a6e` identified the same missing row as stock in each
+file. Running stock `REINDEX` on copies repaired both UTF-16 indexes.
+Both engines then reopened the two original rows and passed the full check.
+
+## Compatibility and concurrent writers, 2026-11-20 through 2026-11-21
+
+Two Linux CLI processes opened the same WAL database with the default settings.
+Both reported `fsqlite.concurrent_mode=1`. Using plain `BEGIN`, each updated a
+different, already populated table and read its own write. Both writes completed
+before either commit. The second writer committed first. Fresh FrankenSQLite
+and stock SQLite 3.54.1 processes read back both values (`11|22`) and reported
+`integrity_check=ok`. This exercises the disjoint-write case in V03–V05.
+Cross-process conflict handling and the many-writer performance gate still
+have their own acceptance on `bd-zywqc.20` and `bd-z4zl7`.
+
+On Linux `4ab88f36f`, two processes read the same row before either wrote.
+After one committed, SQLite rejected the stale writer at UPDATE and
+FrankenSQLite rejected it at COMMIT with a page-2 snapshot conflict. Both
+readers reopened both database origins with the committed value and
+`integrity_check=ok`. Killing a writer after its uncommitted UPDATE also
+preserved the previous value in all four creator/writer combinations. A
+new writer then committed successfully. On `585ef19cb` two separate
+writers starting from maximum rowid 1 both received 2 from
+`INSERT ... RETURNING id`. Across both database origins, both commit
+orders and plain or explicit concurrent BEGIN, the first commit succeeded
+and the second raised a page-2 snapshot conflict. A fresh retry returned
+3. Both engines reopened both rows. Process-shared implicit rowid
+allocation and global commit identity remain on `bd-zywqc.20`.
+
+A different stale-writer schedule can lose committed data. On
+`07da95426`, the `bd-p9wzl` investigator reproduced a stock writer
+merging leaves while a FrankenSQLite transaction held an older snapshot.
+FrankenSQLite acknowledged its subsequent commit, but a fresh reader
+could not find the inserted row. Both engines reported `integrity_check=ok`.
+The issue also records a lost update and a missing index entry. Verifying
+the fix for that schedule takes priority over a throughput claim.
+
+The September GH407 count query now returns the expected integer 1 on both
+engines. A separate wrong-answer path remained in forced partial indexes. An
+alias in a self-join could borrow the other table occurrence's predicate, and
+applying `COLLATE` to the literal in `IS TRUE` could omit rows from a stored
+index. On source `2873c6c0f` with the reviewed fixes, all 18 tests across the
+three partial-index oracle targets passed (RCH `30097323753218207`). The CLI
+from build `30097323753218215` also repaired a previously incomplete index
+with `REINDEX`; stock SQLite recovered the two missing rows. Across 96 further
+memory/file cases, both engines returned the expected rows and agreed on forced
+index admission. Their automatic index choices differed in 28 cases. For
+example, adding `ORDER BY id` to an equality lookup on both columns of a
+partial index produced a table scan where stock used the covering index
+(`bd-81jud`). Other V02 work covers boolean-looking column names (`bd-pud7p`)
+and numeric conversion of underflowing exponents (`bd-ulvzg`).
+
+The same 96 predicate and storage combinations were exercised with UPDATE
+and DELETE, both with ordinary planning and with `INDEXED BY`. Across 768
+stock and FrankenSQLite invocations, affected rows, indexed-column changes,
+integrity and post-rollback table contents agreed. The 28 automatic index
+choices above still differ.
+
+Stock SQLite also exposed a stored-index defect in UTF-16 databases. A BLOB
+predicate could select different rows after reopen depending on which engine
+created the index. The VM and interpreted paths now evaluate numeric truth
+using the database encoding, including underflowing exponents. Cursorless
+prepared expressions receive that encoding too. In native builds
+`30097323753218307` and `30097323753218334`, both engines agreed on scans, forced index reads,
+rollback, and reopen for 12 combinations of encoding, creator, and writer.
+`REINDEX` repaired indexes made by the preceding implementation in both
+UTF-16 byte orders. Stock SQLite then returned the expected rows and passed
+`integrity_check` (`bd-384bo`, `bd-ulvzg`).
+
+Numbering parameters before rewriting a WITH statement fixed named recursive
+queries and sibling CTEs that previously reused another definition's value.
+Six query shapes with changing bindings passed against bundled SQLite on
+direct and retained prepared statements. The WASM built from the integrated
+source (`30097323753218341`) passed 28 comparisons, including a bound query
+where an inner WITH shadows the outer CTE name. All 31 browser tests passed
+with the module supplied. The integrated native build also passed all eight
+cases across the recursive and nested-name targets. Workspace checking and
+strict Clippy matched all 2,983 files in their remote source receipts
+(`30097323753218325` and `30097323753218326`, `bd-3iai6`).
+
+Several September conclusions have changed. The canonical overlap tests,
+executable Rust/C examples, and dependency and specification repairs have
+recorded passing runs on `bd-6hdwo.1` through `.8`. The pager now enforces
+`cache_size` (`bd-dwjnq.1/.2`). Mapping, temporary storage and worker limits
+retain separate open tasks. The native codec tests passed on `bd-3mgq5.1/.2`;
+native SQL durability still depends on authenticated bootstrap, durable
+publication and public SQL routing (`bd-3mgq5.3` through `.10`).
+The WAL crate has a storage-backed two-barrier publisher in
+`native_durability.rs`. Its caller must supply verified commit objects and
+own the append lease. The existing publisher is a concrete starting point
+for the native SQL path.
+
+For V20, three successive in-memory commits yielded the expected historical
+states (empty, `before`, `after`), matching stock databases stopped at each
+boundary. The same temporal queries on a file reported a missing snapshot at
+all three boundaries, both before and after reopen. The current row remained
+`after` (`bd-cd7jt`). On a fresh connection, the V24 virtual-table names
+`fsqlite_queue`, `fsqlite_lease` and `fsqlite_worker_ranges` all reported
+an unregistered module (`bd-6hdwo.11`).
+
+For V26, a named browser database failed at first open because the worker
+passed its storage name to the WASM pager as a file path. The worker now
+opens an in-memory SQL handle and uses the name for checkpoint storage.
+In Chromium 143 the public SDK checkpointed SQL rows through the real WASM
+core on both OPFS and IndexedDB. Fresh workers recovered the acknowledged
+revision and rows, discarded a later uncheckpointed insert, and passed
+`integrity_check`. All 30 browser storage and Web Lock cases passed with
+the WASM module supplied. Page-level durability remains open on `bd-2ua2e`.
+
+The SDK rebase journal now reports cancellation and deadline expiry during
+history writes with the journal error code and the original changeset error
+as its cause. Interrupting a row-conflict rollback retains the row-level error.
+The application row, receipt and history stayed consistent in all three cases
+(`bd-9mx3k`). The four-worker reference SQLite test exposed an admission
+problem. One connection acquired 260 transactions while three peers waited
+2.7 seconds each. In other runs a peer exhausted its five-second budget.
+The adapter now yields on an unsuccessful `BEGIN IMMEDIATE` within the same
+budget. All four workers committed jobs, and SQLite counted 128 unique effects
+and 128 attempts. A held writer still timed out, and a failed effect kept its
+original row and lease (`bd-q1qg2`). Both package builds, both typechecks and
+all 140 Vitest cases passed.
+Across all 124 SDK and worker Node test files, 4,799 cases passed with zero
+skips using the corrected WASM core and the four-connection admission guard.
+
+Two public entry points still expose significant limits. FTS5 and R-tree
+virtual tables could be created, while FTS3 creation reported an unregistered
+module (`bd-26rjq`). A new database opened with `PRAGMA key` retained its
+ordinary SQLite header. Stock SQLite read its row without supplying any key
+(`bd-1vwiy.1`). Applications requiring encryption cannot rely on that pragma.
+The 35-goal checklist and bridge plan below identify the remaining owners.
+The November runs cover Linux compatibility behavior; Windows interoperability,
+crash recovery, release qualification and performance require their named runs.
+
 ## Reality check — 2026-09-04
 
-This section supersedes the historical assessment below for present-day status.
+This section records the September assessment and the work it identified.
 It applies the complete `reality-check-for-project` workflow: documented goals,
 source and shipped behavior, backlog coverage, a bridge plan, ambition rounds,
 and repeated Beads refinement. It is an assessment and implementation backlog,

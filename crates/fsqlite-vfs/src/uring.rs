@@ -244,6 +244,10 @@ fn next_chunk_end(total: usize, len: usize) -> usize {
     total + remaining.min(IO_URING_MAX_RW_CHUNK_BYTES)
 }
 
+/// Disable `runtime` for the rest of the process. Called only on a sustained
+/// conformal tail breach (`IoLatencyVerdict::sustained_breach`): a single
+/// sample over a 99% bound is expected once per hundred operations, and a
+/// window under 99 samples has no bound at all (bd-0oa1b).
 fn enforce_conformal_breach_policy(
     runtime: &IoUringRuntime,
     operation: &'static str,
@@ -251,12 +255,17 @@ fn enforce_conformal_breach_policy(
     conformal_upper_bound_us: u64,
     disable_reason: &'static str,
 ) {
+    #[cfg(test)]
+    if runtime.latency_policy_suspended.load(Ordering::Acquire) {
+        return;
+    }
     runtime.disable(disable_reason);
     info!(
         operation,
         observed_latency_us = duration_to_micros_saturated(observed),
         conformal_upper_bound_us,
-        "io_uring latency exceeded conformal upper bound; backend disabled and unix path will be used"
+        "io_uring latency exceeded its conformal upper bound in a sustained run (bd-0oa1b); \
+         backend disabled and unix path will be used"
     );
 }
 
@@ -479,6 +488,12 @@ struct IoUringRuntime {
     read_buffers: Mutex<Vec<Vec<u8>>>,
     #[cfg(test)]
     driver_wait: Duration,
+    /// Test-only: the conformal latency policy still records this runtime's
+    /// samples but does not disable it (bd-dti3t). The policy's sample window
+    /// is process-wide, so in a test binary the other tests' samples decide
+    /// whether this runtime's next write breaches it.
+    #[cfg(test)]
+    latency_policy_suspended: AtomicBool,
     /// io-wq worker limits registered on `ring`; `None` when uncapped.
     iowq_max_workers: Option<[u32; 2]>,
     initial_status: String,
@@ -604,6 +619,8 @@ impl IoUringRuntime {
                 read_buffers: Mutex::new(Vec::new()),
                 #[cfg(test)]
                 driver_wait: IO_URING_DRIVER_WAIT,
+                #[cfg(test)]
+                latency_policy_suspended: AtomicBool::new(false),
                 iowq_max_workers,
                 initial_status,
                 disabled: AtomicBool::new(forced_failure),
@@ -1300,6 +1317,7 @@ impl IoUringVfs {
     fn wrap_unix_file(
         &self,
         file: UnixFile,
+        open_flags: VfsOpenFlags,
         out_flags: VfsOpenFlags,
     ) -> (IoUringFile, VfsOpenFlags) {
         (
@@ -1307,6 +1325,7 @@ impl IoUringVfs {
                 inner: file,
                 runtime: Arc::clone(&self.runtime),
                 hot_reads: AtomicU8::new(HOT_READS_UNPROBED),
+                writes_inline: open_flags.contains(VfsOpenFlags::WAL),
             },
             out_flags,
         )
@@ -1326,6 +1345,12 @@ pub struct IoUringFile {
     runtime: Arc<IoUringRuntime>,
     /// One of the `HOT_READS_*` routes.
     hot_reads: AtomicU8,
+    /// bd-2sf0f: a file opened with `VfsOpenFlags::WAL` (the WAL and its
+    /// `-wal-cert` sidecars) takes every write through the Unix file's pwrite
+    /// path. A COMMIT's own WAL or certificate write never waits on a ring
+    /// request the kernel may hold without completing it, and holds RESERVED
+    /// and WAL WRITE meanwhile. Its reads stay on io_uring.
+    writes_inline: bool,
 }
 
 impl Vfs for IoUringVfs {
@@ -1342,7 +1367,7 @@ impl Vfs for IoUringVfs {
         flags: VfsOpenFlags,
     ) -> Result<(Self::File, VfsOpenFlags)> {
         let (file, out_flags) = self.unix.open(cx, path, flags)?;
-        Ok(self.wrap_unix_file(file, out_flags))
+        Ok(self.wrap_unix_file(file, flags, out_flags))
     }
 
     fn open_with_expected_identity(
@@ -1355,7 +1380,7 @@ impl Vfs for IoUringVfs {
         let (file, out_flags) =
             self.unix
                 .open_with_expected_identity(cx, path, flags, expected_identity)?;
-        Ok(self.wrap_unix_file(file, out_flags))
+        Ok(self.wrap_unix_file(file, flags, out_flags))
     }
 
     fn open_reserved_with_expected_identity(
@@ -1368,7 +1393,7 @@ impl Vfs for IoUringVfs {
         let (file, out_flags) =
             self.unix
                 .open_reserved_with_expected_identity(cx, path, flags, expected_identity)?;
-        Ok(self.wrap_unix_file(file, out_flags))
+        Ok(self.wrap_unix_file(file, flags, out_flags))
     }
 
     fn delete(&self, cx: &Cx, path: &Path, sync_dir: bool) -> Result<()> {
@@ -1397,6 +1422,14 @@ impl Vfs for IoUringVfs {
         path: &Path,
     ) -> Result<crate::traits::ForeignWalParticipation> {
         self.unix.probe_foreign_wal_participation(cx, path)
+    }
+
+    fn probe_foreign_shm_attachment(
+        &self,
+        cx: &Cx,
+        path: &Path,
+    ) -> Result<crate::traits::ForeignWalParticipation> {
+        self.unix.probe_foreign_shm_attachment(cx, path)
     }
 
     fn full_pathname(&self, cx: &Cx, path: &Path) -> Result<PathBuf> {
@@ -1441,6 +1474,10 @@ impl VfsFile for IoUringFile {
         offset: u64,
     ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
         self.read_data_path(cx, buf, offset)
+    }
+
+    fn positional_reader(&self) -> Option<Arc<std::fs::File>> {
+        self.inner.positional_reader()
     }
 
     fn write<'a>(
@@ -1523,6 +1560,11 @@ impl VfsFile for IoUringFile {
 
     fn lock_external_wal_append(&mut self, cx: &Cx) -> Result<()> {
         self.inner.lock_external_wal_append(cx)
+    }
+
+    fn external_wal_append_blocked_by_local_transaction(&self) -> bool {
+        self.inner
+            .external_wal_append_blocked_by_local_transaction()
     }
 
     fn restore_external_wal_append_attempt(&mut self, cx: &Cx) -> Result<()> {
@@ -1608,6 +1650,14 @@ impl VfsFile for IoUringFile {
         self.inner.wal_reader_slot_release(cx, slot)
     }
 
+    fn wal_private_reader_claim_acquire(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.wal_private_reader_claim_acquire(cx)
+    }
+
+    fn wal_private_reader_claim_release(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.wal_private_reader_claim_release(cx)
+    }
+
     fn wal_checkpoint_backfill_gate_acquire(&mut self, cx: &Cx) -> Result<bool> {
         self.inner.wal_checkpoint_backfill_gate_acquire(cx)
     }
@@ -1630,6 +1680,22 @@ impl VfsFile for IoUringFile {
 
     fn set_busy_timeout_ms(&mut self, ms: u64) {
         self.inner.set_busy_timeout_ms(ms);
+    }
+
+    fn set_mmap_size(&self, cx: &Cx, limit_bytes: u64) -> Result<crate::traits::VfsMmapStatus> {
+        self.inner.set_mmap_size(cx, limit_bytes)
+    }
+
+    fn mmap_status(&self) -> crate::traits::VfsMmapStatus {
+        self.inner.mmap_status()
+    }
+
+    fn read_only_mmap_view(&self) -> Option<crate::traits::ReadOnlyMmapView> {
+        self.inner.read_only_mmap_view()
+    }
+
+    fn inject_mmap_failure(&self, remaining_failures: u64) -> Result<()> {
+        self.inner.inject_mmap_failure(remaining_failures)
     }
 }
 
@@ -1674,6 +1740,9 @@ impl IoUringFile {
             return self.inner.read(cx, buf, offset).await;
         };
         checkpoint_or_abort(cx)?;
+        if let Some(total) = self.inner.try_read_via_mmap(cx, buf, offset)? {
+            return Ok(total);
+        }
         let file = self.inner.canonical_file()?;
 
         // bd-w4pr1.13.19: bytes the kernel already holds are read here, as the
@@ -1786,7 +1855,7 @@ impl IoUringFile {
         }
 
         let elapsed = start.elapsed();
-        if record_io_uring_read_latency(elapsed) {
+        if record_io_uring_read_latency(elapsed).sustained_breach {
             let snapshot = io_uring_latency_snapshot();
             enforce_conformal_breach_policy(
                 &self.runtime,
@@ -1844,6 +1913,9 @@ impl IoUringFile {
         checkpoint_or_abort(cx)?;
         if buf.is_empty() {
             return Ok(());
+        }
+        if self.writes_inline {
+            return self.inner.write(cx, buf, offset).await;
         }
         if !self.runtime.is_available() {
             record_io_uring_write_unix_fallback();
@@ -1948,7 +2020,7 @@ impl IoUringFile {
         }
 
         let elapsed = start.elapsed();
-        if record_io_uring_write_latency(elapsed) {
+        if record_io_uring_write_latency(elapsed).sustained_breach {
             let snapshot = io_uring_latency_snapshot();
             enforce_conformal_breach_policy(
                 &self.runtime,
@@ -1975,6 +2047,9 @@ impl IoUringFile {
         if buf.is_empty() {
             completion.complete_success();
             return Ok(());
+        }
+        if self.writes_inline {
+            return self.inner.write_tracked(cx, buf, offset, completion).await;
         }
         if !self.runtime.is_available() {
             record_io_uring_write_unix_fallback();
@@ -2084,7 +2159,7 @@ impl IoUringFile {
         checkpoint_or_abort(cx)?;
 
         let elapsed = start.elapsed();
-        if record_io_uring_write_latency(elapsed) {
+        if record_io_uring_write_latency(elapsed).sustained_breach {
             let snapshot = io_uring_latency_snapshot();
             enforce_conformal_breach_policy(
                 &self.runtime,
@@ -2101,6 +2176,9 @@ impl IoUringFile {
         checkpoint_or_abort(cx)?;
         if buf.is_empty() {
             return Ok(());
+        }
+        if self.writes_inline {
+            return self.inner.write_owned(cx, buf, offset).await;
         }
         if !self.runtime.is_available() {
             record_io_uring_write_unix_fallback();
@@ -2128,6 +2206,12 @@ impl IoUringFile {
         if buf.is_empty() {
             completion.complete_success();
             return Ok(());
+        }
+        if self.writes_inline {
+            return self
+                .inner
+                .write_owned_tracked(cx, buf, offset, completion)
+                .await;
         }
         if !self.runtime.is_available() {
             record_io_uring_write_unix_fallback();
@@ -2244,7 +2328,7 @@ impl IoUringFile {
         checkpoint_or_abort(cx)?;
 
         let elapsed = start.elapsed();
-        if record_io_uring_write_latency(elapsed) {
+        if record_io_uring_write_latency(elapsed).sustained_breach {
             let snapshot = io_uring_latency_snapshot();
             enforce_conformal_breach_policy(
                 &self.runtime,
@@ -2427,6 +2511,56 @@ mod tests {
         #[cfg(feature = "linux-asupersync-uring")]
         FORCE_RING_READS.store(true, Ordering::Release);
         IoUringTestGuard { _lock: lock }
+    }
+
+    /// bd-2sf0f: a file opened with `VfsOpenFlags::WAL` (the WAL and its
+    /// `-wal-cert` sidecars) writes through the Unix pwrite path, so its
+    /// writes add no io_uring submission, and the bytes land. Negative: a
+    /// main-file write through the same runtime still goes through the ring.
+    /// Red on main, where the WAL writes are ring submissions.
+    #[cfg(feature = "linux-asupersync-uring")]
+    #[test]
+    fn bd_2sf0f_wal_writes_take_the_pwrite_path_and_main_file_writes_the_ring() {
+        let _guard = io_uring_test_guard();
+        let cx = Cx::new();
+        let vfs = IoUringVfs::new();
+        assert!(vfs.is_available(), "requires io_uring: {}", vfs.status());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (wal, _) = vfs
+            .open(
+                &cx,
+                Some(&dir.path().join("t.db-wal")),
+                VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL,
+            )
+            .expect("open wal");
+        let (main, _) = vfs
+            .open(
+                &cx,
+                Some(&dir.path().join("t.db")),
+                open_flags_create_unlocked(),
+            )
+            .expect("open main");
+        let submitted = || vfs.runtime.submitted_requests.load(Ordering::Acquire);
+        let before = submitted();
+        block_on_test(&cx, wal.write(&cx, &[0x5A; 4096], 0)).expect("wal write");
+        block_on_test(&cx, wal.write_owned(&cx, vec![0x5B; 156], 4096)).expect("wal write");
+        assert_eq!(
+            submitted(),
+            before,
+            "a WAL-flagged file's writes must not be io_uring submissions"
+        );
+        let mut back = vec![0_u8; 4096 + 156];
+        let n = block_on_test(&cx, wal.read(&cx, &mut back, 0)).expect("read back");
+        assert_eq!(n, back.len());
+        assert!(back[..4096].iter().all(|byte| *byte == 0x5A));
+        assert!(back[4096..].iter().all(|byte| *byte == 0x5B));
+
+        let before_main = submitted();
+        block_on_test(&cx, main.write(&cx, &[0xAB; 4096], 0)).expect("main write");
+        assert!(
+            submitted() > before_main,
+            "negative: a main-file write still goes through the ring"
+        );
     }
 
     #[cfg(feature = "linux-asupersync-uring")]
@@ -2899,6 +3033,13 @@ mod tests {
         let cx = Cx::new();
         let vfs = IoUringVfs::new();
         assert!(vfs.is_available(), "requires io_uring: {}", vfs.status());
+        // bd-dti3t: the conformal latency policy's window is process-wide.
+        // With the other tests' samples in it (or only this test's first
+        // write), one of the writes below could "breach" it and disable the
+        // ring, so the reads went to the Unix path and the pool stayed empty.
+        vfs.runtime
+            .latency_policy_suspended
+            .store(true, Ordering::Release);
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut full, _) = vfs
             .open(
@@ -2923,7 +3064,8 @@ mod tests {
         assert!(page.iter().all(|byte| *byte == 0xAB));
         assert!(
             !full.runtime.read_buffers.lock().unwrap().is_empty(),
-            "a completed io_uring read must return its buffer to the pool"
+            "a completed io_uring read must return its buffer to the pool: {}",
+            full.runtime.status()
         );
 
         // The pooled 4096-byte buffer serves a 14-byte request: an uncut
@@ -2941,8 +3083,108 @@ mod tests {
             short_page[100..].iter().all(|byte| *byte == 0),
             "bytes past EOF must be zero, not a recycled buffer's stale 0xAB"
         );
+        assert!(
+            vfs.is_available(),
+            "every read above must have gone through the ring: {}",
+            vfs.status()
+        );
         full.close(&cx).expect("close full");
         short.close(&cx).expect("close short");
+    }
+
+    /// bd-0oa1b keepers on the real ring. The latency window is process-wide,
+    /// so the body runs in a child process of this test binary, filtered to
+    /// this test alone, where no other test's samples share it.
+    #[cfg(feature = "linux-asupersync-uring")]
+    #[test]
+    fn test_conformal_policy_spares_early_writes_and_disables_on_a_sustained_breach() {
+        const CHILD_ENV: &str = "FSQLITE_BD_0OA1B_POLICY_CHILD";
+        const TEST: &str = "uring::tests::test_conformal_policy_spares_early_writes_and_disables_on_a_sustained_breach";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            conformal_policy_child_body();
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([TEST, "--exact", "--test-threads=1", "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("run the isolated conformal-policy child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "isolated conformal-policy child failed: {}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(feature = "linux-asupersync-uring")]
+    fn conformal_policy_child_body() {
+        let cx = Cx::new();
+        let vfs = IoUringVfs::new();
+        assert!(vfs.is_available(), "requires io_uring: {}", vfs.status());
+        reset_io_uring_latency_metrics();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut file, _) = vfs
+            .open(
+                &cx,
+                Some(&dir.path().join("policy.db")),
+                open_flags_create_unlocked(),
+            )
+            .expect("open");
+        let page = [0x5A_u8; 4096];
+        let mut offset = 0_u64;
+        let mut write = |file: &mut IoUringFile| {
+            block_on_test(&cx, file.write(&cx, &page, offset)).expect("write");
+            offset += 4096;
+        };
+
+        // A process's first 99 ring writes cannot breach, whatever their
+        // latencies: with fewer than 99 calibration scores the 99% conformal
+        // bound is unbounded. On main the bound of such a window was its
+        // running maximum; the CLI lost io_uring at its 58th ring write.
+        for _ in 0..99 {
+            write(&mut file);
+        }
+        let early = io_uring_latency_snapshot();
+        assert_eq!(
+            early.write_samples_total, 99,
+            "every early write went through the ring"
+        );
+        assert_eq!(early.write_tail_violations_total, 0);
+        assert!(
+            vfs.is_available(),
+            "early writes must not disable io_uring: {}",
+            vfs.status()
+        );
+
+        // A sustained breach on a full window still disables it. Calibrate
+        // the window at 1 ns, so that every real ring write exceeds the bound
+        // until about 11 of them have entered the window; the policy needs 10
+        // violations among the last 64 calibrated samples.
+        for _ in 0..2_000 {
+            let _ = record_io_uring_write_latency(Duration::from_nanos(1));
+        }
+        for violation in 1..10 {
+            write(&mut file);
+            assert!(
+                vfs.is_available(),
+                "{violation} violations are not a sustained breach: {}",
+                vfs.status()
+            );
+        }
+        write(&mut file);
+        let status = vfs.status();
+        assert!(
+            !vfs.is_available(),
+            "the tenth violation is a sustained breach: {status}"
+        );
+        assert!(
+            status.contains(IO_URING_WRITE_CONFORMAL_BREACH_MSG),
+            "{status}"
+        );
+        assert_eq!(io_uring_latency_snapshot().write_tail_violations_total, 10);
+        file.close(&cx).expect("close");
     }
 
     #[test]
@@ -3672,10 +3914,17 @@ mod tests {
         // `block_on_test` attaches a native `Cx`, the WAL's retained canonical fd is
         // multiplexed through io_uring (3d1dc5c9d) rather than falling back, so the
         // ops record io_uring latency samples.
+        // bd-2sf0f: WAL-flagged files now write through the Unix pwrite path (the
+        // coordinator-approved lever), so the write records no io_uring sample; the
+        // read still goes through the ring on the retained canonical fd.
         let snapshot = io_uring_latency_snapshot();
+        assert_eq!(
+            snapshot.write_samples_total, 0,
+            "a WAL write must take the pwrite path, not the ring"
+        );
         assert!(
-            snapshot.write_samples_total >= 1 && snapshot.read_samples_total >= 1,
-            "wal I/O should multiplex the canonical fd through io_uring and record latency samples"
+            snapshot.read_samples_total >= 1,
+            "wal reads should multiplex the canonical fd through io_uring and record latency samples"
         );
     }
 

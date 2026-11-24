@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use fsqlite_types::opcode::{Opcode, P4};
+use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
 use fsqlite_vdbe::VdbeProgram;
 
 // ---------------------------------------------------------------------------
@@ -305,12 +305,16 @@ pub fn program_index_seek_facts(program: &VdbeProgram) -> Option<IndexSeek> {
 }
 
 /// Aggregate-only compatibility wrapper for callers that require that shape.
+///
+/// The program steps an aggregate, or counts index entries from the b-tree
+/// (`IdxCountBefore`, bd-2fb53 / bd-zgbhb / bd-qyd3s), which is a COUNT(*)
+/// over the same seek without an `AggStep`.
 #[must_use]
 pub fn aggregate_index_seek_facts(program: &VdbeProgram) -> Option<IndexSeek> {
     if !program
         .ops()
         .iter()
-        .any(|op| op.opcode == Opcode::AggStep)
+        .any(|op| matches!(op.opcode, Opcode::AggStep | Opcode::IdxCountBefore))
     {
         return None;
     }
@@ -445,6 +449,48 @@ pub fn program_seeks_rowid_on_table(program: &VdbeProgram, table_name: &str) -> 
     })
 }
 
+/// True when the program seeks a rowid range on `table_name` (bd-r39kx).
+///
+/// A cursor opened on the table is positioned with a range seek
+/// (`SeekGE`/`SeekGT`/`SeekLE`/`SeekLT` on the table b-tree), and no index is
+/// positioned, walked or read: stock reports that as `SEARCH t USING INTEGER
+/// PRIMARY KEY (rowid>? ...)`.
+#[must_use]
+pub fn program_seeks_rowid_range_on_table(program: &VdbeProgram, table_name: &str) -> bool {
+    let ops = program.ops();
+    let mut table_cursors: HashSet<i32> = HashSet::new();
+    let mut index_cursors: HashSet<i32> = HashSet::new();
+    for op in ops {
+        if matches!(op.opcode, Opcode::OpenRead | Opcode::OpenWrite) {
+            match &op.p4 {
+                P4::Table(name) if name == table_name => {
+                    table_cursors.insert(op.p1);
+                }
+                P4::Index(_) => {
+                    index_cursors.insert(op.p1);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut range_seek = false;
+    for op in ops {
+        let positions = matches!(
+            op.opcode,
+            Opcode::SeekGE | Opcode::SeekGT | Opcode::SeekLE | Opcode::SeekLT
+        );
+        let walks_or_reads = matches!(
+            op.opcode,
+            Opcode::Rewind | Opcode::Last | Opcode::Next | Opcode::Prev | Opcode::IdxRowid
+        );
+        if (positions || walks_or_reads) && index_cursors.contains(&op.p1) {
+            return false;
+        }
+        range_seek |= positions && table_cursors.contains(&op.p1);
+    }
+    range_seek
+}
+
 /// True when the program's ONLY way onto `table_name` is by rowid (GH #415).
 ///
 /// Every access to a cursor opened on the table must be a rowid probe
@@ -542,6 +588,210 @@ pub fn program_seeks_without_rowid_pk_on_table(program: &VdbeProgram, table_name
     }
     ops.iter().any(|op| {
         matches!(op.opcode, Opcode::NoConflict | Opcode::NotFound) && table_cursors.contains(&op.p1)
+    })
+}
+
+/// bd-r39kx: whether a comparison exits the walk `cursor` starts at
+/// `rewind_addr` once the value `reader` loads from the cursor passes an
+/// upper bound: right after the `Rewind`, the register `reader` loads (it
+/// returns the destination register of a matching opcode) is the LEFT operand
+/// (`P3`) of a `Ge` or `Gt` that jumps to the `Rewind`'s exit, as `x < ?` /
+/// `x <= ?` compile; only NULL tests may come between.
+fn walk_exits_at_upper_bound(
+    ops: &[VdbeOp],
+    rewind_addr: usize,
+    cursor: i32,
+    reader: impl Fn(&VdbeOp) -> Option<i32>,
+) -> bool {
+    let exit = ops[rewind_addr].p2;
+    let mut loaded: Option<i32> = None;
+    for op in &ops[rewind_addr + 1..] {
+        if op.p1 == cursor
+            && let Some(register) = reader(op)
+        {
+            loaded = Some(register);
+            continue;
+        }
+        match op.opcode {
+            Opcode::IsNull | Opcode::NotNull => {}
+            Opcode::Ge | Opcode::Gt => return loaded == Some(op.p3) && op.p2 == exit,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Opcodes whose `P1` is a cursor that they position or walk.
+fn positions_cursor(opcode: Opcode) -> bool {
+    matches!(
+        opcode,
+        Opcode::Rewind
+            | Opcode::Last
+            | Opcode::Next
+            | Opcode::Prev
+            | Opcode::SeekGE
+            | Opcode::SeekGT
+            | Opcode::SeekLE
+            | Opcode::SeekLT
+            | Opcode::NoConflict
+            | Opcode::NotFound
+            | Opcode::NotExists
+            | Opcode::Count
+    )
+}
+
+/// bd-r39kx: whether the program walks `table_name` up to a rowid bound.
+///
+/// The walk starts at its first row and leaves at an upper bound on the rowid
+/// (`Rewind`, `Rowid`, `Ge`/`Gt` to the exit), touching no index: stock's
+/// `SEARCH t USING INTEGER PRIMARY KEY (rowid<?)`.
+#[must_use]
+pub fn program_walks_rowid_up_to_bound(program: &VdbeProgram, table_name: &str) -> bool {
+    let ops = program.ops();
+    let mut table_cursor = None;
+    for op in ops {
+        if matches!(op.opcode, Opcode::OpenRead | Opcode::OpenWrite) {
+            match &op.p4 {
+                P4::Table(name) if name == table_name && table_cursor.is_none() => {
+                    table_cursor = Some(op.p1);
+                }
+                P4::Table(_) | P4::Index(_) => return false,
+                _ => {}
+            }
+        }
+    }
+    let Some(cursor) = table_cursor else {
+        return false;
+    };
+    let mut rewinds = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| op.p1 == cursor && matches!(op.opcode, Opcode::Rewind | Opcode::Last));
+    let (Some((rewind_addr, rewind)), None) = (rewinds.next(), rewinds.next()) else {
+        return false;
+    };
+    rewind.opcode == Opcode::Rewind
+        && !ops.iter().any(|op| {
+            op.p1 == cursor
+                && matches!(
+                    op.opcode,
+                    Opcode::SeekGE | Opcode::SeekGT | Opcode::SeekLE | Opcode::SeekLT
+                )
+        })
+        && walk_exits_at_upper_bound(ops, rewind_addr, cursor, |op| {
+            (op.opcode == Opcode::Rowid).then_some(op.p2)
+        })
+}
+
+/// How a program walks its one index (bd-r39kx).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexWalkKind {
+    /// From one end to the other.
+    Whole,
+    /// From its first entry until the leading key column passes a bound.
+    BoundedAbove,
+    /// Reads the first or last non-NULL key into a single `min`/`max`.
+    Extremum,
+    /// Counts its entries (`Count`).
+    Count,
+}
+
+/// An index a program walks rather than seeks (bd-r39kx).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexWalk {
+    /// The index walked.
+    pub index_name: String,
+    /// No `IdxRowid` on the index feeds a `SeekRowid` into the table.
+    pub covering: bool,
+    /// How the walk runs.
+    pub kind: IndexWalkKind,
+}
+
+/// bd-r39kx: the one index a program walks rather than seeks, if any.
+///
+/// The program opens one index and positions it only with a `Rewind` or
+/// `Last` (or counts it with `Count`), and reaches its table, if at all, only
+/// by `IdxRowid` + `SeekRowid`. Stock describes
+/// that as one row for the source: `SCAN t USING [COVERING] INDEX i`, `SEARCH
+/// t USING [COVERING] INDEX i (a<?)` for a walk that stops at an upper bound
+/// on the leading column, `SEARCH t USING COVERING INDEX i` for a `min` or
+/// `max` read. `None` for any other shape (a seek, two indexes, a table
+/// walked on its own), which keeps the existing rendering.
+#[must_use]
+pub fn program_index_walk(program: &VdbeProgram) -> Option<IndexWalk> {
+    let ops = program.ops();
+    let mut index: Option<(i32, &str)> = None;
+    let mut table_cursor: Option<i32> = None;
+    for op in ops {
+        if !matches!(op.opcode, Opcode::OpenRead | Opcode::OpenWrite) {
+            continue;
+        }
+        match &op.p4 {
+            P4::Index(name) if index.is_none() => index = Some((op.p1, name.as_str())),
+            P4::Table(_) if table_cursor.is_none() => table_cursor = Some(op.p1),
+            P4::Index(_) | P4::Table(_) => return None,
+            _ => {}
+        }
+    }
+    let (cursor, index_name) = index?;
+    // The table is only looked up by the rowids the index yields, and the
+    // index is never seeked.
+    let mut rowid_from_index = false;
+    let mut table_lookup = false;
+    for op in ops {
+        if op.opcode == Opcode::SeekRowid && Some(op.p1) == table_cursor {
+            table_lookup |= rowid_from_index;
+        } else if positions_cursor(op.opcode)
+            && (Some(op.p1) == table_cursor
+                || (op.p1 == cursor
+                    && !matches!(
+                        op.opcode,
+                        Opcode::Rewind | Opcode::Last | Opcode::Next | Opcode::Prev | Opcode::Count
+                    )))
+        {
+            return None;
+        }
+        rowid_from_index = op.opcode == Opcode::IdxRowid && op.p1 == cursor;
+    }
+    let covering = !table_lookup;
+    let positions: Vec<(usize, Opcode)> = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| {
+            op.p1 == cursor && matches!(op.opcode, Opcode::Rewind | Opcode::Last | Opcode::Count)
+        })
+        .map(|(addr, op)| (addr, op.opcode))
+        .collect();
+    let [(position_addr, position)] = positions[..] else {
+        return None;
+    };
+    let extremum_steps = ops
+        .iter()
+        .filter(|op| op.opcode == Opcode::AggStep)
+        .map(|op| match &op.p4 {
+            P4::FuncName(name) | P4::FuncNameCollated(name, _) => {
+                name.eq_ignore_ascii_case("min") || name.eq_ignore_ascii_case("max")
+            }
+            _ => false,
+        })
+        .collect::<Vec<_>>();
+    let kind = if position == Opcode::Count {
+        IndexWalkKind::Count
+    } else if extremum_steps == [true] {
+        IndexWalkKind::Extremum
+    } else if position == Opcode::Rewind
+        && walk_exits_at_upper_bound(ops, position_addr, cursor, |op| {
+            (op.opcode == Opcode::Column && op.p2 == 0).then_some(op.p3)
+        })
+    {
+        IndexWalkKind::BoundedAbove
+    } else {
+        IndexWalkKind::Whole
+    };
+    Some(IndexWalk {
+        index_name: index_name.to_owned(),
+        covering,
+        kind,
     })
 }
 
@@ -817,6 +1067,41 @@ mod tests {
             aggregate_index_seek_facts(&prog),
             None,
             "a non-aggregate seek must not satisfy the aggregate-only wrapper"
+        );
+    }
+
+    /// A COUNT(*) counted from the b-tree has no AggStep: the seek it
+    /// positions with is still an aggregate's covering index search.
+    #[test]
+    fn test_aggregate_index_seek_facts_accepts_a_counted_index_run() {
+        let mut b = ProgramBuilder::new();
+        let end_label = b.emit_label();
+        let done_label = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
+        b.emit_op(Opcode::Transaction, 0, 0, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 0, 2, 0, P4::None, 0);
+        b.emit_op(
+            Opcode::OpenRead,
+            1,
+            3,
+            0,
+            P4::Index("idx_t_k".to_owned()),
+            0,
+        );
+        b.emit_jump_to_label(Opcode::SeekGE, 1, 4, done_label, P4::None, 0);
+        b.emit_op(Opcode::IdxCountBefore, 1, 2, 4, P4::None, 1);
+        b.resolve_label(done_label);
+        b.emit_op(Opcode::ResultRow, 2, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Close, 1, 0, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end_label);
+        let prog = b.finish().unwrap();
+        assert_eq!(
+            aggregate_index_seek_facts(&prog),
+            Some(IndexSeek {
+                index_name: "idx_t_k".to_owned(),
+                covering: true,
+            })
         );
     }
 

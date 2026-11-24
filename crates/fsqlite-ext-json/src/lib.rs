@@ -19,7 +19,7 @@
 //! - `$[#-N]` reverse array index
 
 use std::borrow::Cow;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use fsqlite_error::{FrankenError, Result};
@@ -28,7 +28,231 @@ use fsqlite_func::{
     VirtualTable, VirtualTableCursor, WindowFunction,
 };
 use fsqlite_types::{SmallText, SqliteValue, cx::Cx};
-use serde_json::{Map, Number, Value};
+use serde_json::Number;
+
+/// JSON objects are ordered sequences of members, not maps: SQLite retains
+/// repeated labels and a path selects the first matching member. Keep this
+/// representation private so every parser, renderer and edit shares that rule.
+#[derive(Debug, Clone, PartialEq)]
+enum Value {
+    Null,
+    Bool(bool),
+    Number(Number),
+    /// Exact decimal digits when a Number would round them or lose the sign of -0.
+    IntegerText(String),
+    HexInteger(HexInteger),
+    String(String),
+    Array(Vec<Self>),
+    Object(Object),
+}
+
+/// SQLite's INT5 uses the unsigned hexadecimal magnitude to choose the SQL
+/// storage class, even for negative values. Keep the original token so a
+/// JSONB round trip retains that distinction at the signed integer boundary.
+#[derive(Debug, Clone, PartialEq)]
+struct HexInteger {
+    token: String,
+    magnitude: Option<u64>,
+}
+
+impl HexInteger {
+    fn parse_value(token: &str) -> Option<Value> {
+        let unsigned = token.strip_prefix('-').unwrap_or(token);
+        let digits = unsigned
+            .strip_prefix("0x")
+            .or_else(|| unsigned.strip_prefix("0X"))?;
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let magnitude = u64::from_str_radix(digits, 16).ok();
+        if let Some(n) = magnitude {
+            if !token.starts_with('-') {
+                return Some(Value::Number(n.into()));
+            }
+            if n == 0 {
+                return Some(Value::IntegerText("-0".to_owned()));
+            }
+            if let Ok(int) = i64::try_from(n) {
+                return Some(Value::Number((-int).into()));
+            }
+        }
+        Some(Value::HexInteger(Self {
+            token: token.to_owned(),
+            magnitude,
+        }))
+    }
+
+    fn write_text(&self, out: &mut String) {
+        if self.token.starts_with('-') {
+            out.push('-');
+        }
+        if let Some(magnitude) = self.magnitude {
+            out.push_str(&magnitude.to_string());
+        } else {
+            out.push_str("9.0e999");
+        }
+    }
+
+    fn sql_value(&self) -> Result<SqliteValue> {
+        let magnitude = self.magnitude.ok_or_else(malformed_json)?;
+        let negative = self.token.starts_with('-');
+        Ok(if let Ok(int) = i64::try_from(magnitude) {
+            SqliteValue::Integer(if negative { -int } else { int })
+        } else {
+            let real = magnitude as f64;
+            SqliteValue::Float(if negative { -real } else { real })
+        })
+    }
+}
+
+impl Value {
+    fn get(&self, key: &str) -> Option<&Self> {
+        match self {
+            Self::Object(object) => object.get(key),
+            _ => None,
+        }
+    }
+
+    fn as_array(&self) -> Option<&Vec<Self>> {
+        match self {
+            Self::Array(array) => Some(array),
+            _ => None,
+        }
+    }
+
+    fn as_array_mut(&mut self) -> Option<&mut Vec<Self>> {
+        match self {
+            Self::Array(array) => Some(array),
+            _ => None,
+        }
+    }
+
+    fn as_object_mut(&mut self) -> Option<&mut Object> {
+        match self {
+            Self::Object(object) => Some(object),
+            _ => None,
+        }
+    }
+
+    fn is_null(&self) -> bool {
+        matches!(self, Self::Null)
+    }
+}
+
+/// Members retain their source order, including duplicate labels. Large
+/// objects also keep a first-member index, avoiding a linear search for each
+/// path lookup; small objects need neither a hash table nor a second key copy.
+#[derive(Debug, Clone, Default)]
+struct Object {
+    members: Vec<(String, Value)>,
+    first_by_key: Option<HashMap<String, usize>>,
+}
+
+impl PartialEq for Object {
+    fn eq(&self, other: &Self) -> bool {
+        self.members == other.members
+    }
+}
+
+impl Object {
+    const INDEX_THRESHOLD: usize = 16;
+
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn len(&self) -> usize {
+        self.members.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.members.is_empty()
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, (String, Value)> {
+        self.members.iter()
+    }
+
+    fn first_index(&self, key: &str) -> Option<usize> {
+        match &self.first_by_key {
+            Some(index) => index.get(key).copied(),
+            None => self.members.iter().position(|(label, _)| label == key),
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<&Value> {
+        self.first_index(key).map(|index| &self.members[index].1)
+    }
+
+    fn get_mut(&mut self, key: &str) -> Option<&mut Value> {
+        self.first_index(key)
+            .map(|index| &mut self.members[index].1)
+    }
+
+    fn contains_key(&self, key: &str) -> bool {
+        self.first_index(key).is_some()
+    }
+
+    /// Parsing always appends: even an existing label names another member.
+    fn append(&mut self, key: String, value: Value) {
+        if let Some(index) = &mut self.first_by_key {
+            index.entry(key.clone()).or_insert(self.members.len());
+        }
+        self.members.push((key, value));
+        if self.first_by_key.is_none() && self.members.len() >= Self::INDEX_THRESHOLD {
+            self.rebuild_index();
+        }
+    }
+
+    /// Edits replace the first matching member without disturbing duplicates.
+    fn insert(&mut self, key: String, value: Value) {
+        if let Some(prior) = self.get_mut(&key) {
+            *prior = value;
+        } else {
+            self.append(key, value);
+        }
+    }
+
+    /// Removing the first member exposes the next duplicate to path lookup.
+    fn shift_remove(&mut self, key: &str) {
+        if let Some(index) = self.first_index(key) {
+            self.members.remove(index);
+            if self.first_by_key.is_some() {
+                self.rebuild_index();
+            }
+        }
+    }
+
+    fn rebuild_index(&mut self) {
+        if self.members.len() < Self::INDEX_THRESHOLD {
+            self.first_by_key = None;
+            return;
+        }
+        let mut index = HashMap::with_capacity(self.members.len());
+        for (position, (key, _)) in self.members.iter().enumerate() {
+            index.entry(key.clone()).or_insert(position);
+        }
+        self.first_by_key = Some(index);
+    }
+}
+
+impl IntoIterator for Object {
+    type Item = (String, Value);
+    type IntoIter = std::vec::IntoIter<Self::Item>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.members.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a Object {
+    type Item = &'a (String, Value);
+    type IntoIter = std::slice::Iter<'a, (String, Value)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.members.iter()
+    }
+}
 
 const JSON_VALID_DEFAULT_FLAGS: u8 = 0x01;
 const JSON_VALID_RFC_8259_FLAG: u8 = 0x01;
@@ -72,9 +296,12 @@ const JSONB_OBJECT_TYPE: u8 = 0xC;
 ///
 /// Such a number is carried inside the `Value` tree as a `Value::String` whose
 /// bytes begin with this tag followed by the numeric text. Every renderer, the
-/// JSONB encoder, `json_type` and the SQL readers treat it as a REAL. The tag
-/// embeds NUL and SOH control bytes so it can never collide with a real JSON
-/// string value.
+/// JSONB encoder, `json_type` and the SQL readers treat it as a REAL.
+///
+/// Genuine strings can contain these control bytes too. Every string-value
+/// ingress doubles an initial tag, and every string-value output removes that
+/// extra tag exactly once. Numeric carriers keep a single tag followed by
+/// numeric text. Object labels remain raw strings outside this representation.
 const NUMBER_TEXT_TAG: &str = "\u{0}\u{0}fsqlite\u{1}nonfinite\u{0}";
 
 /// Build the tagged `Value::String` that carries a JSON number as its exact
@@ -83,10 +310,26 @@ fn number_text_value(raw: &str) -> Value {
     Value::String(format!("{NUMBER_TEXT_TAG}{raw}"))
 }
 
+/// Import genuine text without allowing it to impersonate a number carrier.
+fn json_string_value(mut text: String) -> Value {
+    if text.starts_with(NUMBER_TEXT_TAG) {
+        text.insert_str(0, NUMBER_TEXT_TAG);
+    }
+    Value::String(text)
+}
+
+/// Recover genuine text from an internal string value, removing one escape.
+fn json_string_text(text: &str) -> &str {
+    text.strip_prefix(NUMBER_TEXT_TAG)
+        .filter(|raw| raw.starts_with(NUMBER_TEXT_TAG))
+        .unwrap_or(text)
+}
+
 /// If `s` is a tagged number-text carrier, return its numeric text; otherwise
 /// `None` (a genuine string value).
 fn as_number_text(s: &str) -> Option<&str> {
     s.strip_prefix(NUMBER_TEXT_TAG)
+        .filter(|raw| !raw.starts_with(NUMBER_TEXT_TAG))
 }
 
 /// Whether a JSON number token must be carried as its text
@@ -97,18 +340,17 @@ fn as_number_text(s: &str) -> Option<&str> {
 /// `Number` renders in Rust's shortest form, so a token needs its text when
 /// it overflows f64 (GH#212), or when it is a float (`.`, `e` or `E`) whose
 /// text is not that shortest form (bd-1nxwh). Integers fit i64/u64 and render
-/// as written. A token that is not an RFC 8259 number (`5.`, `01`) is left to
+/// as written. Integers outside serde's signed/unsigned range and integer -0
+/// also need their original digits. A non-RFC 8259 token (`5.`, `01`) is left to
 /// the strict parse to reject, so JSON5 input still reaches its fallback.
 ///
 /// Every number of every parsed document passes through here, so the common
-/// tokens are decided without parsing: an integer cannot overflow f64 below
-/// 309 digits, and [`is_shortest_fixed_decimal`] recognizes the usual decimal.
+/// tokens are decided without parsing: an integer shorter than 19 digits fits
+/// in i64, and [`is_shortest_fixed_decimal`] recognizes the usual decimal.
 fn number_token_needs_text(raw: &str) -> bool {
     let bytes = raw.as_bytes();
     if !bytes.iter().any(|byte| matches!(byte, b'.' | b'e' | b'E')) {
-        return bytes.len() > 300
-            && is_strict_json_number(raw)
-            && raw.parse::<f64>().is_ok_and(f64::is_infinite);
+        return integer_needs_text(raw);
     }
     if is_shortest_fixed_decimal(bytes) {
         return false;
@@ -118,6 +360,20 @@ fn number_token_needs_text(raw: &str) -> bool {
         Ok(value) => is_strict_json_number(raw) && !float_renders_as(value, raw),
         Err(_) => false,
     }
+}
+
+/// Decimal integer tokens that cannot round-trip through serde's i64/u64.
+fn integer_needs_text(raw: &str) -> bool {
+    raw == "-0"
+        || (raw.len() >= 20
+            && raw
+                .strip_prefix('-')
+                .unwrap_or(raw)
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+            && is_strict_json_number(raw)
+            && raw.parse::<i64>().is_err()
+            && raw.parse::<u64>().is_err())
 }
 
 /// Whether `text` is a fixed-point decimal that is already the shortest
@@ -219,19 +475,18 @@ fn float_renders_as(value: f64, text: &str) -> bool {
 /// written other than in Rust's shortest form keeps its source text, as stock
 /// keeps it (bd-1nxwh).
 ///
-/// The scanner walks bytes, copying string literals verbatim (respecting `\"` and
-/// `\\`) and identifying numeric tokens OUTSIDE strings: optional `-`, integer
-/// digits, optional `.`digits, optional `e`/`E` with optional sign and digits.
+/// The scanner walks bytes, respecting `\"` and `\\` in string literals and
+/// identifying numeric tokens OUTSIDE strings: optional `-`, integer digits,
+/// optional `.`digits, optional `e`/`E` with optional sign and digits. Original
+/// string values beginning with the reserved tag are escaped before any
+/// numeric carriers are synthesized; object labels remain unchanged.
 /// Such a token is replaced by the JSON string literal
 /// `"<escaped NUMBER_TEXT_TAG><raw>"` (serde escapes the tag's control bytes,
 /// keeping the output valid JSON). Returns `Some(rewritten)` iff at least one
-/// token was wrapped, else `None`, so the common document is parsed as given
-/// without a copy.
+/// token was wrapped or a genuine string escaped, else `None`, so the common
+/// document is parsed as given without a copy.
 /// Whether `input` can hold a float token: a `.`, or an exponent marker right
-/// after a digit. Only a float can need its text kept
-/// ([`number_token_needs_text`]), except an integer long enough to overflow
-/// f64, which the strict parse rejects so the callers rewrite on that error.
-/// A document with no float skips [`rewrite_number_text_tokens`]' scan.
+/// after a digit. Wide integers are checked separately.
 fn may_hold_float_token(input: &str) -> bool {
     let bytes = input.as_bytes();
     memchr::memchr(b'.', bytes).is_some()
@@ -239,9 +494,27 @@ fn may_hold_float_token(input: &str) -> bool {
             .any(|at| at > 0 && bytes[at - 1].is_ascii_digit())
 }
 
+/// A wide integer has at least 19 consecutive digits (negative i64 overflow
+/// starts at 19). Skip past the last non-digit in each candidate window.
+fn may_hold_integer_text(input: &str) -> bool {
+    if input.contains("-0") {
+        return true;
+    }
+    let mut bytes = input.as_bytes();
+    while let Some(window) = bytes.get(..19) {
+        let Some(last_non_digit) = window.iter().rposition(|b| !b.is_ascii_digit()) else {
+            return true;
+        };
+        bytes = &bytes[last_non_digit + 1..];
+    }
+    false
+}
+
 /// [`rewrite_number_text_tokens`] when the document may need it.
 fn number_text_rewrite_for_parse(input: &str) -> Option<String> {
-    if may_hold_float_token(input) {
+    // The tag starts with NUL, which strict JSON can spell only as \u0000.
+    // A float-free document can still contain genuine text needing escape.
+    if may_hold_float_token(input) || may_hold_integer_text(input) || input.contains(r"\u0000") {
         rewrite_number_text_tokens(input)
     } else {
         None
@@ -262,9 +535,11 @@ fn rewrite_number_text_tokens(input: &str) -> Option<String> {
         // UTF-8 sequence, so byte-level scanning is safe.
         let b = bytes[i];
         if b == b'"' {
-            // String literal: skip it, honoring backslash escapes. (A plain
+            // String literal: scan it, honoring backslash escapes. (A plain
             // position search beats memchr2 here: JSON strings are mostly
             // short keys.)
+            let start = i;
+            let mut closed = false;
             i += 1;
             while i < n {
                 let Some(offset) = bytes[i..]
@@ -279,8 +554,28 @@ fn rewrite_number_text_tokens(input: &str) -> Option<String> {
                     i += 2; // skip the escape and its escaped byte
                 } else {
                     i += 1;
+                    closed = true;
                     break;
                 }
+            }
+            // Only original string VALUES need escaping. Keys stay raw for
+            // object lookup, and malformed literals must reach the parser
+            // unchanged. Checking the first escape avoids decoding ordinary
+            // strings; numeric carriers inserted below are never rescanned.
+            if closed
+                && input[start + 1..i].starts_with(r"\u0000")
+                && !input[i..]
+                    .trim_start_matches([' ', '\t', '\r', '\n'])
+                    .starts_with(':')
+                && let Ok(text) = serde_json::from_str::<String>(&input[start..i])
+                && text.starts_with(NUMBER_TEXT_TAG)
+            {
+                let literal = serde_json::to_string(&format!("{NUMBER_TEXT_TAG}{text}"))
+                    .expect("serializing a String to JSON is infallible");
+                let rewritten = out.get_or_insert_with(|| String::with_capacity(n + 32));
+                rewritten.push_str(&input[copied..start]);
+                rewritten.push_str(&literal);
+                copied = i;
             }
         } else if b.is_ascii_digit() || (b == b'-' && i + 1 < n && bytes[i + 1].is_ascii_digit()) {
             // Numeric token start (a bare `-` not followed by a digit is
@@ -687,10 +982,8 @@ fn translate_json5_number(token: &str) -> String {
         .strip_prefix("0x")
         .or_else(|| token.strip_prefix("0X"))
     {
-        if let Ok(value) = u128::from_str_radix(hex, 16) {
-            return value.to_string();
-        }
-        return token.to_owned();
+        return u64::from_str_radix(hex, 16)
+            .map_or_else(|_| "9.0e999".to_owned(), |value| value.to_string());
     }
     let mut out = String::with_capacity(token.len() + 2);
     let mut chars = token.chars().peekable();
@@ -744,6 +1037,8 @@ fn write_canonical_json_text(value: &Value, out: &mut String) -> Result<()> {
         Value::Null => out.push_str("null"),
         Value::Bool(true) => out.push_str("true"),
         Value::Bool(false) => out.push_str("false"),
+        Value::IntegerText(digits) => out.push_str(digits),
+        Value::HexInteger(integer) => integer.write_text(out),
         Value::Number(number) => {
             if number.is_i64() || number.is_u64() {
                 out.push_str(&number.to_string());
@@ -779,7 +1074,7 @@ fn write_canonical_json_text(value: &Value, out: &mut String) -> Result<()> {
                 // are) — GH#212, bd-yalqc, bd-1nxwh.
                 out.push_str(raw);
             } else {
-                let escaped = serde_json::to_string(text).map_err(|error| {
+                let escaped = serde_json::to_string(json_string_text(text)).map_err(|error| {
                     FrankenError::function_error(format!("JSON string escape failed: {error}"))
                 })?;
                 out.push_str(&escaped);
@@ -888,7 +1183,7 @@ fn json_arrow_value(root: &Value, path: &str) -> Result<SqliteValue> {
 
 fn json_extract_single_path(root: &Value, path: &str) -> Result<SqliteValue> {
     let selected = resolve_path(root, path)?;
-    Ok(selected.map_or(SqliteValue::Null, json_to_sqlite_scalar))
+    selected.map_or(Ok(SqliteValue::Null), json_to_sqlite_scalar)
 }
 
 fn jsonb_extract_single_path_value(root: &Value, path: &str) -> Result<Value> {
@@ -1306,6 +1601,25 @@ pub fn jsonb_group_array(values: &[SqliteValue]) -> Result<Vec<u8>> {
     jsonb(&json_text)
 }
 
+/// The label a `json_group_object` row stores; `None` for a NULL label.
+///
+/// Stock's jsonObjectStep reads the label with `sqlite3_value_text`, so a
+/// number becomes its text, then measures it with `sqlite3Strlen30`, so the
+/// label ends at its first NUL. (`json_object` keeps the whole label.) A row
+/// with a NULL label adds no member. The connection's grouped aggregate
+/// evaluator builds these objects too, and reads its labels through this.
+#[must_use]
+pub fn group_object_label(label: &SqliteValue) -> Option<String> {
+    if label.is_null() {
+        return None;
+    }
+    let mut text = label.to_text();
+    if let Some(nul) = text.find('\0') {
+        text.truncate(nul);
+    }
+    Some(text)
+}
+
 /// Aggregate key/value pairs into a JSON object.
 ///
 /// Duplicate keys are preserved verbatim in row order, matching stock SQLite
@@ -1313,12 +1627,10 @@ pub fn jsonb_group_array(values: &[SqliteValue]) -> Result<Vec<u8>> {
 pub fn json_group_object(entries: &[(SqliteValue, SqliteValue)]) -> Result<String> {
     let mut members = Vec::with_capacity(entries.len());
     for (key_value, value) in entries {
-        // Stock reads the label as text (`sqlite3_value_text`), so a number
-        // becomes its text, and a NULL label drops the row.
-        if key_value.is_null() {
+        let Some(label) = group_object_label(key_value) else {
             continue;
-        }
-        members.push((key_value.to_text(), sqlite_to_json(value)?));
+        };
+        members.push((label, sqlite_to_json(value)?));
     }
     encode_json_object_members(&members)
 }
@@ -1327,10 +1639,10 @@ pub fn json_group_object(entries: &[(SqliteValue, SqliteValue)]) -> Result<Strin
 pub fn jsonb_group_object(entries: &[(SqliteValue, SqliteValue)]) -> Result<Vec<u8>> {
     let mut payload = Vec::new();
     for (key_value, value) in entries {
-        if key_value.is_null() {
+        let Some(label) = group_object_label(key_value) else {
             continue;
-        }
-        append_jsonb_string(&key_value.to_text(), &mut payload)?;
+        };
+        append_jsonb_string(&label, &mut payload)?;
         encode_jsonb_value(&sqlite_to_json(value)?, &mut payload)?;
     }
     let mut out = Vec::new();
@@ -1520,7 +1832,7 @@ fn json_each_value(root: &Value, path: Option<&str>) -> Result<Vec<JsonTableRow>
                     key: SqliteValue::Integer(index_i64),
                     value: json_value_column(item)?,
                     type_name: json_type_name(item),
-                    atom: json_atom_column(item),
+                    atom: json_atom_column(item)?,
                     id: next_id,
                     parent: SqliteValue::Null,
                     fullkey,
@@ -1536,7 +1848,7 @@ fn json_each_value(root: &Value, path: Option<&str>) -> Result<Vec<JsonTableRow>
                     key: SqliteValue::Text(key.as_str().into()),
                     value: json_value_column(item)?,
                     type_name: json_type_name(item),
-                    atom: json_atom_column(item),
+                    atom: json_atom_column(item)?,
                     id: next_id,
                     parent: SqliteValue::Null,
                     fullkey,
@@ -1554,7 +1866,7 @@ fn json_each_value(root: &Value, path: Option<&str>) -> Result<Vec<JsonTableRow>
                 key: SqliteValue::Null,
                 value: json_value_column(scalar)?,
                 type_name: json_type_name(scalar),
-                atom: json_atom_column(scalar),
+                atom: json_atom_column(scalar)?,
                 id: next_id,
                 parent: SqliteValue::Null,
                 fullkey: base_path.to_owned(),
@@ -1667,7 +1979,7 @@ impl VirtualTableCursor for JsonEachCursor {
     }
 
     fn rowid(&self) -> Result<i64> {
-        Ok(self.rows.get(self.pos).map_or(0, |row| row.id))
+        json_table_cursor_rowid(self.pos, self.rows.len())
     }
 }
 
@@ -1736,8 +2048,17 @@ impl VirtualTableCursor for JsonTreeCursor {
     }
 
     fn rowid(&self) -> Result<i64> {
-        Ok(self.rows.get(self.pos).map_or(0, |row| row.id))
+        json_table_cursor_rowid(self.pos, self.rows.len())
     }
+}
+
+fn json_table_cursor_rowid(pos: usize, row_count: usize) -> Result<i64> {
+    if pos >= row_count {
+        return Ok(0);
+    }
+    i64::try_from(pos).map_err(|error| {
+        FrankenError::function_error(format!("JSON table rowid overflow: {error}"))
+    })
 }
 
 fn parse_json_text(input: &str) -> Result<Value> {
@@ -1745,63 +2066,83 @@ fn parse_json_text(input: &str) -> Result<Value> {
     // `arbitrary_precision` off rejects; a float not in Rust's shortest form)
     // travel as tagged carriers (GH#212, bd-yalqc, bd-1nxwh).
     let rewritten = number_text_rewrite_for_parse(input);
-    match serde_json::from_str::<Value>(rewritten.as_deref().unwrap_or(input)) {
-        Ok(value) => Ok(value),
-        // An integer that overflows f64 (no float token, so no rewrite yet).
-        Err(_) if rewritten.is_none() => rewrite_number_text_tokens(input)
-            .and_then(|rewritten| serde_json::from_str::<Value>(&rewritten).ok())
-            .ok_or_else(malformed_json),
-        Err(_) => Err(malformed_json()),
-    }
+    serde_json::from_str::<Value>(rewritten.as_deref().unwrap_or(input))
+        .map_err(|_| malformed_json())
 }
 
 /// Deserialize JSON5 without letting serde_json turn infinite floats into null.
 struct Json5Value(Value);
+
+impl<'de> serde::Deserialize<'de> for Value {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Strict JSON has already passed through the numeric-text rewrite,
+        // including escaping genuine strings that begin with its private tag.
+        deserializer.deserialize_any(JsonValueVisitor::<false>)
+    }
+}
 
 impl<'de> serde::Deserialize<'de> for Json5Value {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        deserializer.deserialize_any(Json5ValueVisitor)
+        deserializer
+            .deserialize_any(JsonValueVisitor::<true>)
+            .map(Self)
     }
 }
 
-struct Json5ValueVisitor;
+struct JsonValueVisitor<const ESCAPE_STRINGS: bool>;
 
-impl<'de> serde::de::Visitor<'de> for Json5ValueVisitor {
-    type Value = Json5Value;
+impl<'de, const ESCAPE_STRINGS: bool> serde::de::DeserializeSeed<'de>
+    for JsonValueVisitor<ESCAPE_STRINGS>
+{
+    type Value = Value;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de, const ESCAPE_STRINGS: bool> serde::de::Visitor<'de> for JsonValueVisitor<ESCAPE_STRINGS> {
+    type Value = Value;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("a JSON5 value")
+        formatter.write_str("a JSON value")
     }
 
     fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
     where
         E: serde::de::Error,
     {
-        Ok(Json5Value(Value::Null))
+        Ok(Value::Null)
     }
 
     fn visit_bool<E>(self, value: bool) -> std::result::Result<Self::Value, E>
     where
         E: serde::de::Error,
     {
-        Ok(Json5Value(Value::Bool(value)))
+        Ok(Value::Bool(value))
     }
 
     fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E>
     where
         E: serde::de::Error,
     {
-        Ok(Json5Value(Value::from(value)))
+        Ok(Value::Number(value.into()))
     }
 
     fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E>
     where
         E: serde::de::Error,
     {
-        Ok(Json5Value(Value::from(value)))
+        Ok(Value::Number(value.into()))
     }
 
     fn visit_f64<E>(self, value: f64) -> std::result::Result<Self::Value, E>
@@ -1817,23 +2158,31 @@ impl<'de> serde::de::Visitor<'de> for Json5ValueVisitor {
                 "9e999"
             })
         } else {
-            Value::from(value)
+            Value::Number(Number::from_f64(value).expect("finite JSON number"))
         };
-        Ok(Json5Value(value))
+        Ok(value)
     }
 
     fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
     where
         E: serde::de::Error,
     {
-        Ok(Json5Value(Value::String(value.to_owned())))
+        self.visit_string(value.to_owned())
     }
 
     fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E>
     where
         E: serde::de::Error,
     {
-        Ok(Json5Value(Value::String(value)))
+        Ok(if ESCAPE_STRINGS {
+            json_string_value(value)
+        } else if let Some(raw) = as_number_text(&value)
+            && integer_needs_text(raw)
+        {
+            Value::IntegerText(raw.to_owned())
+        } else {
+            Value::String(value)
+        })
     }
 
     fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
@@ -1841,28 +2190,102 @@ impl<'de> serde::de::Visitor<'de> for Json5ValueVisitor {
         A: serde::de::SeqAccess<'de>,
     {
         let mut values = Vec::new();
-        while let Some(value) = sequence.next_element::<Json5Value>()? {
-            values.push(value.0);
+        while let Some(value) = sequence.next_element_seed(Self)? {
+            values.push(value);
         }
-        Ok(Json5Value(Value::Array(values)))
+        Ok(Value::Array(values))
     }
 
     fn visit_map<A>(self, mut object: A) -> std::result::Result<Self::Value, A::Error>
     where
         A: serde::de::MapAccess<'de>,
     {
-        let mut values = Map::new();
-        while let Some((key, value)) = object.next_entry::<String, Json5Value>()? {
-            values.insert(key, value.0);
+        let mut values = Object::new();
+        while let Some(key) = object.next_key::<String>()? {
+            let value = object.next_value_seed(Self)?;
+            values.append(key, value);
         }
-        Ok(Json5Value(Value::Object(values)))
+        Ok(Value::Object(values))
     }
 }
 
 fn parse_json5_text(input: &str) -> Result<Value> {
-    json5::from_str::<Json5Value>(input)
-        .map(|value| value.0)
-        .map_err(|error| FrankenError::function_error(format!("invalid JSON5 input: {error}")))
+    let Json5Value(mut value) = json5::from_str(input)
+        .map_err(|error| FrankenError::function_error(format!("invalid JSON5 input: {error}")))?;
+    if may_hold_integer_text(input) || input.contains("0x") || input.contains("0X") {
+        let mut remaining = input;
+        restore_json5_integer_text(&mut value, &mut remaining);
+    }
+    Ok(value)
+}
+
+/// The JSON5 deserializer rounds a wide integer before calling our serde
+/// visitor. Recover its decimal spelling from the validated input. Members
+/// (including duplicate keys) are stored in source order, so consuming one
+/// token per key and per scalar leaf keeps tokens aligned with the value tree.
+fn restore_json5_integer_text(value: &mut Value, input: &mut &str) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                restore_json5_integer_text(item, input);
+            }
+        }
+        Value::Object(object) => {
+            for (_, item) in &mut object.members {
+                let _label = next_json5_atom(input);
+                restore_json5_integer_text(item, input);
+            }
+        }
+        _ => {
+            if let Some(token) = next_json5_atom(input) {
+                let digits = token.strip_prefix('+').unwrap_or(token);
+                if integer_needs_text(digits) {
+                    *value = Value::IntegerText(digits.to_owned());
+                } else if let Some(integer) = HexInteger::parse_value(digits) {
+                    *value = integer;
+                }
+            }
+        }
+    }
+}
+
+/// Return a complete string, bare identifier, or scalar token from valid
+/// JSON5. Quoted text and comments are opaque, including any digits inside.
+fn next_json5_atom<'a>(input: &mut &'a str) -> Option<&'a str> {
+    let separator = |c| {
+        json5::char::is_json5_whitespace(c) || matches!(c, '[' | ']' | '{' | '}' | ',' | ':')
+    };
+    loop {
+        *input = input.trim_start_matches(separator);
+        if let Some(comment) = input.strip_prefix("//") {
+            let end = comment
+                .find(json5::char::is_json5_line_terminator)
+                .unwrap_or(comment.len());
+            *input = &comment[end..];
+        } else if let Some(comment) = input.strip_prefix("/*") {
+            *input = comment.split_once("*/")?.1;
+        } else {
+            break;
+        }
+    }
+    let mut chars = input.char_indices();
+    let (_, first) = chars.next()?;
+    let end = if matches!(first, '\'' | '"') {
+        loop {
+            let (at, c) = chars.next()?;
+            if c == first {
+                break at + 1;
+            }
+            if c == '\\' {
+                chars.next()?;
+            }
+        }
+    } else {
+        input.find(|c| separator(c) || c == '/').unwrap_or(input.len())
+    };
+    let (token, tail) = input.split_at(end);
+    *input = tail;
+    Some(token)
 }
 
 /// Parse JSON text, accepting JSON5 (unquoted keys, single quotes, trailing
@@ -1878,21 +2301,7 @@ fn parse_json_value_lenient(input: &str) -> Result<Value> {
     // `parse_json_text` (GH#212, bd-yalqc, bd-1nxwh). If the strict parse
     // fails, fall back to JSON5; on total failure report stock's
     // "malformed JSON".
-    let rewritten = number_text_rewrite_for_parse(input);
-    match serde_json::from_str::<Value>(rewritten.as_deref().unwrap_or(input)) {
-        Ok(value) => Ok(value),
-        Err(_) => {
-            // An integer that overflows f64 (no float token, so no rewrite
-            // yet) parses once wrapped; anything else tries JSON5.
-            if rewritten.is_none()
-                && let Some(rewritten) = rewrite_number_text_tokens(input)
-                && let Ok(value) = serde_json::from_str::<Value>(&rewritten)
-            {
-                return Ok(value);
-            }
-            parse_json5_text(input).map_err(|_| malformed_json())
-        }
-    }
+    parse_json_text(input).or_else(|_| parse_json5_text(input).map_err(|_| malformed_json()))
 }
 
 fn encode_jsonb_root(value: &Value) -> Result<Vec<u8>> {
@@ -1906,6 +2315,10 @@ fn encode_jsonb_value(value: &Value, out: &mut Vec<u8>) -> Result<()> {
         Value::Null => append_jsonb_node(JSONB_NULL_TYPE, &[], out),
         Value::Bool(true) => append_jsonb_node(JSONB_TRUE_TYPE, &[], out),
         Value::Bool(false) => append_jsonb_node(JSONB_FALSE_TYPE, &[], out),
+        Value::IntegerText(digits) => append_jsonb_node(JSONB_INT_TYPE, digits.as_bytes(), out),
+        Value::HexInteger(integer) => {
+            append_jsonb_node(JSONB_INT5_TYPE, integer.token.as_bytes(), out)
+        }
         Value::Number(number) => {
             // bd-t75hg: SQLite JSONB stores numeric payloads as the ASCII
             // text of the number (RFC-8259 text for INT/FLOAT), never as
@@ -1938,7 +2351,7 @@ fn encode_jsonb_value(value: &Value, out: &mut Vec<u8>) -> Result<()> {
                 // bd-1nxwh).
                 append_jsonb_node(JSONB_FLOAT_TYPE, raw.as_bytes(), out)
             } else {
-                append_jsonb_string(text, out)
+                append_jsonb_string(json_string_text(text), out)
             }
         }
         Value::Array(array) => {
@@ -2062,21 +2475,21 @@ fn decode_jsonb_value(input: &[u8]) -> Result<(Value, usize)> {
             } else {
                 text
             };
-            let number = if node_type == JSONB_INT5_TYPE
-                && let Some(hex) = normalized
-                    .strip_prefix("0x")
-                    .or_else(|| normalized.strip_prefix("0X"))
+            if integer_needs_text(normalized) {
+                return Ok((Value::IntegerText(normalized.to_owned()), consumed));
+            }
+            if node_type == JSONB_INT5_TYPE
+                && let Some(integer) = HexInteger::parse_value(normalized)
             {
-                i64::from_str_radix(hex, 16).ok().map(Number::from)
-            } else if let Ok(int) = normalized.parse::<i64>() {
+                return Ok((integer, consumed));
+            }
+            let number = if let Ok(int) = normalized.parse::<i64>() {
                 Some(Number::from(int))
             } else if let Ok(uint) = normalized.parse::<u64>() {
                 Some(Number::from(uint))
             } else {
-                // Stock keeps arbitrarily long integer text INT-typed; a
-                // value beyond u64 degrades to its nearest double, which
-                // preserves the numeric reading even though serde_json
-                // cannot carry the exact digits.
+                // Preserve the existing numeric fallback for non-decimal INT5
+                // spellings. Valid wide decimal integers were handled above.
                 normalized.parse::<f64>().ok().and_then(Number::from_f64)
             };
             Value::Number(number.ok_or_else(|| {
@@ -2114,24 +2527,8 @@ fn decode_jsonb_value(input: &[u8]) -> Result<(Value, usize)> {
                 number_text_value(normalized)
             }
         }
-        JSONB_TEXT_TYPE | JSONB_TEXTRAW_TYPE => {
-            let text = String::from_utf8(payload.to_vec()).map_err(|error| {
-                FrankenError::function_error(format!("invalid JSONB text payload: {error}"))
-            })?;
-            Value::String(text)
-        }
-        JSONB_TEXT_JSON_TYPE | JSONB_TEXT5_TYPE => {
-            // Escaped text: the payload carries RFC-8259 (TEXTJ) or JSON5
-            // (TEXT5) escape sequences that must be resolved to the raw
-            // string (bd-t75hg: previously returned verbatim, so stock-
-            // written escaped strings decoded with literal backslashes).
-            let text = std::str::from_utf8(payload).map_err(|error| {
-                FrankenError::function_error(format!("invalid JSONB text payload: {error}"))
-            })?;
-            Value::String(decode_jsonb_escaped_text(
-                text,
-                node_type == JSONB_TEXT5_TYPE,
-            )?)
+        JSONB_TEXT_TYPE | JSONB_TEXTRAW_TYPE | JSONB_TEXT_JSON_TYPE | JSONB_TEXT5_TYPE => {
+            json_string_value(decode_jsonb_text(node_type, payload)?)
         }
         JSONB_ARRAY_TYPE => {
             let mut cursor = 0usize;
@@ -2145,15 +2542,14 @@ fn decode_jsonb_value(input: &[u8]) -> Result<(Value, usize)> {
         }
         JSONB_OBJECT_TYPE => {
             let mut cursor = 0usize;
-            let mut map = Map::new();
+            let mut map = Object::new();
             while cursor < payload.len() {
-                let (key_node, key_used) = decode_jsonb_value(&payload[cursor..])?;
+                let (key_type, key_payload, key_used) = decode_jsonb_node(&payload[cursor..])?;
                 cursor += key_used;
-                let Value::String(key) = key_node else {
-                    return Err(FrankenError::function_error(
-                        "invalid JSONB object key payload",
-                    ));
-                };
+                // Labels are raw strings, not escaped string values. Decode
+                // their wire type directly: a numeric carrier must never
+                // make a non-text key look like a valid Value::String.
+                let key = decode_jsonb_text(key_type, key_payload)?;
                 if cursor >= payload.len() {
                     return Err(FrankenError::function_error(
                         "invalid JSONB object missing value",
@@ -2161,7 +2557,7 @@ fn decode_jsonb_value(input: &[u8]) -> Result<(Value, usize)> {
                 }
                 let (item, used) = decode_jsonb_value(&payload[cursor..])?;
                 cursor += used;
-                map.insert(key, item);
+                map.append(key, item);
             }
             Value::Object(map)
         }
@@ -2171,6 +2567,28 @@ fn decode_jsonb_value(input: &[u8]) -> Result<(Value, usize)> {
     };
 
     Ok((value, consumed))
+}
+
+/// Decode raw text for either a JSONB string value or an object label. Only
+/// values subsequently enter the escaped internal string representation.
+fn decode_jsonb_text(node_type: u8, payload: &[u8]) -> Result<String> {
+    match node_type {
+        JSONB_TEXT_TYPE | JSONB_TEXTRAW_TYPE => {
+            String::from_utf8(payload.to_vec()).map_err(|error| {
+                FrankenError::function_error(format!("invalid JSONB text payload: {error}"))
+            })
+        }
+        JSONB_TEXT_JSON_TYPE | JSONB_TEXT5_TYPE => {
+            // TEXTJ carries RFC-8259 escapes; TEXT5 adds JSON5 escapes.
+            let text = std::str::from_utf8(payload).map_err(|error| {
+                FrankenError::function_error(format!("invalid JSONB text payload: {error}"))
+            })?;
+            decode_jsonb_escaped_text(text, node_type == JSONB_TEXT5_TYPE)
+        }
+        _ => Err(FrankenError::function_error(
+            "invalid JSONB object key payload",
+        )),
+    }
 }
 
 /// Resolve TEXTJ/TEXT5 escape sequences to the raw string. TEXT5 adds the
@@ -2607,8 +3025,10 @@ fn resolve_path<'a>(root: &'a Value, path: &str) -> Result<Option<&'a Value>> {
 
 fn append_object_path(base: &str, key: &str) -> String {
     // Quote keys containing special characters that would make the path
-    // ambiguous (dots, brackets, quotes, whitespace).
-    if key.contains(|c: char| matches!(c, '.' | '[' | ']' | '"' | '\'') || c.is_whitespace()) {
+    // ambiguous (dots, brackets, quotes, whitespace), including an empty label.
+    if key.is_empty()
+        || key.contains(|c: char| matches!(c, '.' | '[' | ']' | '"' | '\'') || c.is_whitespace())
+    {
         format!("{base}.\"{}\"", key.replace('"', "\\\""))
     } else {
         format!("{base}.{key}")
@@ -2627,13 +3047,13 @@ fn json_value_column(value: &Value) -> Result<SqliteValue> {
             encode_json_text("json table value encode failed", value)
                 .map(|encoded| SqliteValue::Text(encoded.into()))
         }
-        _ => Ok(json_to_sqlite_scalar(value)),
+        _ => json_to_sqlite_scalar(value),
     }
 }
 
-fn json_atom_column(value: &Value) -> SqliteValue {
+fn json_atom_column(value: &Value) -> Result<SqliteValue> {
     match value {
-        Value::Array(_) | Value::Object(_) => SqliteValue::Null,
+        Value::Array(_) | Value::Object(_) => Ok(SqliteValue::Null),
         _ => json_to_sqlite_scalar(value),
     }
 }
@@ -2654,7 +3074,7 @@ fn append_tree_rows(
         key,
         value: json_value_column(value)?,
         type_name: json_type_name(value),
-        atom: json_atom_column(value),
+        atom: json_atom_column(value)?,
         id: current_id,
         parent: parent_id.map_or(SqliteValue::Null, SqliteValue::Integer),
         fullkey: fullkey.to_owned(),
@@ -2751,6 +3171,7 @@ fn json_type_name(value: &Value) -> &'static str {
         Value::Null => "null",
         Value::Bool(true) => "true",
         Value::Bool(false) => "false",
+        Value::IntegerText(_) | Value::HexInteger(_) => "integer",
         Value::Number(number) => {
             if number.is_i64() || number.is_u64() {
                 "integer"
@@ -2771,11 +3192,18 @@ fn json_type_name(value: &Value) -> &'static str {
     }
 }
 
-fn json_to_sqlite_scalar(value: &Value) -> SqliteValue {
-    match value {
+fn json_to_sqlite_scalar(value: &Value) -> Result<SqliteValue> {
+    Ok(match value {
+        Value::HexInteger(integer) => return integer.sql_value(),
         Value::Null => SqliteValue::Null,
         Value::Bool(true) => SqliteValue::Integer(1),
         Value::Bool(false) => SqliteValue::Integer(0),
+        Value::IntegerText(raw) if raw == "-0" => SqliteValue::Integer(0),
+        Value::IntegerText(raw) => {
+            // SQLite returns a REAL to SQL for JSON integers outside its i64
+            // range. Keep the exact digits until this conversion is requested.
+            SqliteValue::Float(raw.parse().expect("validated decimal integer"))
+        }
         Value::Number(number) => {
             if let Some(i) = number.as_i64() {
                 SqliteValue::Integer(i)
@@ -2804,7 +3232,7 @@ fn json_to_sqlite_scalar(value: &Value) -> SqliteValue {
                 // for a finite one (bd-1nxwh).
                 SqliteValue::Float(raw.parse::<f64>().unwrap_or(0.0))
             } else {
-                SqliteValue::Text(text.as_str().into())
+                SqliteValue::Text(json_string_text(text).into())
             }
         }
         Value::Array(_) | Value::Object(_) => {
@@ -2815,7 +3243,7 @@ fn json_to_sqlite_scalar(value: &Value) -> SqliteValue {
                 encode_json_text("json scalar encode", value).unwrap_or_else(|_| "null".to_owned());
             SqliteValue::Text(encoded.into())
         }
-    }
+    })
 }
 
 /// Convert a SQL REAL to a JSON value exactly as stock SQLite does:
@@ -2859,7 +3287,7 @@ fn sqlite_to_json(value: &SqliteValue) -> Result<Value> {
         SqliteValue::Null => Ok(Value::Null),
         SqliteValue::Integer(i) => Ok(Value::Number(Number::from(*i))),
         SqliteValue::Float(f) => float_to_json(*f),
-        SqliteValue::Text(text) => Ok(Value::String(text.to_string())),
+        SqliteValue::Text(text) => Ok(json_string_value(text.to_string())),
         // Stock `jsonAppendSqlValue`: a JSONB blob is embedded as the JSON
         // value it encodes; any other blob is an error.
         SqliteValue::Blob(bytes) => decode_jsonb_root(bytes)
@@ -2937,7 +3365,7 @@ fn array_insert_scaffold(next: Option<&PathSegment>) -> Value {
         Some(PathSegment::Index(_) | PathSegment::Append | PathSegment::FromEnd(_)) => {
             Value::Array(Vec::new())
         }
-        _ => Value::Object(Map::new()),
+        _ => Value::Object(Object::new()),
     }
 }
 
@@ -3230,10 +3658,7 @@ fn remove_at_path(root: &mut Value, segments: &[PathSegment]) {
 
     match (parent, last_segment) {
         (Value::Object(object), PathSegment::Key(key)) => {
-            // shift_remove (order-preserving), NOT remove (== swap_remove under
-            // serde_json's preserve_order IndexMap backing, which swaps the last
-            // member into the hole). SQLite's json_remove keeps the remaining
-            // object members in their original order.
+            // Preserve member order and remove only the first matching label.
             object.shift_remove(key.as_ref());
         }
         (Value::Array(array), PathSegment::Index(index)) if *index < array.len() => {
@@ -3290,7 +3715,7 @@ fn resolve_parent_for_edit<'a>(
             Some(PathSegment::Index(_) | PathSegment::Append | PathSegment::FromEnd(_)) => {
                 Value::Array(Vec::new())
             }
-            _ => Value::Object(Map::new()),
+            _ => Value::Object(Object::new()),
         }
     }
 
@@ -3376,7 +3801,7 @@ fn merge_patch(target: Value, patch: Value) -> Value {
         Value::Object(patch_map) => {
             let mut target_map = match target {
                 Value::Object(map) => map,
-                _ => Map::new(),
+                _ => Object::new(),
             };
 
             for (key, patch_value) in patch_map {
@@ -3745,7 +4170,7 @@ impl JsonExtractFunc {
             let subtype = matches!(selected, Some(Value::Array(_) | Value::Object(_)))
                 .then_some(JSON_SUBTYPE);
             return Ok((
-                selected.map_or(SqliteValue::Null, json_to_sqlite_scalar),
+                selected.map_or(Ok(SqliteValue::Null), json_to_sqlite_scalar)?,
                 subtype,
             ));
         }
@@ -3805,7 +4230,7 @@ impl ScalarFunction for JsonbExtractFunc {
                 Value::Array(_) | Value::Object(_) => Ok(SqliteValue::Blob(Arc::from(
                     encode_jsonb_root(&node)?.as_slice(),
                 ))),
-                _ => Ok(json_to_sqlite_scalar(&node)),
+                _ => json_to_sqlite_scalar(&node),
             };
         }
         let paths = collect_path_args(self.name(), args, 1)?;
@@ -4806,14 +5231,10 @@ impl AggregateFunction for JsonGroupObjectFunc {
         args: &[SqliteValue],
         arg_subtypes: &[u32],
     ) -> Result<()> {
-        // Stock reads the label as text (`sqlite3_value_text`), so a number
-        // becomes its text, and a NULL label drops the row.
-        let label = match &args[0] {
-            SqliteValue::Null => return Ok(()),
-            label @ SqliteValue::Text(_) => label.clone(),
-            other => SqliteValue::Text(SmallText::from_string(other.to_text())),
+        let Some(label) = group_object_label(&args[0]) else {
+            return Ok(());
         };
-        state.push((label, 0));
+        state.push((SqliteValue::Text(SmallText::from_string(label)), 0));
         state.push((args[1].clone(), arg_subtypes.get(1).copied().unwrap_or(0)));
         Ok(())
     }
@@ -4904,11 +5325,11 @@ impl AggregateFunction for JsonbGroupObjectFunc {
         args: &[SqliteValue],
         arg_subtypes: &[u32],
     ) -> Result<()> {
-        if args[0].is_null() {
+        let Some(label) = group_object_label(&args[0]) else {
             return Ok(());
-        }
+        };
         state.push((
-            args[0].to_text(),
+            label,
             args[1].clone(),
             arg_subtypes.get(1).copied().unwrap_or(0),
         ));
@@ -5003,12 +5424,9 @@ impl WindowFunction for JsonGroupWindowFunc {
             ));
             return Ok(());
         }
-        // The label is read as text, as for the aggregate.
-        let label = match &args[0] {
-            SqliteValue::Null => None,
-            label @ SqliteValue::Text(_) => Some(label.clone()),
-            other => Some(SqliteValue::Text(SmallText::from_string(other.to_text()))),
-        };
+        // The label is read as for the aggregate.
+        let label = group_object_label(&args[0])
+            .map(|text| SqliteValue::Text(SmallText::from_string(text)));
         state.push_back((
             label,
             args[1].clone(),
@@ -5111,6 +5529,699 @@ mod tests {
     use super::*;
     use fsqlite_func::FunctionRegistry;
 
+    fn stock_json_rows(
+        stock: &rusqlite::Connection,
+        sql: &str,
+        args: &[SqliteValue],
+    ) -> rusqlite::Result<Vec<Vec<SqliteValue>>> {
+        let parameters: Vec<rusqlite::types::Value> = args
+            .iter()
+            .map(|value| match value {
+                SqliteValue::Null => rusqlite::types::Value::Null,
+                SqliteValue::Integer(value) => rusqlite::types::Value::Integer(*value),
+                SqliteValue::Float(value) => rusqlite::types::Value::Real(*value),
+                SqliteValue::Text(value) => rusqlite::types::Value::Text(value.to_string()),
+                SqliteValue::Blob(value) => rusqlite::types::Value::Blob(value.to_vec()),
+            })
+            .collect();
+        let mut statement = stock.prepare(sql)?;
+        let width = statement.column_count();
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(parameters), |row| {
+                (0..width)
+                    .map(|index| {
+                        row.get::<_, rusqlite::types::Value>(index)
+                            .map(|value| match value {
+                                rusqlite::types::Value::Null => SqliteValue::Null,
+                                rusqlite::types::Value::Integer(value) => {
+                                    SqliteValue::Integer(value)
+                                }
+                                rusqlite::types::Value::Real(value) => SqliteValue::Float(value),
+                                rusqlite::types::Value::Text(value) => {
+                                    SqliteValue::Text(value.into())
+                                }
+                                rusqlite::types::Value::Blob(value) => {
+                                    SqliteValue::Blob(value.into())
+                                }
+                            })
+                    })
+                    .collect()
+            })?
+            .collect();
+        rows
+    }
+
+    fn stock_json_scalar(
+        stock: &rusqlite::Connection,
+        sql: &str,
+        args: &[SqliteValue],
+    ) -> SqliteValue {
+        stock_json_rows(stock, sql, args)
+            .unwrap()
+            .remove(0)
+            .remove(0)
+    }
+
+    fn normalized_jsonb(stock: &rusqlite::Connection, value: SqliteValue) -> SqliteValue {
+        if matches!(value, SqliteValue::Blob(_)) {
+            // Stock independently decodes our output. JSONB permits several
+            // string encodings; membership and values must be identical.
+            stock_json_scalar(stock, "SELECT json(?1)", &[value])
+        } else {
+            value
+        }
+    }
+
+    #[test]
+    fn duplicate_members_match_live_sqlite_oracle() {
+        let stock = rusqlite::Connection::open_in_memory().unwrap();
+        let mut registry = FunctionRegistry::new();
+        register_json_scalars(&mut registry);
+        let cases = [
+            ("json", vec![]),
+            ("jsonb", vec![]),
+            ("json_type", vec![text("$.a")]),
+            ("json_valid", vec![SqliteValue::Integer(10)]),
+            ("json_extract", vec![text("$.a")]),
+            ("json_extract", vec![text("$.a"), text("$.missing")]),
+            ("jsonb_extract", vec![text("$")]),
+            ("->", vec![text("$.a")]),
+            ("->>", vec![text("$.a")]),
+            ("json_set", vec![text("$.a"), SqliteValue::Integer(9)]),
+            ("jsonb_set", vec![text("$.a"), SqliteValue::Integer(9)]),
+            ("json_replace", vec![text("$.a"), SqliteValue::Integer(9)]),
+            ("jsonb_replace", vec![text("$.a"), SqliteValue::Integer(9)]),
+            (
+                "json_insert",
+                vec![
+                    text("$.a"),
+                    SqliteValue::Integer(9),
+                    text("$.new"),
+                    SqliteValue::Integer(4),
+                ],
+            ),
+            (
+                "jsonb_insert",
+                vec![
+                    text("$.a"),
+                    SqliteValue::Integer(9),
+                    text("$.new"),
+                    SqliteValue::Integer(4),
+                ],
+            ),
+            ("json_remove", vec![text("$.a")]),
+            ("json_remove", vec![text("$.a"), text("$.a")]),
+            ("jsonb_remove", vec![text("$.a")]),
+            ("json_patch", vec![text(r#"{"a":null}"#)]),
+            ("json_patch", vec![text(r#"{"a":8,"a":9}"#)]),
+            ("jsonb_patch", vec![text(r#"{"a":null,"a":9}"#)]),
+            ("json_pretty", vec![]),
+        ];
+        let mut documents = vec![
+            r#"{"a":1,"b":0,"a":2}"#.to_owned(),
+            r#"{"a":{"x":1,"x":2},"b":0,"a":3}"#.to_owned(),
+            r#"{"a":1.50,"a":1E2}"#.to_owned(),
+            r#"{"a":null,"a":[],"":1,"":2}"#.to_owned(),
+            "{a:1,b:0,a:2,}".to_owned(),
+            r#"{"a":1,"b":[2,3]}"#.to_owned(),
+            "{}".to_owned(),
+        ];
+        let mut large = vec![r#""a":1"#.to_owned()];
+        large.extend((0..32).map(|index| format!(r#""k{index}":{index}"#)));
+        large.push(r#""a":2"#.to_owned());
+        documents.push(format!("{{{}}}", large.join(",")));
+        for document in documents {
+            let stock_binary = stock_json_scalar(&stock, "SELECT jsonb(?1)", &[text(&document)]);
+            for source in [
+                text(&document),
+                SqliteValue::Blob(document.as_bytes().into()),
+                stock_binary,
+            ] {
+                for (name, tail) in &cases {
+                    let mut args = vec![source.clone()];
+                    args.extend(tail.iter().cloned());
+                    let sql = if matches!(*name, "->" | "->>") {
+                        format!("SELECT ?1 {name} ?2")
+                    } else {
+                        let parameters: Vec<_> =
+                            (1..=args.len()).map(|index| format!("?{index}")).collect();
+                        format!("SELECT {name}({})", parameters.join(","))
+                    };
+                    let expected = stock_json_scalar(&stock, &sql, &args);
+                    let actual = registry
+                        .find_scalar(name, args.len() as i32)
+                        .unwrap()
+                        .invoke(&args)
+                        .unwrap();
+                    assert_eq!(
+                        std::mem::discriminant(&actual),
+                        std::mem::discriminant(&expected),
+                        "{sql}: {args:?}"
+                    );
+                    assert_eq!(
+                        normalized_jsonb(&stock, actual),
+                        normalized_jsonb(&stock, expected),
+                        "{sql}: {args:?}"
+                    );
+                }
+                for recursive in [false, true] {
+                    let name = if recursive { "json_tree" } else { "json_each" };
+                    let actual = match (&source, recursive) {
+                        (SqliteValue::Text(input), false) => json_each(input, None),
+                        (SqliteValue::Text(input), true) => json_tree(input, None),
+                        (SqliteValue::Blob(input), false) => json_each_blob(input, None),
+                        (SqliteValue::Blob(input), true) => json_tree_blob(input, None),
+                        _ => unreachable!(),
+                    }
+                    .unwrap();
+                    let actual: Vec<Vec<_>> = actual
+                        .into_iter()
+                        .map(|row| {
+                            vec![
+                                row.key,
+                                row.value,
+                                text(row.type_name),
+                                row.atom,
+                                SqliteValue::Text(row.fullkey.into()),
+                                SqliteValue::Text(row.path.into()),
+                            ]
+                        })
+                        .collect();
+                    let sql = format!("SELECT key,value,type,atom,fullkey,path FROM {name}(?1)");
+                    assert_eq!(
+                        actual,
+                        stock_json_rows(&stock, &sql, &[source.clone()]).unwrap(),
+                        "{sql}: {source:?}"
+                    );
+                }
+                let canonical = JsonFunc.invoke(&[source.clone()]).unwrap();
+                for name in ["json_array", "jsonb_array"] {
+                    let actual = registry
+                        .find_scalar(name, 1)
+                        .unwrap()
+                        .invoke_with_arg_subtypes(&[canonical.clone()], &[JSON_SUBTYPE])
+                        .unwrap();
+                    let expected = stock_json_scalar(
+                        &stock,
+                        &format!("SELECT {name}(json(?1))"),
+                        &[source.clone()],
+                    );
+                    assert_eq!(
+                        normalized_jsonb(&stock, actual),
+                        normalized_jsonb(&stock, expected),
+                        "{name}: {source:?}"
+                    );
+                }
+            }
+        }
+        for document in [r#"{"a":1,"b":2}"#, r#"{"a":1,"a":2}"#] {
+            assert_eq!(
+                JsonbFunc.invoke(&[text(document)]).unwrap(),
+                stock_json_scalar(&stock, "SELECT jsonb(?1)", &[text(document)])
+            );
+        }
+        // Escape spellings denote the same key for lookup, but both members
+        // survive. Preserving a label's original escape spelling in rendered
+        // JSON and fullkey is a separate lexical-format concern.
+        let escaped = text(r#"{"a":1,"\u0061":2}"#);
+        let escaped_binary = stock_json_scalar(&stock, "SELECT jsonb(?1)", &[escaped.clone()]);
+        for source in [escaped, escaped_binary] {
+            let args = [source.clone(), text("$.a")];
+            assert_eq!(
+                JsonExtractFunc.invoke(&args).unwrap(),
+                stock_json_scalar(&stock, "SELECT json_extract(?1,?2)", &args)
+            );
+            let rows = match &source {
+                SqliteValue::Text(input) => json_each(input, None),
+                SqliteValue::Blob(input) => json_each_blob(input, None),
+                _ => unreachable!(),
+            }
+            .unwrap();
+            let rows: Vec<Vec<_>> = rows
+                .into_iter()
+                .map(|row| vec![row.key, row.value])
+                .collect();
+            assert_eq!(
+                rows,
+                stock_json_rows(&stock, "SELECT key,value FROM json_each(?1)", &[source]).unwrap()
+            );
+        }
+        for document in [r#"{"a":1,"a":}"#, r#"{"a":1,"a":2"#] {
+            let args = [text(document), text("$.a")];
+            assert!(JsonExtractFunc.invoke(&args).is_err());
+            assert!(stock_json_rows(&stock, "SELECT json_extract(?1,?2)", &args).is_err());
+        }
+    }
+
+    #[test]
+    fn duplicate_aggregate_members_match_live_sqlite_oracle() {
+        let stock = rusqlite::Connection::open_in_memory().unwrap();
+        stock
+            .execute_batch(
+                "CREATE TABLE entries(k,v); INSERT INTO entries VALUES \
+            ('a',1),('a',2),('b',3),(char(0)||'a',4),(char(0)||'b',5)",
+            )
+            .unwrap();
+        let mut registry = FunctionRegistry::new();
+        register_json_scalars(&mut registry);
+        let entries = [("a", 1), ("a", 2), ("b", 3), ("\0a", 4), ("\0b", 5)];
+        for name in ["json_group_object", "jsonb_group_object"] {
+            let aggregate = registry.find_aggregate(name, 2).unwrap();
+            let mut state = aggregate.initial_state();
+            for (key, value) in entries {
+                aggregate
+                    .step(&mut state, &[text(key), SqliteValue::Integer(value)])
+                    .unwrap();
+            }
+            let actual = aggregate.finalize(state).unwrap();
+            let expected =
+                stock_json_scalar(&stock, &format!("SELECT {name}(k,v) FROM entries"), &[]);
+            assert_eq!(
+                normalized_jsonb(&stock, actual.clone()),
+                normalized_jsonb(&stock, expected.clone()),
+                "{name}"
+            );
+            assert_eq!(
+                JsonFunc.invoke(&[actual]).unwrap(),
+                JsonFunc.invoke(&[expected]).unwrap()
+            );
+        }
+        for name in ["json_group_array", "jsonb_group_array"] {
+            let aggregate = registry.find_aggregate(name, 1).unwrap();
+            let mut state = aggregate.initial_state();
+            let document = text(r#"{"a":1,"a":2}"#);
+            for _ in entries {
+                aggregate
+                    .step_with_arg_subtypes(&mut state, &[document.clone()], &[JSON_SUBTYPE])
+                    .unwrap();
+            }
+            let actual = aggregate.finalize(state).unwrap();
+            let expected = stock_json_scalar(
+                &stock,
+                &format!("SELECT {name}(json(?1)) FROM entries"),
+                &[document],
+            );
+            assert_eq!(
+                normalized_jsonb(&stock, actual.clone()),
+                normalized_jsonb(&stock, expected.clone()),
+                "{name}"
+            );
+            assert_eq!(
+                JsonFunc.invoke(&[actual]).unwrap(),
+                JsonFunc.invoke(&[expected]).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_object_members_survive_parsers_jsonb_and_table_walks() {
+        let canonical = r#"{"a":{"x":1,"x":2},"b":0,"a":3}"#;
+        for input in [canonical, "{a:{x:1,x:2},b:0,a:3}"] {
+            let binary = jsonb(input).unwrap();
+            assert_eq!(json_from_jsonb(&binary).unwrap(), canonical);
+            assert_eq!(
+                json_extract(input, &["$.a.x"]).unwrap(),
+                SqliteValue::Integer(1)
+            );
+            assert_eq!(
+                json_arrow(input, "$.a").unwrap(),
+                SqliteValue::Text(r#"{"x":1,"x":2}"#.into())
+            );
+            for rows in [
+                json_each(input, None).unwrap(),
+                json_each_blob(&binary, None).unwrap(),
+            ] {
+                assert_eq!(rows.len(), 3);
+                assert_eq!(rows[0].key, SqliteValue::Text("a".into()));
+                assert_eq!(rows[0].value, SqliteValue::Text(r#"{"x":1,"x":2}"#.into()));
+                assert_eq!(rows[1].key, SqliteValue::Text("b".into()));
+                assert_eq!(rows[2].key, SqliteValue::Text("a".into()));
+                assert_eq!(rows[2].value, SqliteValue::Integer(3));
+            }
+            for rows in [
+                json_tree(input, None).unwrap(),
+                json_tree_blob(&binary, None).unwrap(),
+            ] {
+                assert_eq!(rows.len(), 6);
+                assert_eq!(rows[2].fullkey, "$.a.x");
+                assert_eq!(rows[3].fullkey, "$.a.x");
+                assert_eq!(rows[2].value, SqliteValue::Integer(1));
+                assert_eq!(rows[3].value, SqliteValue::Integer(2));
+            }
+        }
+        // Different escape spellings of a label identify the same first key.
+        let escaped = r#"{"a":1,"\u0061":2}"#;
+        assert_eq!(json_each(escaped, None).unwrap().len(), 2);
+        assert_eq!(
+            json_extract(escaped, &["$.a"]).unwrap(),
+            SqliteValue::Integer(1)
+        );
+        for malformed in [r#"{"a":1,"a":}"#, r#"{"a":1,"a":2"#] {
+            assert!(json_extract(malformed, &["$.a"]).is_err());
+            assert!(jsonb(malformed).is_err());
+        }
+    }
+
+    #[test]
+    fn duplicate_object_edits_address_only_the_first_member() {
+        let input = r#"{"a":1,"b":0,"a":2}"#;
+        let replacement = [("$.a", SqliteValue::Integer(9))];
+        for edited in [
+            json_set(input, &replacement).unwrap(),
+            json_replace(input, &replacement).unwrap(),
+            json_from_jsonb(&jsonb_set(input, &replacement).unwrap()).unwrap(),
+            json_from_jsonb(&jsonb_replace(input, &replacement).unwrap()).unwrap(),
+        ] {
+            assert_eq!(edited, r#"{"a":9,"b":0,"a":2}"#);
+        }
+        assert_eq!(json_insert(input, &replacement).unwrap(), input);
+        assert_eq!(json_remove(input, &["$.a"]).unwrap(), r#"{"b":0,"a":2}"#);
+        assert_eq!(json_remove(input, &["$.a", "$.a"]).unwrap(), r#"{"b":0}"#);
+        assert_eq!(
+            json_set(
+                r#"{"a":{"x":1,"x":2},"a":3}"#,
+                &[("$.a.x", SqliteValue::Integer(7))]
+            )
+            .unwrap(),
+            r#"{"a":{"x":7,"x":2},"a":3}"#
+        );
+        for (target, patch, expected) in [
+            (input, r#"{"a":null}"#, r#"{"b":0,"a":2}"#),
+            (input, r#"{"a":9,"a":10}"#, r#"{"a":10,"b":0,"a":2}"#),
+            (input, r#"{"a":null,"a":9}"#, r#"{"b":0,"a":9}"#),
+            ("{}", r#"{"a":1,"a":2}"#, r#"{"a":2}"#),
+        ] {
+            assert_eq!(json_patch(target, patch).unwrap(), expected);
+            assert_eq!(
+                json_from_jsonb(&jsonb_patch(target, patch).unwrap()).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_lookup_remains_correct_across_large_object_edits() {
+        let mut members = vec![r#""a":1"#.to_owned()];
+        members.extend((0..32).map(|index| format!(r#""k{index}":{index}"#)));
+        members.extend([r#""a":2"#.to_owned(), r#""a":3"#.to_owned()]);
+        let mut document = format!("{{{}}}", members.join(","));
+        for value in 1..=3 {
+            assert_eq!(
+                json_extract(&document, &["$.a"]).unwrap(),
+                SqliteValue::Integer(value)
+            );
+            assert_eq!(
+                json_extract(&document, &["$.k31"]).unwrap(),
+                SqliteValue::Integer(31)
+            );
+            document = json_remove(&document, &["$.a"]).unwrap();
+        }
+        assert_eq!(
+            json_extract(&document, &["$.a"]).unwrap(),
+            SqliteValue::Null
+        );
+        // Shrink below the indexed-object threshold, then grow through it again.
+        for index in 0..24 {
+            document = json_remove(&document, &[&format!("$.k{index}")]).unwrap();
+        }
+        for index in 0..24 {
+            document = json_set(
+                &document,
+                &[(&format!("$.k{index}"), SqliteValue::Integer(index))],
+            )
+            .unwrap();
+        }
+        for index in 0..32 {
+            assert_eq!(
+                json_extract(&document, &[&format!("$.k{index}")]).unwrap(),
+                SqliteValue::Integer(index)
+            );
+        }
+        assert_eq!(
+            json_from_jsonb(&jsonb(&document).unwrap()).unwrap(),
+            document
+        );
+        // The unique-label binary encoding remains exactly the same format.
+        assert_eq!(
+            jsonb(r#"{"a":1,"b":2}"#).unwrap(),
+            b"\x8c\x17a\x131\x17b\x132"
+        );
+        assert_eq!(
+            jsonb(r#"{"a":1,"a":2}"#).unwrap(),
+            b"\x8c\x17a\x131\x17a\x132"
+        );
+    }
+
+    #[test]
+    fn reserved_number_tag_strings_remain_text() {
+        for repetitions in 1..=3 {
+            for suffix in ["", "9e999", "1.50", "null,0", "\"\\\n", "ordinary"] {
+                let raw = format!("{}{suffix}", NUMBER_TEXT_TAG.repeat(repetitions));
+                let quoted = serde_json::to_string(&raw).unwrap();
+                let value = SqliteValue::Text(raw.clone().into());
+                assert_eq!(json_type(&quoted, None).unwrap(), Some("text"));
+                assert_eq!(json_extract(&quoted, &["$"]).unwrap(), value);
+                assert_eq!(
+                    json_arrow(&quoted, "$").unwrap(),
+                    SqliteValue::Text(quoted.clone().into())
+                );
+                assert_eq!(json(&quoted).unwrap(), quoted);
+                assert_eq!(json_set(&quoted, &[]).unwrap(), quoted);
+                assert_eq!(json_pretty(&quoted, None).unwrap(), quoted);
+                assert_eq!(json_quote(&value).unwrap(), quoted);
+                let array = json_array(&[value]).unwrap();
+                assert_eq!(array, format!("[{quoted}]"));
+                assert_eq!(json_array_length(&array, None).unwrap(), Some(1));
+                let mut round_trip = quoted.clone();
+                for _ in 0..3 {
+                    round_trip = json_from_jsonb(&jsonb(&round_trip).unwrap()).unwrap();
+                    assert_eq!(round_trip, quoted);
+                }
+            }
+        }
+        for raw in [
+            "\0ordinary".to_owned(),
+            "\0\0fsqlite".to_owned(),
+            format!("ordinary{NUMBER_TEXT_TAG}9e999"),
+        ] {
+            let quoted = serde_json::to_string(&raw).unwrap();
+            assert_eq!(
+                json_extract(&quoted, &["$"]).unwrap(),
+                SqliteValue::Text(raw.into())
+            );
+            assert_eq!(json_set(&quoted, &[]).unwrap(), quoted);
+        }
+    }
+
+    #[test]
+    fn reserved_number_tag_values_and_keys_coexist_with_real_numbers() {
+        let raw = format!("{NUMBER_TEXT_TAG}null,0");
+        let quoted = serde_json::to_string(&raw).unwrap();
+        let doc = format!(r#"{{{quoted}:{quoted},"n":1e+02,"big":9e999}}"#);
+        let path = format!("$.{quoted}");
+        assert_eq!(json_type(&doc, Some(&path)).unwrap(), Some("text"));
+        assert_eq!(
+            json_extract(&doc, &[&path]).unwrap(),
+            SqliteValue::Text(raw.clone().into())
+        );
+        assert_eq!(json_type(&doc, Some("$.n")).unwrap(), Some("real"));
+        assert_eq!(
+            json_extract(&doc, &["$.n"]).unwrap(),
+            SqliteValue::Float(100.0)
+        );
+        assert_eq!(
+            json_extract(&doc, &["$.big"]).unwrap(),
+            SqliteValue::Float(f64::INFINITY)
+        );
+        assert_eq!(json_set(&doc, &[]).unwrap(), doc);
+        assert_eq!(json_from_jsonb(&jsonb(&doc).unwrap()).unwrap(), doc);
+        for rows in [
+            json_each(&doc, None).unwrap(),
+            json_each_blob(&jsonb(&doc).unwrap(), None).unwrap(),
+        ] {
+            assert_eq!(rows[0].key, SqliteValue::Text(raw.clone().into()));
+            assert_eq!(rows[0].value, SqliteValue::Text(raw.clone().into()));
+            assert_eq!(rows[0].atom, SqliteValue::Text(raw.clone().into()));
+            assert_eq!(rows[0].type_name, "text");
+        }
+        let tree = json_tree(&doc, None).unwrap();
+        assert_eq!(tree[1].value, SqliteValue::Text(raw.into()));
+        assert_eq!(tree[1].type_name, "text");
+
+        // A different escape spelling still denotes the same original text.
+        let escaped = r#""\u0000\u0000\u0066sqlite\u0001nonfinite\u00009e999""#;
+        assert_eq!(
+            json_extract(escaped, &["$"]).unwrap(),
+            SqliteValue::Text(format!("{NUMBER_TEXT_TAG}9e999").into())
+        );
+    }
+
+    #[test]
+    fn reserved_number_tag_json5_strings_are_not_numeric_carriers() {
+        let raw = format!("{NUMBER_TEXT_TAG}9e999");
+        let quoted = serde_json::to_string(&raw).unwrap();
+        let input = format!("{{s:{quoted},n:Infinity,}}");
+        assert_eq!(json_type(&input, Some("$.s")).unwrap(), Some("text"));
+        assert_eq!(
+            json_extract(&input, &["$.s"]).unwrap(),
+            SqliteValue::Text(raw.clone().into())
+        );
+        assert_eq!(
+            json_set(&input, &[]).unwrap(),
+            format!(r#"{{"s":{quoted},"n":9e999}}"#)
+        );
+        let single_quoted = r"'\0\0fsqlite\x01nonfinite\x009e999'";
+        assert_eq!(
+            json_extract(single_quoted, &["$"]).unwrap(),
+            SqliteValue::Text(raw.into())
+        );
+        assert_eq!(
+            json_from_jsonb(&jsonb(single_quoted).unwrap()).unwrap(),
+            quoted
+        );
+    }
+
+    #[test]
+    fn reserved_number_tag_constructors_mutations_and_subtypes_preserve_strings() {
+        let raw = format!("{NUMBER_TEXT_TAG}null,0");
+        let quoted = serde_json::to_string(&raw).unwrap();
+        let value = SqliteValue::Text(raw.clone().into());
+        let array = format!("[{quoted}]");
+        let object = format!("{{{quoted}:{quoted}}}");
+        assert_eq!(json_group_array(&[value.clone()]).unwrap(), array);
+        assert_eq!(
+            json_from_jsonb(&jsonb_group_array(&[value.clone()]).unwrap()).unwrap(),
+            array
+        );
+        assert_eq!(
+            json_object(&[value.clone(), value.clone()]).unwrap(),
+            object
+        );
+        assert_eq!(
+            json_from_jsonb(&jsonb_object(&[value.clone(), value.clone()]).unwrap()).unwrap(),
+            object
+        );
+        // The group-object label ends at its first NUL, as stock's
+        // jsonObjectStep measures it (sqlite3Strlen30): the tag starts with
+        // NUL, so the label is "". The value keeps every byte.
+        let group_object = format!("{{\"\":{quoted}}}");
+        assert_eq!(
+            json_group_object(&[(value.clone(), value.clone())]).unwrap(),
+            group_object
+        );
+        assert_eq!(
+            json_from_jsonb(&jsonb_group_object(&[(value.clone(), value.clone())]).unwrap())
+                .unwrap(),
+            group_object
+        );
+        for edited in [
+            json_set("[]", &[("$[#]", value.clone())]).unwrap(),
+            json_insert("[]", &[("$[#]", value.clone())]).unwrap(),
+            json_replace("[0]", &[("$[0]", value.clone())]).unwrap(),
+            json_array_insert("[]", &[("$[0]", value.clone())]).unwrap(),
+        ] {
+            assert_eq!(edited, array);
+        }
+        let subtyped = [SqliteValue::Text(quoted.into())];
+        assert_eq!(
+            json_array_with_subtypes(&subtyped, &[JSON_SUBTYPE]).unwrap(),
+            array
+        );
+        assert_eq!(
+            json_from_jsonb(&jsonb_array_with_subtypes(&subtyped, &[JSON_SUBTYPE]).unwrap())
+                .unwrap(),
+            array
+        );
+        for window in JsonGroupWindowFunc::ALL {
+            let mut state = window.initial_state();
+            let args = if window.object {
+                vec![value.clone(), value.clone()]
+            } else {
+                vec![value.clone()]
+            };
+            window.step(&mut state, &args).unwrap();
+            let output = window.value(&state).unwrap();
+            let output = match output {
+                SqliteValue::Text(text) => text.to_string(),
+                SqliteValue::Blob(bytes) => json_from_jsonb(&bytes).unwrap(),
+                other => panic!("unexpected JSON window value: {other:?}"),
+            };
+            assert_eq!(&output, if window.object { &group_object } else { &array });
+            window.inverse(&mut state, &args).unwrap();
+            window.step(&mut state, &args).unwrap();
+            assert_eq!(state.len(), 1);
+        }
+    }
+
+    #[test]
+    fn reserved_number_tag_jsonb_text_nodes_and_labels_remain_text() {
+        let raw = format!("{NUMBER_TEXT_TAG}{NUMBER_TEXT_TAG}9e999");
+        let quoted = serde_json::to_string(&raw).unwrap();
+        for node_type in [
+            JSONB_TEXT_TYPE,
+            JSONB_TEXT_JSON_TYPE,
+            JSONB_TEXT5_TYPE,
+            JSONB_TEXTRAW_TYPE,
+        ] {
+            let payload = if matches!(node_type, JSONB_TEXT_JSON_TYPE | JSONB_TEXT5_TYPE) {
+                &quoted.as_bytes()[1..quoted.len() - 1]
+            } else {
+                raw.as_bytes()
+            };
+            let mut node = Vec::new();
+            append_jsonb_node(node_type, payload, &mut node).unwrap();
+            assert_eq!(json_from_jsonb(&node).unwrap(), quoted);
+            let row = json_each_blob(&node, None).unwrap().remove(0);
+            assert_eq!(row.type_name, "text");
+            assert_eq!(row.value, SqliteValue::Text(raw.clone().into()));
+            let mut object_payload = node.clone();
+            object_payload.extend_from_slice(&node);
+            let mut object = Vec::new();
+            append_jsonb_node(JSONB_OBJECT_TYPE, &object_payload, &mut object).unwrap();
+            assert_eq!(
+                json_from_jsonb(&object).unwrap(),
+                format!("{{{quoted}:{quoted}}}")
+            );
+            let row = json_each_blob(&object, None).unwrap().remove(0);
+            assert_eq!(row.key, SqliteValue::Text(raw.clone().into()));
+            assert_eq!(row.value, SqliteValue::Text(raw.clone().into()));
+        }
+        for (node_type, payload) in [
+            (JSONB_FLOAT_TYPE, b"1e2".as_slice()),
+            (JSONB_FLOAT_TYPE, b"9e999".as_slice()),
+            (JSONB_INT_TYPE, b"1".as_slice()),
+            (JSONB_NULL_TYPE, b"".as_slice()),
+            (JSONB_ARRAY_TYPE, b"".as_slice()),
+        ] {
+            let mut payload_nodes = Vec::new();
+            append_jsonb_node(node_type, payload, &mut payload_nodes).unwrap();
+            append_jsonb_node(JSONB_NULL_TYPE, &[], &mut payload_nodes).unwrap();
+            let mut object = Vec::new();
+            append_jsonb_node(JSONB_OBJECT_TYPE, &payload_nodes, &mut object).unwrap();
+            assert!(json_from_jsonb(&object).is_err());
+            assert_eq!(
+                json_valid_blob(&object, Some(JSON_VALID_JSONB_STRICT_FLAG)),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_number_tag_rewrite_preserves_malformed_string_errors() {
+        let prefix = r#""\u0000\u0000fsqlite\u0001nonfinite\u0000"#;
+        for input in [
+            format!("{prefix}9e999"),
+            format!("{prefix}\\q\""),
+            format!("{prefix}\\\""),
+            format!("{prefix}9e999\" trailing"),
+            format!("{prefix}null,0\":1"),
+            format!("[{prefix}9e999\",]"),
+        ] {
+            assert!(parse_json_text(&input).is_err(), "{input}");
+            assert_eq!(json_valid(&input, None), 0, "{input}");
+        }
+    }
+
     #[test]
     fn number_text_rewrite_rejects_malformed_numbers() {
         let mut tokens = vec![
@@ -5130,7 +6241,11 @@ mod tests {
             ] {
                 assert!(parse_json_text(&input).is_err(), "{input}");
                 assert_eq!(json_valid(&input, None), 0, "{input}");
-                assert_eq!(json_valid(&input, Some(JSON_VALID_JSON5_FLAG)), 0, "{input}");
+                assert_eq!(
+                    json_valid(&input, Some(JSON_VALID_JSON5_FLAG)),
+                    0,
+                    "{input}"
+                );
                 assert!(json(&input).is_err(), "{input}");
                 assert!(json_extract(&input, &["$"]).is_err(), "{input}");
                 assert!(jsonb(&input).is_err(), "{input}");
@@ -5155,7 +6270,11 @@ mod tests {
             ] {
                 assert!(parse_json_text(&input).is_err(), "{input}");
                 assert_eq!(json_valid(&input, None), 0, "{input}");
-                assert_eq!(json_valid(&input, Some(JSON_VALID_JSON5_FLAG)), 0, "{input}");
+                assert_eq!(
+                    json_valid(&input, Some(JSON_VALID_JSON5_FLAG)),
+                    0,
+                    "{input}"
+                );
                 assert!(json(&input).is_err(), "{input}");
                 assert!(json_extract(&input, &["$"]).is_err(), "{input}");
                 assert!(jsonb(&input).is_err(), "{input}");
@@ -5176,10 +6295,9 @@ mod tests {
 
     #[test]
     fn overflowing_json5_numbers_still_use_the_json5_fallback() {
-        for (input, expected, negative) in [
-            ("9.e999", "9.0e999", false),
-            ("-9.e999", "-9.0e999", true),
-        ] {
+        for (input, expected, negative) in
+            [("9.e999", "9.0e999", false), ("-9.e999", "-9.0e999", true)]
+        {
             assert!(parse_json_text(input).is_err(), "{input}");
             assert_eq!(json_valid(input, None), 0, "{input}");
             assert_eq!(json_valid(input, Some(JSON_VALID_JSON5_FLAG)), 1, "{input}");
@@ -5212,7 +6330,7 @@ mod tests {
                 value,
                 number_text_value(if negative { "-9e999" } else { "9e999" })
             );
-            let SqliteValue::Float(number) = json_to_sqlite_scalar(&value) else {
+            let SqliteValue::Float(number) = json_to_sqlite_scalar(&value).unwrap() else {
                 panic!("{input} must extract as a REAL");
             };
             assert!(number.is_infinite());
@@ -5233,10 +6351,14 @@ mod tests {
     fn json5_number_text_values_survive_nested_containers() {
         let value = parse_json5_text("{a:[Infinity,{b:-Infinity,c:NaN}],s:'Infinity'}")
             .expect("nested JSON5 non-finite values parse");
-        assert_eq!(value["a"][0], number_text_value("9e999"));
-        assert_eq!(value["a"][1]["b"], number_text_value("-9e999"));
-        assert_eq!(value["a"][1]["c"], Value::Null);
-        assert_eq!(value["s"], Value::String("Infinity".to_owned()));
+        for (path, expected) in [
+            ("$.a[0]", number_text_value("9e999")),
+            ("$.a[1].b", number_text_value("-9e999")),
+            ("$.a[1].c", Value::Null),
+            ("$.s", Value::String("Infinity".to_owned())),
+        ] {
+            assert_eq!(resolve_path(&value, path).unwrap(), Some(&expected));
+        }
         assert_eq!(
             encode_json_text("nested JSON5", &value).unwrap(),
             r#"{"a":[9e999,{"b":-9e999,"c":null}],"s":"Infinity"}"#
@@ -5254,16 +6376,23 @@ mod tests {
             }",
         )
         .expect("ordinary JSON5 values keep their representation");
-        assert_eq!(value["Infinity"].as_u64(), Some(1));
-        assert_eq!(value["NaN"].as_str(), Some("NaN"));
-        assert_eq!(value["u"].as_u64(), Some(u64::MAX));
-        assert_eq!(value["i"].as_i64(), Some(i64::MIN));
-        assert_eq!(value["z"].as_f64().unwrap().to_bits(), (-0.0_f64).to_bits());
-        assert_eq!(value["v"].as_str(), Some("\u{000B}"));
-        assert_eq!(value["s"].as_str(), Some("\\Infinity"));
-        assert_eq!(value["b"], Value::Bool(true));
-        assert_eq!(value["n"], Value::Null);
-        assert_eq!(value["a"], Value::Array(Vec::new()));
+        for (key, expected) in [
+            ("Infinity", Value::Number(1_u64.into())),
+            ("NaN", Value::String("NaN".to_owned())),
+            ("u", Value::Number(u64::MAX.into())),
+            ("i", Value::Number(i64::MIN.into())),
+            ("v", Value::String("\u{000B}".to_owned())),
+            ("s", Value::String("\\Infinity".to_owned())),
+            ("b", Value::Bool(true)),
+            ("n", Value::Null),
+            ("a", Value::Array(Vec::new())),
+        ] {
+            assert_eq!(value.get(key), Some(&expected), "{key}");
+        }
+        let Some(Value::Number(zero)) = value.get("z") else {
+            panic!("negative zero remains a finite number");
+        };
+        assert_eq!(zero.as_f64().unwrap().to_bits(), (-0.0_f64).to_bits());
     }
 
     #[test]
@@ -5402,9 +6531,7 @@ mod tests {
         // This is both JSONB integer 456 and UTF-8 JSON text "3456".
         // JSONB decoding must retain precedence over the text fallback.
         assert_eq!(
-            JsonExtractFunc
-                .invoke(&[blob("3456"), text("$")])
-                .unwrap(),
+            JsonExtractFunc.invoke(&[blob("3456"), text("$")]).unwrap(),
             SqliteValue::Integer(456)
         );
     }
@@ -5984,13 +7111,11 @@ mod tests {
             call("json", vec![t("{\"a\":12345678901234567890}")]),
             "{\"a\":12345678901234567890}"
         );
-        // `[-0]` (JSON-integer negative zero): stock `json_extract('[-0]','$[0]')`
-        // -> `0`, but serde_json parses the literal `-0` as the float `-0.0`,
-        // which renders `-0`. Preserving integer negative-zero would require an
-        // integer/float distinction serde discards on parse; that is a separate
-        // pre-existing edge, NOT in scope for bd-yalqc (the non-finite fix), so
-        // the conformance entry is intentionally omitted here:
-        //   ck!("json_neg_zero", call("json_extract", vec![t("[-0]"), t("$[0]")]), "0");
+        ck!(
+            "json_neg_zero",
+            call("json_extract", vec![t("[-0]"), t("$[0]")]),
+            "0"
+        );
         // ── deeper batch ──
         ck!(
             "jx_true",
@@ -7177,6 +8302,73 @@ mod tests {
         assert_eq!(out, r#"{"k":1,"k":2}"#);
     }
 
+    /// Stock's jsonObjectStep measures the label with `sqlite3Strlen30`, so
+    /// every group-object form ends a label at its first NUL; `json_object`
+    /// keeps the whole label.
+    #[test]
+    fn test_group_object_labels_end_at_the_first_nul() {
+        let text = |s: &str| SqliteValue::Text(SmallText::from_string(s));
+        let rows = [
+            (text("a\0b"), SqliteValue::Integer(1)),
+            (text("\0hidden"), SqliteValue::Integer(2)),
+            (SqliteValue::Null, SqliteValue::Integer(3)),
+            (text("plain"), SqliteValue::Integer(4)),
+        ];
+        let expected = r#"{"a":1,"":2,"plain":4}"#;
+        assert_eq!(json_group_object(&rows).unwrap(), expected);
+        assert_eq!(
+            json_from_jsonb(&jsonb_group_object(&rows).unwrap()).unwrap(),
+            expected
+        );
+
+        let aggregate = JsonGroupObjectFunc;
+        let mut state = aggregate.initial_state();
+        for (label, value) in &rows {
+            aggregate
+                .step(&mut state, &[label.clone(), value.clone()])
+                .unwrap();
+        }
+        assert_eq!(
+            aggregate.finalize(state).unwrap(),
+            SqliteValue::Text(SmallText::from_string(expected))
+        );
+
+        let aggregate = JsonbGroupObjectFunc;
+        let mut state = aggregate.initial_state();
+        for (label, value) in &rows {
+            aggregate
+                .step(&mut state, &[label.clone(), value.clone()])
+                .unwrap();
+        }
+        let SqliteValue::Blob(blob) = aggregate.finalize(state).unwrap() else {
+            panic!("jsonb_group_object must return a BLOB");
+        };
+        assert_eq!(json_from_jsonb(&blob).unwrap(), expected);
+
+        for window in JsonGroupWindowFunc::ALL
+            .iter()
+            .filter(|window| window.object)
+        {
+            let mut state = window.initial_state();
+            for (label, value) in &rows {
+                window
+                    .step(&mut state, &[label.clone(), value.clone()])
+                    .unwrap();
+            }
+            let rendered = match window.value(&state).unwrap() {
+                SqliteValue::Text(text) => text.to_string(),
+                SqliteValue::Blob(blob) => json_from_jsonb(&blob).unwrap(),
+                other => panic!("{} returned {other:?}", window.name),
+            };
+            assert_eq!(rendered, expected, "{}", window.name);
+        }
+
+        assert_eq!(
+            json_object(&[text("a\0b"), SqliteValue::Integer(1)]).unwrap(),
+            r#"{"a\u0000b":1}"#
+        );
+    }
+
     #[test]
     fn test_jsonb_group_array_and_object_variants() {
         let array_blob = jsonb_group_array(&[SqliteValue::Integer(1), SqliteValue::Null]).unwrap();
@@ -7430,6 +8622,51 @@ mod tests {
             values,
             vec![SqliteValue::Integer(10), SqliteValue::Integer(20)]
         );
+    }
+
+    #[test]
+    fn test_json_table_cursor_rowids_match_stock_and_reset_on_filter() {
+        let stock = rusqlite::Connection::open_in_memory().unwrap();
+        let cx = Cx::new();
+        let mut each = JsonEachCursor::default();
+        let mut tree = JsonTreeCursor::default();
+        let cursors: [(&str, &mut dyn VirtualTableCursor); 2] =
+            [("json_each", &mut each), ("json_tree", &mut tree)];
+        let nested = r#"{"a":[10,20,{"b":[30,40]}]}"#;
+        let args = [
+            (SqliteValue::from("[10,20,30]"), SqliteValue::from("$")),
+            (SqliteValue::from(nested), SqliteValue::from("$.a")),
+            (
+                SqliteValue::Blob(Arc::from(jsonb(nested).unwrap())),
+                SqliteValue::from("$.a[2].b"),
+            ),
+            (SqliteValue::from(nested), SqliteValue::from("$.absent")),
+            (SqliteValue::from("42"), SqliteValue::from("$")),
+        ];
+
+        for (name, cursor) in cursors {
+            for (input, root) in &args {
+                let args = [input.clone(), root.clone()];
+                let expected = stock_json_rows(
+                    &stock,
+                    &format!("SELECT rowid, value FROM {name}(?1, ?2)"),
+                    &args,
+                )
+                .unwrap();
+                cursor.filter(&cx, 0, None, &args).unwrap();
+                let mut actual = Vec::new();
+                while !cursor.eof() {
+                    let mut context = ColumnContext::new();
+                    cursor.column(&mut context, 1).unwrap();
+                    actual.push(vec![
+                        SqliteValue::Integer(cursor.rowid().unwrap()),
+                        context.take_value().unwrap(),
+                    ]);
+                    cursor.next(&cx).unwrap();
+                }
+                assert_eq!(actual, expected, "{name} input={input:?} root={root:?}");
+            }
+        }
     }
 
     #[test]
@@ -7742,7 +8979,6 @@ mod tests {
         // JSON number (yielding a single scalar row) instead of erroring
         // "must be TEXT or BLOB JSON". C SQLite: json_each(1.5) -> type='real'
         // atom=1.5; json_tree(7) -> type='integer'.
-        use serde_json::Value;
         let (v_float, path) = super::parse_json_table_filter_args(&[SqliteValue::Float(1.5)])
             .unwrap()
             .unwrap();
@@ -7750,14 +8986,14 @@ mod tests {
         // still a JSON real whose atom is 1.5.
         assert_eq!(super::json_type_name(&v_float), "real");
         assert_eq!(
-            super::json_to_sqlite_scalar(&v_float),
+            super::json_to_sqlite_scalar(&v_float).unwrap(),
             SqliteValue::Float(1.5)
         );
         assert!(path.is_none());
         let (v_int, _) = super::parse_json_table_filter_args(&[SqliteValue::Integer(7)])
             .unwrap()
             .unwrap();
-        assert_eq!(v_int, Value::from(7_i64));
+        assert_eq!(v_int, Value::Number(7_i64.into()));
         // GH#212 (verified against sqlite3 3.46.1): json_each(9e999) yields a
         // single row (type='real', atom=Inf), so a bare +Inf renders as the
         // numeric literal 9.0e+999 rather than erroring. The non-finite REAL is
@@ -8159,15 +9395,19 @@ mod tests {
         }
         assert!(accepted > 40, "the fast path must cover the usual decimals");
 
-        // A document with no float skips the scan; an integer that overflows
-        // f64 still parses, through the strict parse's error path.
+        // Ordinary integers skip rewriting. A wide integer takes the exact
+        // decimal path even when the document contains no float marker.
         assert!(!may_hold_float_token(r#"{"name":"e","n":[1,2],"id":17}"#));
         assert!(may_hold_float_token("[1e5]"));
         assert!(may_hold_float_token("[0.5]"));
         let huge = format!("[1{}]", "0".repeat(400));
         assert!(!may_hold_float_token(&huge));
+        assert!(may_hold_integer_text(&huge));
         let parsed = parse_json_text(&huge).expect("an overflowing integer parses");
-        assert_eq!(json_type_name(&parsed[0]), "real");
+        assert_eq!(
+            json_type_name(&parsed.as_array().expect("the parsed input is an array")[0]),
+            "integer"
+        );
         assert!(parse_json_value_lenient(&huge).is_ok());
         for token in [
             "1.50",
@@ -8182,6 +9422,172 @@ mod tests {
             "-",
         ] {
             assert!(!is_shortest_fixed_decimal(token.as_bytes()), "{token}");
+        }
+    }
+
+    #[test]
+    fn stock_hex_jsonb_preserves_sql_storage_class_and_round_trips() {
+        let stock = rusqlite::Connection::open_in_memory().unwrap();
+        for raw in [
+            "0x1a",
+            "-0x0",
+            "-0X0001",
+            "+0x7fffffffffffffff",
+            "-0x7fffffffffffffff",
+            "0x8000000000000000",
+            "-0x8000000000000000",
+            "0x000ffffffffffffffff",
+            "-0xffffffffffffffff",
+            "0x10000000000000000",
+            "-0x10000000000000000",
+        ] {
+            let input = format!("[{raw}]");
+            let SqliteValue::Blob(stock_blob) =
+                stock_json_scalar(&stock, "SELECT jsonb(?1)", &[text(&input)])
+            else {
+                panic!("expected JSONB for {raw}");
+            };
+            let args = [SqliteValue::Blob(stock_blob.clone())];
+            let rendered = stock_json_scalar(&stock, "SELECT json(?1)", &args);
+            assert_eq!(
+                text(&json_from_jsonb(&stock_blob).unwrap()),
+                rendered,
+                "{raw}"
+            );
+            assert_eq!(text(&json(&input).unwrap()), rendered, "{raw}");
+            let decoded = decode_jsonb_root(&stock_blob).unwrap();
+            let rebound = SqliteValue::Blob(encode_jsonb_root(&decoded).unwrap().into());
+            assert_eq!(
+                stock_json_scalar(&stock, "SELECT json(?1)", &[rebound.clone()]),
+                rendered,
+                "{raw}"
+            );
+            let sql = "SELECT json_extract(?1,'$[0]')";
+            let expected = stock_json_rows(&stock, sql, &args);
+            let ours = json_extract_value(&decoded, &["$[0]"]);
+            let tree = json_tree_blob(&stock_blob, None);
+            if let Ok(rows) = expected {
+                let scalar = &rows[0][0];
+                for actual in [
+                    ours.unwrap(),
+                    json_extract(&input, &["$[0]"]).unwrap(),
+                    tree.unwrap()[1].atom.clone(),
+                    stock_json_scalar(&stock, sql, &[rebound]),
+                ] {
+                    assert_eq!(
+                        std::mem::discriminant(&actual),
+                        std::mem::discriminant(scalar),
+                        "{raw}"
+                    );
+                    assert_eq!(&actual, scalar, "{raw}");
+                }
+            } else {
+                assert!(ours.is_err() && tree.is_err(), "{raw}");
+                assert!(stock_json_rows(&stock, sql, &[rebound]).is_err(), "{raw}");
+            }
+            assert_eq!(
+                json_type_value(&decoded, Some("$[0]")).unwrap(),
+                Some("integer")
+            );
+        }
+    }
+
+    #[test]
+    fn relaxed_decimal_integers_retain_spelling_without_changing_other_json5_values() {
+        let stock = rusqlite::Connection::open_in_memory().unwrap();
+        let doc = concat!(
+            "{'Infinity':1, /* 18446744073709551616, } */ ",
+            r#"words:'escaped \' quote, // -0, [0]', control:'\v', "#,
+            "values:[{}, [], // 111111111111111111111 \u{2028}",
+            "+18446744073709551616,-9223372036854775809, -0, 0x1a, .5, Infinity, NaN,],",
+            "dup:18446744073709551617, dup:-0,}",
+        );
+        for path in [
+            "$.Infinity", "$.words", "$.control", "$.values[2]", "$.values[3]", "$.values[4]",
+            "$.values[5]", "$.values[6]", "$.values[7]", "$.values[8]", "$.dup",
+        ] {
+            let value = json_extract(doc, &[path]).unwrap();
+            let expected = stock_json_scalar(
+                &stock,
+                "SELECT json_extract(?1,?2)",
+                &[text(doc), text(path)],
+            );
+            assert_eq!(
+                std::mem::discriminant(&value),
+                std::mem::discriminant(&expected),
+                "{path}"
+            );
+            assert_eq!(value, expected, "{path}");
+        }
+        let value = parse_json5_text(doc).unwrap();
+        let Value::Object(object) = value else {
+            panic!("expected object");
+        };
+        let dup: Vec<_> = object
+            .iter()
+            .filter(|(key, _)| key == "dup")
+            .map(|(_, value)| encode_json_text("duplicate", value).unwrap())
+            .collect();
+        assert_eq!(dup, ["18446744073709551617", "-0"]);
+        for raw in ["+18446744073709551616", "-9223372036854775809", "-0"] {
+            let input = format!("{{n:{raw},}}");
+            let args = [text(&input)];
+            let expected = stock_json_scalar(&stock, "SELECT json_set(?1,'$.m',1)", &args);
+            let edited = json_set(&input, &[("$.m", SqliteValue::Integer(1))]).unwrap();
+            assert_eq!(text(&edited), expected, "{raw}");
+            let output = SqliteValue::Blob(jsonb(&input).unwrap().into());
+            assert_eq!(
+                stock_json_scalar(&stock, "SELECT json(?1)", &[output]),
+                stock_json_scalar(&stock, "SELECT json(?1)", &args)
+            );
+        }
+    }
+
+    #[test]
+    fn wide_decimal_integers_survive_edits_and_jsonb_round_trips() {
+        let stock = rusqlite::Connection::open_in_memory().unwrap();
+        let huge = "9".repeat(400);
+        for raw in [
+            "-0",
+            "0",
+            "-9223372036854775808",
+            "-9223372036854775809",
+            "9223372036854775808",
+            "18446744073709551615",
+            "18446744073709551616",
+            "123456789012345678901234567890",
+            huge.as_str(),
+        ] {
+            let doc = format!("[{raw}]");
+            let args = [SqliteValue::Text(doc.clone().into())];
+            let oracle = |sql| stock_json_scalar(&stock, sql, &args);
+            let scalar = json_extract(&doc, &["$[0]"]).unwrap();
+            let expected = oracle("SELECT json_extract(?1,'$[0]')");
+            assert_eq!(
+                std::mem::discriminant(&scalar),
+                std::mem::discriminant(&expected),
+                "{raw}: SQL storage class"
+            );
+            assert_eq!(scalar, expected, "{raw}");
+            assert_eq!(json_type(&doc, Some("$[0]")).unwrap(), Some("integer"));
+            let edited = json_set(&doc, &[("$[1]", SqliteValue::Integer(2))]).unwrap();
+            assert_eq!(
+                SqliteValue::Text(edited.into()),
+                oracle("SELECT json_set(?1,'$[1]',2)"),
+                "{raw}"
+            );
+            let blob = SqliteValue::Blob(jsonb(&doc).unwrap().into());
+            let stock_read = stock_json_rows(
+                &stock,
+                "SELECT json(?1), json_type(?1,'$[0]')",
+                &[blob],
+            )
+            .unwrap();
+            assert_eq!(stock_read, vec![vec![text(&doc), text("integer")]], "{raw}");
+            let SqliteValue::Blob(stock_blob) = oracle("SELECT jsonb(?1)") else {
+                panic!("expected stock JSONB for {raw}");
+            };
+            assert_eq!(json_from_jsonb(&stock_blob).unwrap(), doc, "{raw}");
         }
     }
 

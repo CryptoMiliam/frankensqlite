@@ -228,7 +228,7 @@ fn eval_case(
         // Searched CASE: evaluate each WHEN as a boolean.
         for (when_expr, then_expr) in when_clauses {
             let when_val = eval_rebase_expr(when_expr, row)?;
-            if sqlite_value_is_truthy(&when_val) {
+            if when_val.is_sql_truthy() {
                 return eval_rebase_expr(then_expr, row);
             }
         }
@@ -244,17 +244,6 @@ fn eval_case(
 /// numeric comparison rather than rounding integers through `f64`.
 fn sqlite_values_equal(a: &SqliteValue, b: &SqliteValue) -> bool {
     a.unique_eq(b)
-}
-
-/// SQLite boolean conversion tests the numeric value against zero. It does
-/// not truncate fractional values (`sqlite3VdbeBooleanValue`).
-#[allow(clippy::float_cmp)]
-fn sqlite_value_is_truthy(v: &SqliteValue) -> bool {
-    match v {
-        SqliteValue::Null => false,
-        SqliteValue::Integer(value) => *value != 0,
-        value => value.to_float() != 0.0,
-    }
 }
 
 /// Concatenate two values as text (SQLite `||` operator).
@@ -307,7 +296,7 @@ fn eval_unary_op(op: RebaseUnaryOp, v: SqliteValue) -> SqliteValue {
             if matches!(v, SqliteValue::Null) {
                 SqliteValue::Null
             } else {
-                SqliteValue::Integer(i64::from(!sqlite_value_is_truthy(&v)))
+                SqliteValue::Integer(i64::from(!v.is_sql_truthy()))
             }
         }
     }
@@ -329,8 +318,10 @@ fn eval_binary_op(op: RebaseBinaryOp, left: SqliteValue, right: SqliteValue) -> 
         RebaseBinaryOp::Add => left.sql_add(&right),
         RebaseBinaryOp::Subtract => left.sql_sub(&right),
         RebaseBinaryOp::Multiply => left.sql_mul(&right),
-        RebaseBinaryOp::Divide => numeric_div(&left, &right),
-        RebaseBinaryOp::Remainder => numeric_rem(&left, &right),
+        // The engine's own rules, so a regenerated index key equals the one the
+        // statement computed (bd-5lrpw).
+        RebaseBinaryOp::Divide => left.sql_div(&right),
+        RebaseBinaryOp::Remainder => left.sql_rem(&right),
         RebaseBinaryOp::BitwiseAnd => integer_bitop(&left, &right, |a, b| a & b),
         RebaseBinaryOp::BitwiseOr => integer_bitop(&left, &right, |a, b| a | b),
         #[allow(clippy::cast_sign_loss)]
@@ -355,44 +346,6 @@ fn eval_binary_op(op: RebaseBinaryOp, left: SqliteValue, right: SqliteValue) -> 
                 a >> shift
             }
         }),
-    }
-}
-
-#[allow(clippy::cast_precision_loss)]
-fn numeric_div(l: &SqliteValue, r: &SqliteValue) -> SqliteValue {
-    if let (SqliteValue::Integer(a), SqliteValue::Integer(b)) = (l, r) {
-        if *b == 0 {
-            return SqliteValue::Null;
-        }
-        match a.checked_div(*b) {
-            Some(result) => SqliteValue::Integer(result),
-            None => SqliteValue::from(*a as f64 / *b as f64),
-        }
-    } else {
-        let fb = r.to_float();
-        if fb == 0.0 {
-            return SqliteValue::Null;
-        }
-        SqliteValue::from(l.to_float() / fb)
-    }
-}
-
-fn numeric_rem(l: &SqliteValue, r: &SqliteValue) -> SqliteValue {
-    if let (SqliteValue::Integer(a), SqliteValue::Integer(b)) = (l, r) {
-        if *b == 0 {
-            return SqliteValue::Null;
-        }
-        SqliteValue::Integer(a.wrapping_rem(*b))
-    } else {
-        // C SQLite: OP_Remainder always converts to integers even for float
-        // operands, performs integer %, then returns result as Float.
-        let ia = l.to_integer();
-        let ib = r.to_integer();
-        if ib == 0 {
-            return SqliteValue::Null;
-        }
-        let result = ia.checked_rem(ib).unwrap_or_default();
-        SqliteValue::Float(result as f64)
     }
 }
 
@@ -604,7 +557,7 @@ fn apply_collation(val: SqliteValue, collation: Collation) -> SqliteValue {
 fn row_participates(index_def: &IndexDef, row: &[SqliteValue]) -> Result<bool, IndexRegenError> {
     if let Some(ref predicate) = index_def.where_predicate {
         let result = eval_rebase_expr(predicate, row)?;
-        Ok(sqlite_value_is_truthy(&result))
+        Ok(result.is_sql_truthy())
     } else {
         Ok(true)
     }

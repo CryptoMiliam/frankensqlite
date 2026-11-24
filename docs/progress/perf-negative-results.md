@@ -55,7 +55,7 @@ written; this is where their scope is recorded.
 | Removing or adding single arms of `try_execute_hot_opcode` | 2026-05-23..25 (55 entries), 2026-07-16 `NotNull` | removal slower every time; one promotion mixed | a bytecode-executing workload, profile-attributed self time, original and candidate interleaved in one invocation (2026-07-10 LEDGER-INTEGRITY CORRECTION) |
 | Shrinking the statement future by boxing cold branches | 2026-08-11 bd-uzq54 | rejected | allocation-count and CPU-sample evidence that generator size is on the hot path |
 | Register file without Arc | 2026-08-17 bd-i9sov | NO-GO: atomics ~24 ns per row; infeasible in safe Rust | atomics above 10% of execute_body on a new shape and a safe design |
-| `block_on` batching, per-statement runtime entry | 2026-08-17 bd-hggxz, 2026-07-26, 2026-07-27 | crossing is 3.2 ns; 620-750 ns only for callers that enter a runtime per statement | none for batching; `fsqlite::blocking` stopped paying it 2026-11-10, the C API shim still does |
+| `block_on` batching, per-statement runtime entry | 2026-08-17 bd-hggxz, 2026-07-26, 2026-07-27 | crossing is 3.2 ns; 620-750 ns only for callers that enter a runtime per statement | none for batching; `fsqlite::blocking` stopped paying it 2026-11-10, the C API shim on 2026-11-21 (bd-zqr9h L1, c0e568aaf), and the shim's per-step `SELECT changes();` is gone (bd-zqr9h L2, f16f01ccb), as are `fsqlite::blocking`'s per-call `SELECT changes()` / `SELECT total_changes()` (bd-e64z4, ad5f63595) |
 | B-tree cell-parse micro-levers | 2026-05-20 | 4-6 ns per cell, no lever | not from a cold read; whole-workload attribution |
 | Narrow aggregate lanes (FastSumState, direct REAL accumulator, IntDivide) | 2026-05-05, 2026-05-06 | rejected, each helped one group size and hurt another | aggregate dispatch dominates a row and every group size improves; hash aggregation (bd-w4pr1.13.8) is a different change |
 | Thinning sorter rows | 2026-10-27 GH#504, 2026-05-06 | no measurable change (2026-10-27); the 2026-05-06 sweep was abandoned unmeasured | together with a change that removes per-row dispatch or decode cost |
@@ -63,6 +63,7 @@ written; this is where their scope is recorded.
 | Widening the table page-run / bulk builders | 2026-05-06 (two), 2026-05-10, 2026-07-22 | rejected | each entry's own; none as a standalone patch |
 | DELETE / UPDATE direct-lane micro-levers | May 2026 series, 2026-07-22 BLOCKER | rejected | only as a transaction-level mutation set with the live cell-delta adapter |
 | One-entry prepared caches, exact BEGIN/COMMIT fast paths | 2026-05-05, 2026-05-07, 2026-05-09 (two) | rejected, absolute medians worse | with a broader prepare / transaction lifecycle change |
+| Keeping compiled programs across the connection's write COMMIT | 2026-11-18 bd-w4pr1.7 round 5 lever L2 | rejected: one-row transaction -14.1k instructions, read-only +1.03% against a +0.5% kill line (allocator paths after the cache entry grew 40 -> 56 bytes) | the same lever with the entry's size unchanged, read-only over at least 7 callgrind runs |
 | Planner-directive cache bypass | 2026-07-11 REJECT | correctness blocker | none without redesigning the cache-key contract |
 | Group commit | 2026-07-23 bd-6hgad | exists, never coalesces at `synchronous=NORMAL` | `FULL`/`EXTRA`, many small overlapping transactions, null-controlled A/B with CV under 5% |
 | Lock, wakeup and counter micro-levers on the commit path | 2026-05-06 (two), 2026-05-12 (two), 2026-08-17 bd-8euyp | rejected | each entry's own; none is the fixed per-commit cost |
@@ -79,13 +80,8536 @@ written; this is where their scope is recorded.
 valgrind changes the I/O path (2026-11-10); a remote build can return a stale binary (2026-07-13,
 2026-08-02 bd-8wumh); the old concurrent section ran C at `FULL` against fsqlite at `NORMAL`
 (2026-07-23); VDBE metrics are process-global (2026-07-10); counters can be observer-dominated
-(2026-08-02 bd-he3ua); `ResultRow` drains its source registers (2026-07-22).
+(2026-08-02 bd-he3ua); `ResultRow` drains its source registers (2026-07-22); an arm added to or
+reshaped in `try_execute_hot_opcode_sync` moves other statements' cycles (2026-11-15 W3) and their
+instruction counts by up to 1.3% (2026-11-15 H1) without running any of the change. One callgrind
+run of a write shape is not exact on the 64-thread host (2026-11-18 bd-w4pr1.7 round 5):
+async-runtime polling while work waits lands inside statements, so the same binary's statement
+count moves by up to +-3k on autocommit and +-3-6k on a one-row write between runs (whole program
+1.3M-4.7M a transaction); decide such kill lines on means over repeated runs.
 
 ### New entries
 
 Every entry from here on ends with a retry condition a later agent can grep and test: a profile
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
+
+## 2026-11-23 - WIN (landed as 11382864d; past its gain kill line, -5.26k Ir per FULL autocommit INSERT in callgrind, -3.9k in perf, x8.61 -> x8.36 stock 3.54.1; prediction -3.6k to -4.6k): the commit's conflict-page prediction answers "freelist metadata dirty" once, with an exact early return, instead of building five freelist copies per commit (bd-fuwx0, single-writer lane round 13, lever F1)
+
+- Target: the autocommit one-row INSERT's commit path, #10 in bd-fuwx0's cost map.
+  - Phase A's `predicted_conflict_pages_for_wal_commit_with_inner` -> `predicted_commit_pages_with_inner` called
+    `freelist_metadata_dirty_with_inner` twice (itself, then via `page_one_in_pending_commit_surface_with_inner`).
+  - It also built the predicted durable freelist eagerly.
+  - That is five `durable_freelist_pages_with_inner` builds per commit (each clones `inner.freelist`, merges,
+    normalizes and filters), 4.23k of the 4.7k prediction per FULL INSERT on main 19c90923b.
+- Change (`crates/fsqlite-pager/src/pager.rs`):
+  - `durable_freelist_provably_unchanged_with_inner` is the early return. It requires all of: nothing allocated from
+    the freelist; no freed page at or below `committed_db_size`; no freelist page between `inner.db_size` and
+    `committed_db_size`.
+    - Both lists are the descending form of (F + restored) in (1, size] minus the lock-byte page. So under the first
+      two conditions they differ exactly by F's pages between the two sizes.
+    - The sibling Phase-A check lacks the third condition, and that is not sufficient: a peer's returned lease pages
+      below this transaction's growth make the metadata dirty.
+  - `predicted_commit_pages_with_inner` computes the answer once, passes it to the page-1 rule, and builds the
+    predicted list only when the answer is dirty.
+  - In debug builds, a `debug_assert!` checks every early return against the full comparison.
+- Ledger preflight: the O-B1 entry (79c965065) named this as its retry condition. No entry rejects it.
+- Prediction (on the bead, before the build):
+  - FULL -3.6k to -4.6k; NORMAL -3.4k to -4.4k; txn10 -0.4k to -0.8k per commit; point within +/-0.3%;
+  - the INSERT after a 253-page DROP -15k to -35k.
+  - Kill: under -2.0k per FULL INSERT; txn10 or point above +0.5%; any replicated LOSE above 1%, mt-mvcc included;
+    any keeper red.
+- Result. Arms in one rch job on hz4, K=6. The parent's 1961 source hashes were checked against git.
+  - parent 19c90923b, CLI dda6b9c164baf9af; lever CLI 5060f37263ed181e.
+  - thinkstation1, powersave, databases on ext4. Stock SQLite 3.54.1 live.
+  - callgrind, per unit = (N800 - N400)/400:
+    - FULL, 7 pairs: -5,259 (-2.88%; x8.61 -> x8.36). The lever's subtree is 4,234 -> 333.
+    - NORMAL median of 3: -4,986.
+    - txn10: -2.72k per commit, of which -0.65k is in the lever's functions. The rest is a codegen difference
+      outside them, not claimed.
+    - point: noise. 0 calls per SELECT.
+    - INSERT after a 253-page DROP: -63.3k (-25.6%; x11.65 -> x8.66).
+  - perf instructions:u, two runs: FULL -3,972 / -3,866; NORMAL -4,527 / -4,334; txn10 -2,503 / -2,329 per commit;
+    point +8 / +10 per SELECT (+0.01%). A/A at most 221 per unit.
+  - Time (layout-averaged, two valid runs): every row TIE replicated, no LOSE. The disk-backed FULL rows have
+    T 4-8% (cpu) and 11-15% (cycles).
+  - mt-mvcc-bench (--one-row-per-transaction, 200 rows per thread, 11 iters, K=6 layouts; arms in one job on
+    vmi1153651, parent b74e17c5986b82a7, lever 7fd758d26eedd231; stock the bundled rusqlite 3.54.1, live): 4 writers
+    L/P 1.018 TIE, (1.014 VOID), 0.988 TIE; 8 writers 1.012, 0.991, 0.986, all TIE. No LOSE.
+- Keepers (pager lib):
+  - `test_freelist_metadata_dirty_early_return_matches_the_full_comparison_bd_fuwx0`: 276,480 states;
+  - `test_growth_past_a_peer_returned_lease_keeps_the_freelist_dirty_bd_fuwx0`.
+  - Both pass on the parent and on the lever. Both are red on a planted mutant (the early return without the size
+    range).
+- Gate, on 19c90923b + the lever diff (2f69c428):
+  - clippy -D warnings, fsqlite-pager all targets: clean;
+  - pager lib 1135/0; core lib 4208/0;
+  - core keepers 365/1 (the known red bd-70qrk on that base);
+  - e2e concurrent 144/1: bd_3wop3_1_3, red on main 3/3, green on the lever 3/3 (bd-uk9ob);
+  - e2e cross-process 0 failed; e2e multiprocess 12/0;
+  - fsqlite crate batches 1-7, every result line 0 failed. Batch 5's step rc 1 is an rch transport error: "Remote
+    command finished: exit=0", then "completion unconfirmed ... Broken pipe".
+  - Re-gates after the rebases onto origin/main (which carries 0aa7e219b, then 280cdf109, cee9f5c71, 6ce33dfdc and
+    d274b02a9 in pager.rs):
+    - on 793f4682d (vmi1227854): clippy pager all targets clean; pager lib 1139/1. The red was
+      `test_deferred_upgrade_busy_when_writer_active` (a 10 ms wall-clock bound, bd-gp7t8's class). On hz4 it passed
+      10 of 10 alone and the full lib passed 1140/0, and the parent passed 10 of 10 and 1138/0;
+    - the final push tree (on d274b02a9, with 0954db521's clippy allow and 3229ffadf's as_chunks_mut test fix below
+      F1; pager.rs b414df99; vmi1153651): clippy -D warnings fsqlite-pager all targets rc 0; pager lib 1143/0.
+- Found on the way: the Phase-A sibling's early return published a growth past a peer's returned lease pages with
+  those pages on no durable freelist (bd-fwsyc). This lane's fix made the grower's COMMIT refuse with BusySnapshot
+  instead. It was NOT landed: superseded by 0aa7e219b, which commits instead of refusing. Runtime evidence for
+  0aa7e219b is on bd-fwsyc.
+- Retry or extend: the same shape of cost (O(freelist) work per commit) may remain in the Phase-A path
+  (`freelist_metadata_dirty_with_pending_free_pages`'s full comparison on commits that allocate or free). Measure
+  ins_fl first.
+
+## 2026-11-23 - REJECTED at phase 0, no build (the token-only part is at most -6.6k Ir per FULL autocommit INSERT, under its -9k gain kill line; x8.36 stock 3.54.1): a "solo epoch" token that runs the multi-writer protocol lazily and hands off transparently to a second writer (bd-2uxuh, single-writer lane round 14)
+
+- Design (bd-2uxuh, borrowed from biased locking):
+  - A write transaction takes a solo token at BEGIN when no other write transaction is live in-process and the
+    -shm shows no foreign writer.
+  - In a solo epoch it keeps a coarse read summary and skips conflict prediction and validation.
+  - A second writer revokes the token and waits only for an inflate into the full protocol.
+  - Commits publish through the same WAL, WAL-index and certificate bytes.
+- Phase 0, measurement only. Per INSERT = (N800 - N400)/400, inclusive, median of 7 callgrind replicate pairs.
+  - ELF: CLI fsqlite-cargo 5060f37263ed181e, r13's F1 lever arm (19c90923b + F1), whose commit path is origin/main
+    337f0bda8 plus F1. The profiles are r13's ($S/s13/cg, tags L..L7).
+  - Whole INSERT 177.5k against stock 3.54.1's 21,236 (x8.36). The commit is 113.0k and the BEGIN side 25.3k.
+- Why the token cannot pay:
+  - Stock processes do not know the token. Every row a stock process can observe or change stays, about 57k:
+    - frame append 11.8k, sync 6.8k, certificate about 12k (frozen at v5);
+    - the external WAL lock and shm locks 3.4k, the vouched WAL-index header 4.9k;
+    - the native-append preflight 6.9k (stock writers, GH#534's dead-peer tail);
+    - the conflict scan 3.3k (a stock writer can commit inside our window);
+    - the BEGIN-side refresh 13.3k.
+  - Holding stock's WAL write lock across our transactions would make a stock writer wait for our COMMIT, and
+    serializing writers is ruled out.
+  - The in-process rows need no token:
+    - fsqlite-mvcc already takes its uncontended prepare and finalize fast paths (finalize_prepared_session_state
+      "uncontended", 801 of 801 commits). The registry row (5.5k) is wrapper cost, reachable by O-B4 under a
+      "the registry holds no other session" guard.
+    - A write-only token cannot rule out live readers, and readers are the finalize record's consumers.
+    - The page plane and snapshot publication (13.8k) feed every later BEGIN on the file, not only live readers,
+      so they are not lazily skippable either.
+  - Only three rows depend on the token: the Phase-A prediction remnant after F1 (1.4k), the epoch waiter
+    bookkeeping (3.5k), and the SSI read witnesses (1.7k). That is at most 6.6k (3.7%), realistically 3-5k.
+    - The read witnesses are not consumer-free: a session live at the solo commit, with an older snapshot, that
+      writes later, can close a write-skew cycle through the solo transaction's reads.
+- Kill line: a gain under -9k (5%). That is the smallest gain that pays for revoke and inflate, their DPOR/loom
+  model, a shadow mode and the planted-mutant keepers. The token-only upper bound is under it.
+- Cost-only options on the same tree, about -18 to -25k together. Each needs its own lever:
+  - O-B1 under-gate -2.9k (measured, rejected alone, 79c965065); O-B3 -1.0k; O-B4 -2 to -3k;
+  - O-C1 -4 to -6k; O-C3 -4 to -8k;
+  - the checkpoint copying the bytes it validated instead of re-reading and comparing XXH3-128 digests, about -3.0k.
+- Retry condition: an owner decision that excludes stock writers while a token is held (a Q2-class interop change),
+  which would put about 18k of cross-process rows in reach. Or a cost-only campaign after which the three token-only
+  rows above are the largest protocol cost left.
+
+## 2026-11-24 - REJECTED on its time kill line (gb_a_sum_c cycles a replicated layout-averaged LOSE, 1.0155 / 1.0243 at Ir 1.0000), with every statement row it targets a replicated WIN (txn point SELECT cpu x2.77 -> x2.04 / x2.09 stock 3.54.1, Ir -23.3%): an exact-guard per-connection cache of validated statements lets a repeated text statement skip its pre-dispatch rewrites and relation / semantic validation (bd-5310l, statement lane round 1)
+
+- Target: the text path's per-statement front end. On main 60386fa04 (user instructions an execution, stock 3.54.1
+  live): in-transaction point SELECT by rowid 50.59k against stock's 21.9k (x2.31), INSERT 36.85k (x2.69), UPDATE
+  43.72k (x2.57); autocommit SELECT 79.2k (x3.32). About 24k of the SELECT is the pre-dispatch block of
+  `execute_statement_once_after_background_status` (rewrites, then relation and semantic validation in the
+  registry-stability loop), which neither the parse cache nor the compiled cache skips.
+- Touched (not landed; patch `frankensqlite-perf-lnab/scripts/stmt1/lever.patch`, sha256 9618712ba04f25db, on
+  60386fa04): `crates/fsqlite-core/src/connection.rs`, and the keeper
+  `crates/fsqlite-core/tests/bd_5310l_validated_statement_cache_oracle.rs`. A 64-entry LRU keyed by the address of the
+  parse cache's `Arc<Statement>` (the entry holds the Arc, so an address is never reused under it). Guard, compared
+  before and after the schema refresh, which always runs: a catalog version (the sum of per-cell monotonic versions of
+  the connection's `TxnRestorableCell` catalog cells, bumped on borrow_mut, replace and the transaction restore), the
+  function registry generation, and foreign_keys. Eligible only at depth 0, for the statement the text entry point took
+  from the parse cache, when every rewrite is the identity, with no attached database, no application virtual-table
+  module, no live or dropped virtual-table instance, and no virtual-table callback entered during validation. Errors
+  are never cached, a mismatching entry is dropped at lookup, and the cookie-driven reuse-cache clear leaves it alone.
+- Keepers (both pass on the lever; K2 on vmi1152480, K3 on vmi1153651): a differential test against live rusqlite
+  3.54.1 with three arms (cached; an uncached reference kept ineligible by an ATTACHed database; stock), each statement
+  run three times, across DDL, savepoint rollback of ALTER, TEMP shadowing, views, foreign_keys flips on a
+  partial-index DELETE, recursive_triggers / case_sensitive_like / trusted_schema, ATTACH / DETACH, fts5, a function
+  re-registered from scalar to aggregate, an ICU collation load and `fsqlite_cache_pages()`: cached equals reference
+  on every outcome, and both match stock's rows, changes() and error outcomes (the one error-wording gap, "no such
+  column: c" where stock 3.54.1 adds " in <sql> at offset 7", is the uncached reference arm's too). Plus a counter test:
+  changing each guard input alone makes the next run a miss. Six planted mutants, in one runtime-selected build:
+  dropping the catalog version (m1) or the function generation (m2) is caught by the counter test only (no
+  SQL-visible difference found); dropping foreign_keys (m3: changes() 0 against 2 after `DELETE FROM p INDEXED BY
+  p_part`), the ATTACH bar (m4), the virtual-table bar (m5) or the callback witness (m6) is caught by both tests.
+- Found on the way: (1) the schema cookie is not a sound guard. A ROLLBACK of DDL restores the old cookie, so a plan
+  validated against the rolled-back schema would match again; hence the per-cell versions. (2) `Connection::open`
+  installs the engine's own FSQLITE_CACHE_PAGES module through the public `register_module`, so a flag set there is
+  set on every connection. The first build never engaged (its keeper's engagement assert failed); its core library
+  run, 4,215 passed, is for that non-engaged build and is not cited.
+- Prediction (bead, before the build): txn point SELECT -14% to -22% Ir, UPDATE -7% to -10%, INSERT -6% to -9%,
+  autocommit SELECT -10% to -14%, txn_1000x10_rows -2% to -5%. Kill lines: under 8% on the txn point SELECT; any
+  prepared-statement row more than 1% worse; any scorecard row with a replicated LOSE (judge v2b, stock live).
+- Result (one rch job AB2 on vmi1153651, base 60386fa04; parent cargo ELF 64815463aeeccccc, lever 0d135d37e2e496c4,
+  .text +8,064 B; six relinks per arm; measured on thinkstation1).
+  - Instructions an execution (single ELFs, stock live, every answer equal to stock's): txn point SELECT 50.67k ->
+    38.85k (-23.3%; x2.32 -> x1.78), INSERT -8.0% (x2.69 -> x2.47), UPDATE -8.7% (x2.58 -> x2.36), autocommit SELECT
+    -15.0% (x3.33 -> x2.83), autocommit INSERT / UPDATE within their spread; txn_1000x10_rows 645.0M -> 616.0M (-4.5%).
+  - Time on the statement rows (bd-es2im lines, the same six layouts, two valid runs, null max |z| 1.79 / 2.71, stock
+    live): every targeted row a replicated WIN in cpu and cycles. txn_select_2000 cpu 0.736 / 0.754 (x2.77 -> x2.04 /
+    x2.09 stock), cycles 0.644 / 0.652; auto_select_2000 cpu 0.817 / 0.808 (x5.09 -> x4.16 / x5.12 -> x4.14);
+    txn_update_2000 cpu 0.928 / 0.932; txn_insert_2000 cpu 0.929 / 0.951; txn_1000x10_rows cpu 0.955 / 0.971 (x9.50 ->
+    x9.08 / x8.96 -> x8.70); autocommit_5k_inserts a TIE.
+  - Scorecard (judge v2b, K=6, two valid runs, null max |z| 2.66 / 2.23, stock live): gb_a_sum_c cycles 1.0155 /
+    1.0243 LOSE / LOSE (T 1.48% / 1.00%) at Ir 1.0000; bulk_insert_1M_one_txn cycles 0.985 / 0.988 WIN / WIN; every
+    other row and metric a replicated TIE.
+- The LOSE, per layout (gb_a_sum_c cycles, M, s1..s6, run A): parent 3221 3356 3214 3238 3253 3356; null (the parent's
+  same ELFs) 3214 3327 3216 3211 3241 3336; lever 3222 3325 3293 3289 3318 3299. Run B shows the same split. The row
+  is bimodal by layout: the parent drew two slow layouts of six, the lever five. A counter probe (parent and lever s1,
+  s3, s2; 5 reps) reproduced the modes (s3: parent 3,213M, lever 3,307M) with branch misses (3.46-3.58M), L1i misses
+  (0.40-0.59M) and L1d misses (30.8-31.4M) flat across them, so the modes are not branch prediction or cache misses.
+  Not diagnosed further.
+- Not measured: the prepared-statement kill line (the lever's prepared-dml-probe build was lost when the disk
+  supervisor killed AB2 at 4h10m, rc 137, and was not rebuilt after the rejection); the gate battery (G1 was in flight
+  at the rejection; G2 and G3 were not run).
+- Retry condition (coordinator, 2026-11-24): (a) a revision with a smaller hot-path footprint, with fresh predictions;
+  or (b) bd-j0jc0 shows judge v2b's replication defective, and the lever is re-judged under the fixed gate with every
+  other verdict. judge v2b replicates on the same six layouts, so on a bimodal row one draw's slow-layout count can
+  move an arm about 2%. Do not re-roll it on new layouts alone.
+- Evidence: scratchpad (session 1f77802a) `stmt1/`: ab2_stmt_probe.txt, ab2_rows_probe.txt, judge/verdict_AB.txt,
+  judge/stmt_verdict.txt, judge/gb_frontend.txt, results/K2, results/K3, jobs.log; the arms are in arms/AB2 and
+  arms/AB2-L.
+
+## 2026-11-24 - SMALL WIN (landed as ae029a9a4; inside every prediction line; instructions only, x4.92 -> x4.85 stock 3.54.1, time a replicated TIE): the forgotten-page table of the eviction trace hashes page numbers apart from the flat page table, so a compaction's probes stay short (bd-w4pr1.13.18, read/seek round 12, lever CP1)
+
+- Target: BF1's `ForgottenTracePages` probes in `AccessTrace::compact`. Callgrind on main e9dd4aa18: forget 331 Ir an
+  eviction, 252 of it the 375 compactions (126k each); 103.6k of a compaction's 121.7k own Ir were the probe loop of
+  `cut` (about 52 a scanned entry).
+- Cause: `home` hashed by the top bits of page * 0x9E37_79B9, the flat page table's multiplier (GOLDEN_RATIO_32,
+  whose slot is bits 16..29 of the same product). The clean-buffer eviction takes victims in flat-slot order, so the
+  ~500 pages forgotten between two compactions cover part of the flat table's hash range and their homes here crowd
+  into part of this table. Model (`scratchpad/pl12/sim_forgot_hash.py`): 3.7-8.4 probes a waiting page and 10-21 any
+  other, against 1.4 / 2.2 for random keys at that load. A correlated-hash defect, not a load-factor one.
+- Touched: `crates/fsqlite-pager/src/page_cache.rs`. `home` multiplies by `FORGOTTEN_TRACE_PAGE_HASH` = 0x85EB_CA6B
+  (MurmurHash3's odd constant). Same table size (8 KiB), same semantics. Keeper
+  `test_bd_w4pr1_13_18_forgotten_pages_from_one_flat_sweep_probe_short` (500 pages from half of a 16,384-slot flat
+  table's range, eight windows; mean probes at most 2.0 waiting / 3.0 not); planted mutant (the flat multiplier)
+  fails it at 7.36 / 17.57.
+- Prediction (bead, before the build): compaction 40k-60k; forget 120-190; rowid -27M to -42M Ir; scans -0.7M to
+  -1.6M; write rows +-0.3%; all-hits +-0.05%; rowid cycles TIE or WIN. Kill: rowid better by less than 15M; any row
+  above +0.5% Ir; any replicated LOSE.
+- Result (gate job j-...533 on vmi1227854, then arms job j-...722 on ovh-a, same patch and tree; parent cargo ELF
+  c34ec97d3d3ea6fd, lever 4ffeb19fa82996db; stock 3.54.1 live): rowid 2,257.68M -> 2,226.18M Ir (-31.5M, -1.39%);
+  forget 164 a call, compaction 52k; all-hits +0.0001%; judge minima rowid 2,267.3M -> 2,235.8M, scans -0.01% to
+  -0.08%, write rows 1.0000. Time (runs cp1j2 + cp1j3 valid, cp1j1 VOID): every row a replicated TIE; rowid cycles
+  0.975 WIN / 1.007 TIE. Answers equal stock everywhere. Every prediction line met.
+- Gate (3968ebfef, CP1 on origin/main 4579ee0ba; rch): clippy -D warnings fsqlite-pager all targets clean; pager lib
+  1,134 and core lib 4,208 + 1 passed; T3+XP 268, PS 184; the fsqlite crate in seven batches 877 / 37 / 36 / 57 / 45 /
+  35 / 24 passed, 0 failed (batch 4 with bd_w9s20_held_statement_reprepare_oracle, which round 12's target list had
+  missed); fsqlite-e2e 127 passed, with bd-ze4zu's one-table explicit-writers test red. That test was judged against
+  the parent in one rch job on vmi1149989 (both ELFs built there, 12 interleaved runs each): parent 9 of 12 failed,
+  CP1 8 of 12, same modes. rustfmt: ignored crate; ubs page_cache.rs 0 critical. Landed on origin/main fd696998f (no
+  commit between 4579ee0ba and it touches page_cache.rs).
+- Retry / next: the forget is 164 Ir a call after CP1, inside the 60-200 band BF1 aimed for; the miss path's larger
+  pieces are elsewhere (bd-w4pr1.13.18: the flight's waiter fanout, lever NW; the eviction walk, FS1 v2).
+- Note for the next lever on this table: any open-addressing table keyed by page number and filled in eviction order
+  must not share the flat table's multiplicative hash (or its bit range); a different multiplier is enough.
+
+## 2026-11-23 - WIN (landed as 48b41a41e; inside its prediction): a statement's run of explicit-rowid floor bumps takes the tables lock alone after its first; bulk -206M Ir and a replicated cpu and cycles WIN against SQLite 3.54.1 live (bd-w4pr1.13, bulk-write round 17, lever FR)
+
+- Target: the explicit-rowid floor bump of bulk_insert_1M_one_txn.
+  - 61acfe86a (bd-u65rh, 2026-11-22) attributed every bump to (session, statement) so that rollbacks rewind it exactly.
+  - That raised the bump from 17.5M to 37.3M Ir per 100k rows: 373 a row, with three mutexes and three hash lookups per explicit-rowid row.
+  - Measured by callgrind of the 100k bulk row on a CLI whose sources equal main 4579ee0ba. Line by line per row: the async wrapper 79, `bump_explicit_floor_for_statement` 158, `note_session_op_locked` 75, `record_claim` 61.
+- Touched:
+  - `crates/fsqlite-mvcc/src/rowid_alloc.rs`:
+    - `TableAllocatorState::run`, an `ExplicitRun` holding the session, the statement, the depth after the run's first bump, and the last row's prior floor.
+    - A continuation bump (same session and statement, depth unchanged) raises the floor under the tables lock alone.
+    - Every other depth change, and every mark, rewind or `clear_session` of the session, ends the run.
+    - `rewind_unlanded_explicit` restores a run row's own prior floor.
+  - `crates/fsqlite-vdbe/src/engine.rs`: a synchronous floor raise for a row the cursor just appended (round 11's FB).
+  - Keepers:
+    - mvcc unit `explicit_run_raises_every_row_rewinds_exactly_and_ends_at_any_other_operation`, 7 scenarios;
+    - core `failed_insert_rowid_reuse_oracle::explicit_rowid_runs_raise_every_row_and_rewind_whole_beside_a_concurrent_peer`, two connections and a disjoint-leaf peer;
+    - two OR IGNORE / OR FAIL run-row cases in the stock-differential modes test.
+    - Mutants M1 (runs never end), M2 (a savepoint keeps the run), M3 (a later row does not raise the floor) and M4 (no run-row rewind) each turn them red (rc 101).
+- Ledger preflight:
+  - FB (2026-11-19). Its retry condition was "with the floor's per-row lock and table lookup in the same lever"; FR removes two of the three per-row locks and lookups.
+  - F2 (foldhash) is kept.
+  - No entry covered bd-u65rh's per-row attribution.
+- Prediction (on the bead before the build): bulk -200M to -280M Ir, cycles -3% to -6%, task-clock -2.5% to -5%; other rows within ±0.5% Ir.
+- Kill lines: bulk down less than 120M (1.7% of the row); any row up more than 0.5%; a replicated LOSE above 1%; a failing keeper or oracle; a surviving mutant.
+- Result:
+  - Setup: stock SQLite 3.54.1 live. Parent 4579ee0ba. One three-arm job on vmi1152480 (P_t / L_m2t / L_frt, the parent shared with lever MR2). Cargo ELFs: P d397eddd4281c2ce, L 452029373ca729c9. Two valid layout-averaged runs (null max |z| 2.09 and 1.88). Answers equal stock.
+  - Instructions (single ELF): bulk 6,979.6M -> 6,773.6M (-206.0M; x1.933 -> x1.876 against stock's 3,610.9M). memory_script +0.7M, update and delete unchanged, and every read row within ±0.02%. Callgrind of the 100k row: 705.8M -> 685.2M.
+  - Time (layout-averaged): bulk cpu 0.9785 / 0.9692, a replicated WIN (against stock x2.242 -> x2.194 and x2.238 -> x2.169). Cycles 0.9693 / 0.9660, a replicated WIN (x2.584 -> x2.505 and x2.572 -> x2.485). Every other row is a replicated TIE.
+  - Gate (rch, the measured tree):
+    - clippy -D warnings (mvcc and vdbe, all targets; the core test target): rc 0;
+    - fsqlite-mvcc lib 1689 passed, fsqlite-vdbe lib 1267, fsqlite-core lib 4208;
+    - the seven core rowid keepers all pass (failed_insert_rowid_reuse_oracle 4, bd_8a8pr 4, bd_elcjy 4, bd_hi7qg 3, bd_6i9c5 1, bd_i3csr_1 9, the concurrent rewind stress 1);
+    - ubs 0 critical.
+- Retry / next: none for this lever. The remaining floor cost is about 100-130 a row: the tables lock and lookup and the sync call. A per-cursor floor held as an atomic that peers fold in at allocation would remove those too, but it changes what a peer reads mid-statement, so it needs the two-writer keeper the coordinator named.
+
+## 2026-11-23 - SMALL WIN (landed as b50d778c4; under its prediction, inside every kill line; instructions only, time a replicated TIE): the record writer stores a one-byte serial type straight into its header slot and encodes each payload inline (bd-w4pr1.13, bulk-write round 17, lever MR2)
+
+- Target: round 16's MR retry line. The 3-to-16-value MakeRecord writer `write_serialized_record_from_layouts` called `encode_serialized_value` out of line (400k calls, 110 a row) and wrote each header byte through a fresh sub-slice (about 65 a row).
+- Touched: `crates/fsqlite-types/src/record.rs`.
+  - A serial type of at most 0x7F is stored as one byte at its header offset; larger ones keep `write_varint`.
+  - `encode_serialized_value` is `#[inline(always)]`.
+  - Byte output is unchanged.
+  - Keeper: round 16's `record::tests::test_record_writer_matches_the_file_format_byte_for_byte`, with two-byte serial types 128, 129 and 413. Mutant M4 (the one-byte form for every two-byte serial type) turns it red (rc 101).
+- Ledger preflight: not the 2026-05-06 "Direct INSERT text append force-inline annotation" REJECT. That was connection.rs's prepared direct-INSERT lane on comprehensive-bench; its retry condition, a whole-matrix judgement, is the layout-averaged judge.
+- Prediction (on the bead before the build): bulk -70M to -110M Ir, time -0.5% to -1.5%; memory_script -15M to -25M; update -2M to -3.5M; other rows within ±0.5%.
+- Kill lines: bulk under 40M (0.6% of the row, just above the codegen-only ±0.5%); any row up more than 0.5%; a replicated LOSE above 1%.
+- Result:
+  - Setup: stock SQLite 3.54.1 live. Parent 4579ee0ba. One three-arm job on vmi1152480, sharing its parent with lever FR. Cargo ELFs: P d397eddd4281c2ce, L ceb56df3ef6469c1.
+  - Instructions (single ELF):
+    - bulk 6,977.0M -> 6,931.6M: -45.4M by min, -45.9M by median; x1.933 -> x1.920 against stock's 3,610.9M.
+    - memory_script -10.3M, update -1.5M; delete and every read row unchanged.
+    - Callgrind of the 100k bulk row: 705.8M -> 701.2M. The writer went from 334 to 287 a row inclusive.
+  - Time (layout-averaged): five runs, of which three were void on host load (another project's burst; load 120 at 15:25Z) and two valid (null max |z| 2.35 and 2.75).
+    - Every row is a replicated TIE. Bulk cycles 1.0000 / 0.9921 (against stock x2.540 both ways in run d, x2.583 -> x2.562 in run e); cpu 0.9957 / 0.9933.
+    - The single-run LOSEs (gb_1000 cycles in run d, rowid_lookups cycles in run e, window_sum_over cpu in run d) are each TIE in the other run, at Ir 1.0000.
+  - Gate: clippy -D warnings on fsqlite-types (all targets) rc 0; fsqlite-types 593 passed, 0 failed; rustfmt clean; ubs 0 critical.
+- Lesson (the miss): the inlined encoder keeps its bodies (the TEXT payload copy stays a memcpy call), and the header-byte store saved less than the sub-slice was charged. About 46 a row came off, not 70-110.
+- Retry / next: the writer is 287 a row against stock's OP_MakeRecord body of about 237. What is left is per-value dispatch on the value's type and the TEXT copy, which a record-template lever on a prepared program could remove. Not the generic serializer again.
+
+## 2026-11-23 - REJECTED on its time kill line (rowid_lookups_200k cycles a layout-averaged LOSE, 1.080 in the only valid run, 1.059 / 1.030 in two void runs, +7.5% at each of 8 heap offsets), with -32.0M Ir (-1.42%, x4.92 -> x4.85 stock 3.54.1) inside its prediction: the clean-buffer eviction walks an occupancy bitmap of the flat page table instead of every slot (bd-w4pr1.13.18, read/seek round 12, lever FS1)
+
+- Target: `ShardedPageCache::take_clean_buffer_from_flat_slots`, run on every page-cache eviction. Callgrind on main
+  e9dd4aa18: `take_clean_buffer`'s own code 414 Ir an eviction, about 233 of it the walk (16,384 flat slots, ~500
+  occupied at the default budget; every slot from the cursor read until an occupied one).
+- Touched (not landed; patch `scratchpad/pl12/fs1_v1.patch`, sha256 a504f167fa066573): `crates/fsqlite-pager/src/page_cache.rs`.
+  `FlatPageSlots.occupied`, one `AtomicU64` bit per slot, changed only under the slot's payload lock in the critical
+  section of the page-number transition it mirrors (insert, remove, clean take, arbitrary removal, clear);
+  `find_map_occupied_from` offers the occupied slots in the full walk's order; the walk's take checks the slot it
+  read before probing. Keepers: an occupancy / walk-order oracle (30,000 generated operations) and a twin cache
+  evicting by the old walk (same victim, bytes, cursor and residents every step); four planted mutants each failed.
+- Prediction (bead, before the build): rowid -30M to -46M Ir; cycles 0.96-0.995. Kill: rowid better by less than
+  25M; any row above +0.5% Ir; any replicated layout-averaged LOSE.
+- Result (one rch job on hz2; parent cargo ELF c16544c66fbc5a0c, lever e69aadfd8cc6e1eb; stock 3.54.1 live;
+  thinkstation1 at load 15-22): rowid 2,257.67M -> 2,225.68M Ir; `take_clean_buffer` own 414 -> 233 an eviction
+  (predicted 180-215); all-hits control +0.002%. Time, three runs (null max |z| 4.15 VOID, 2.84 valid, 18.46 VOID):
+  rowid cycles 1.059 / 1.080 LOSE / 1.030, cpu 1.045 / 1.047 LOSE / 1.044; every layout of the lever slower in every
+  run. Heap-offset probe (`scratchpad/pl12/heapshift_probe.py`, LD_PRELOAD malloc 0-3,584 B, 3 reps): lever slower at
+  every offset (1,649-1,706M against 1,510-1,570M cycles) with fewer L1d misses (114-117M against 121-123M) and fewer
+  L2 misses (8.4-9.4M against 10.3-11.8M). Not heap layout and not more misses. Not landed although only one run was
+  valid: every run and every layout showed the target row slower.
+- Why (diagnosis, not proven): the full walk's independent loads ran speculatively past the victim and warmed the next
+  victim's slot (about 17 slots on); the bitmap walk reaches the slot through a dependent chain (bitmap word, then
+  slot), so each take met a cold slot. Instructions are a poor proxy for this loop.
+- Retry condition: the same walk plus a software prefetch of the next victim's slot lines after each eviction (FS1 v2:
+  patch `scratchpad/pl12/fs1v2.patch`, sha256 7ede2dead05a13fa, prediction posted on the bead, never admitted on the
+  fleet in round 12), judged on rowid cycles first; any eviction-walk change must be judged on cycles first, since the
+  walk's memory side effect is part of its cost.
+- Related finding, measured separately as lever CP1 (bd-w4pr1.13.18, commit 3968ebfef on lane branch lane-cp1-r12,
+  landing gate pending): BF1's forgotten-page table hashed by the flat table's own multiplier, so pages forgotten in
+  flat-cursor order crowded its probes.
+
+## 2026-11-23 - WIN (landed as e519bf9ed; inside its prediction; trig_cte x11.59 -> x10.45 stock 3.54.1 in instructions, alt_txn x3.06 -> x2.46): a retained cursor a program on another root displaces from the engine's slot is kept as a spare, and the next open of its root takes it back (bd-fpr5g, trig lane round 2, lever RC)
+
+- Target: programs on the connection's one cached VDBE engine number their target cursor 0, so an INSERT's trigger
+  body programs replaced the outer INSERT's retained cursor in slot 0 and each other's. Every statement opened a new
+  cursor (reading its root page and copying it) and lost its right-edge append. Callgrind on main eb7cd85b2, per
+  firing of the bead's body (d_both minus d_never, 1,714 firings): open_storage_cursor 13.6k (four opens),
+  table_insert_prechecked_absent 7.4k (two seeks for insert). The same displacement hit alt_txn (INSERTs
+  alternating two tables in one transaction): 4.9k open and 4.4k seek per statement.
+- Touched: `crates/fsqlite-vdbe/src/engine.rs` (`spare_storage_cursors`, at most 8, oldest dropped first;
+  `swap_spare_storage_cursor_into_slot`, `keep_spare_storage_cursor`; the reset that keeps no cursors,
+  `take_transaction` and `storage_cursors_empty` include the spares). An open of a root whose slot does not hold it
+  takes the root's spare into the slot, where OpenWrite's retained-cursor reuse refreshes it.
+- Soundness: while one of a root's cursors is a spare, the engine holds no other cursor on that root (a cursor is not
+  kept while another slot holds its root; every open of a root not in its slot takes the spare first; a spare is not
+  put back beside a slot holding its root), so nothing writes a root under its spare. Spares are dropped wherever
+  retained cursors are, so every existing invalidation covers them. Only cursors on the execution's reuse backend
+  are kept, never one holding an ephemeral index's records; a spare's unlanded rowid goes back as OP_Close's does.
+- Ledger preflight: the 2026-05-07 and 2026-05-08 retained direct-DML cursor rejections kept a connection-local
+  BtCursor for the direct-DML lanes; this lever stays inside the engine's existing retained-cursor reuse.
+- Keepers: fsqlite-vdbe lib `test_displaced_retained_cursor_is_kept_as_a_spare_and_taken_back` (mem backend, where a
+  cursor's own rows make reuse observable, with an in-test control that a new cursor lacks them; red on main's engine);
+  `bd_fpr5g_trigger_body_cache_under_cte` `spare_cursors_follow_self_writes_recursion_schema_changes_and_rollbacks`
+  (stock 3.54.1, :memory: and a file: the bodies' tables written from outside the bodies, the firing table written by
+  its own trigger with recursive_triggers OFF and ON, a body's table dropped / created / indexed between firings, a
+  savepoint rollback and a failed statement between firings, integrity_check).
+- Prediction (bead, before the build): trig_cte / trig_src / trig_values each -190M to -330M; alt_txn -110M to -180M;
+  every other row within +-0.5%. Kill: trig_cte gaining under 120M; any other row above +0.5% Ir; a replicated time
+  LOSE above 1%; answers; keepers.
+- Result. Arms in one rch job on hz2 (parent 297d47109 cargo link 78fc4582710dc3c2, lever b23287bdae273fe4; the
+  parent's 1,960 sources equal git, the lever differs only in engine.rs, equal to HEAD + patch). thinkstation1,
+  powersave, stock 3.54.1 (rl12/stock354) live, answers equal everywhere. Instructions:u, single ELFs, 5 reps, the A/A
+  copy within 0.09%:
+  - trig_cte_20000 2,664.1M -> 2,403.4M (-260.7M, -9.8%; x11.59 -> x10.45 stock), trig_src -260.2M (x9.34 -> x8.34),
+    trig_values -306.0M (x2.11 -> x1.85), alt_txn_20000 884.7M -> 711.2M (-173.5M, -19.6%; x3.06 -> x2.46).
+  - notrig_cte, ctl_insert_txn, ctl_select, sel_case within +-0.11%; upd_case_txn +5.8M (+0.33%), inside the +0.5%
+    line (about 290 per statement; not attributed).
+  - Callgrind, 2,000 rows: d_both -14.2k per firing, d_never -0.08M (no displacement, no change), alt_txn -7.8k per
+    statement.
+  - Time (bd-es2im layout-averaged, K=6, 7 reps): runs 1, 3 and 4 were VOID (P-vs-Q nulls |z| 4.97, 6.09,
+    9.93; other projects' rch jobs ran on this host, load 30-58 on 64 cores); runs 2 and 5 are valid (null max |z|
+    1.69 and 2.61). trig_cte cycles 0.815 / 0.813 (x26.5 -> x21.6 stock in run 2), trig_src 0.797 / 0.828,
+    trig_values 0.797 / 0.809, alt_txn 0.684 / 0.679 (x4.82 -> x3.30): replicated WINs, cpu likewise. Every other
+    row a replicated TIE; the one single-run LOSE is upd_case_txn cpu in run 2 (1.024; TIE in run 5).
+- Gate (rch; RC, 2a and lever 5 stacked on main 79c965065, in parts with test binaries built without debug
+  info, after a one-job gate passed rch's 20 GiB disk-growth budget): fsqlite-vdbe lib 1,268 passed;
+  fsqlite-core lib 4,210 passed, 0 failed; 40 trigger / conflict / RETURNING / GH#516 keeper targets and 8
+  e2e trigger targets, 247 passed, 0 failed; the fsqlite crate in 7 batches of 19, 125 binaries, 1,111 passed, 0 failed (batches 1-4 on the tree before the clippy rewrite, 5-7 on the final tree). clippy -D
+  warnings on both crates (all targets) clean after RC's swap condition was rewritten as is_none_or
+  (nonminimal_bool), re-checked on the final tree with the vdbe lib and the keeper file (9 passed).
+  rustfmt: ignored crates. ubs on engine.rs, insert_batch.rs and the keeper file: 0 critical.
+- Retry condition: none for this lever. Left on the row: the per-firing 4 KiB copy-on-write of the pages the body
+  statements write (PageData::as_bytes_mut, about 3 per firing; bd-yb70u), and lg's NewRowid `last` (2.1k-2.9k per
+  firing, a retained cursor does not remove it).
+
+## 2026-11-23 - WIN (landed as 4875034e9; inside its prediction; trig_src x9.34 -> x9.18 stock 3.54.1 in instructions): a column with no DEFAULT takes its NULL without the boxed default evaluator (bd-fpr5g, trig lane round 2, lever 2a)
+
+- Target: an INSERT whose target has triggers or foreign keys snapshots each row's NEW image from a row of the
+  columns' defaults; `evaluate_default_row_from_sqls` called `evaluate_column_default_value` for every column, which
+  boxes a future before it finds the column has no DEFAULT. Callgrind on main eb7cd85b2: 2.55k per inserted row on the
+  bead's 4-column table, 1.9k of it malloc / free.
+- Touched: `crates/fsqlite-core/src/connection.rs` (`evaluate_default_row_from_sqls`: a column with no DEFAULT takes
+  NULL directly). Keeper `bd_fpr5g_trigger_body_cache_under_cte` `trigger_new_rows_hold_every_omitted_columns_default`
+  (stock 3.54.1, :memory: and a file: BEFORE and AFTER NEW rows from VALUES, a SELECT, DEFAULT VALUES and the FK path
+  hold every omitted column's DEFAULT and NULL for one with none).
+- Ledger preflight: no entry on the default-row evaluation.
+- Prediction (bead, before the build): trig_cte / trig_src / trig_values each -38M to -50M; every other row within
+  +-0.1%. Kill: trig_src gaining under 20M; any other row above +0.1%; a replicated time LOSE above 1%.
+- Result (same job, host and stock as lever RC's entry; lever cargo link 0a53c9ae243852cf, differing from the parent
+  only in connection.rs): trig_cte -44.5M (x11.59 -> x11.39), trig_src -43.6M (x9.34 -> x9.18), trig_values -45.1M
+  (x2.11 -> x2.07); every other row within +-0.02%. Callgrind, 2,000 rows: -2.4k to -2.7k per inserted row.
+  - Time (bd-es2im layout-averaged, K=6, 7 reps): runs 1, 3 and 4 were VOID (P-vs-Q nulls |z| 4.97, 6.09,
+    9.93; other projects' rch jobs ran on this host, load 30-58 on 64 cores); runs 2 and 5 are valid (null max |z|
+    1.69 and 2.61). Every row a replicated TIE: the 1.8% instruction gain is inside the time noise. Single-run
+    LOSEs: trig_src cpu and cycles in run 2 (1.082 / 1.059; 0.967 / 0.992 in run 5), notrig_cte cycles and
+    upd_case_txn cpu in run 5; none replicated.
+- Gate: stacked with the other two landed levers; see lever RC entry.
+- Retry condition: none for this lever.
+
+## 2026-11-23 - WIN (landed as e502df9b6; inside its prediction on trig_src, beyond it on trig_cte; trig_cte x11.59 -> x10.19 stock 3.54.1 in instructions): an INSERT ... SELECT into a table with triggers replays its materialized rows, and replays while temp roots exist, through the compiled row program (bd-fpr5g, trig lane round 2, lever 5)
+
+- Target: GH#516's compiled-row kernel (`crates/fsqlite-core/src/connection/insert_batch.rs`) refused this bead's
+  scripts at two gates: a SELECT source (trig_src) and any temp root in the connection (trig_cte, whose recursive CTE
+  is a materialized binding while the statement runs), so every row went through `execute_prepared_with_params`.
+- Touched: `connection.rs` (`execute_insert_select_row_stream` gains `source_rows_materialized`: the materialized and
+  morsel producers pass true, the streaming producer false) and `insert_batch.rs` (`prepare_compiled_insert_replay`
+  admits a SELECT source only for materialized rows; the blanket temp-roots refusal becomes an explicit refusal of an
+  unqualified TEMP target plus a post-compile check that the template's program opens no temp root). The soundness
+  arguments for both gates were posted on bd-fpr5g before any code.
+- Keepers: insert_batch.rs `compiled_insert_replay_rows` (a #[cfg(test)] count of compiled rows: a materialized
+  SELECT source of 200 rows replays 200, a bare-column SELECT the streaming producer feeds replays 0, a CTE-fed
+  insert of 120 rows with a TEMP table present replays 120, a TEMP target 0); `bd_fpr5g_trigger_body_cache_under_cte`
+  `replayed_select_rows_follow_chunks_raises_conflicts_and_temp_roots` (stock 3.54.1, :memory: and a file).
+- Two pre-existing defects found while writing that keeper (main eb7cd85b2, both reproduced with main's CLI against
+  stock 3.54.1; both left out of the keeper and reported to the coordinator): an INSERT ... SELECT into a table with
+  row triggers reads its source in 10,000-row chunks, so a trigger that writes the source changes what later chunks
+  read (stock reads the whole SELECT first; repro scratchpad trig2/wl/srcwrite_probe_10005.sql); and a ROLLBACK after
+  CTE-fed INSERTs into a table with a trigger empties a TEMP table (trig2/wl/temp_rows_lost_on_rollback_repro.sql).
+- Prediction (bead, before the build): trig_src -120M to -200M; trig_cte -120M to -200M; every other row within
+  +-0.1%. Kill: trig_src (or, for gate 2, trig_cte) gaining under 60M; any other row above +0.1%; a replicated time
+  LOSE above 1%.
+- Result (same job, host and stock; lever cargo link 44a0a3614701ba99, differing from the parent only in the two
+  files): trig_src -160.2M (x9.34 -> x8.73), trig_cte -321.9M (x11.59 -> x10.19, beyond the band: about 16k a row
+  where 6k-10k was predicted); every other row within +-0.11%, the largest a decrease (sel_case -0.11%).
+  - Time (bd-es2im layout-averaged, K=6, 7 reps): runs 1, 3 and 4 were VOID (P-vs-Q nulls |z| 4.97, 6.09,
+    9.93; other projects' rch jobs ran on this host, load 30-58 on 64 cores); runs 2 and 5 are valid (null max |z|
+    1.69 and 2.61). trig_cte cycles 0.804 / 0.799 (x26.5 -> x21.3 stock in run 2), trig_src 0.796 / 0.822:
+    replicated WINs, cpu likewise. Every other row a replicated TIE. Single-run LOSEs: notrig_cte cpu in run 2
+    (1.027) and cycles in run 5 (1.024), never the same metric twice, on a row whose instructions are unchanged;
+    upd_case_txn cpu in run 2; sel_case cycles in run 5.
+- Gate: stacked with the other two landed levers; see lever RC entry.
+- Retry condition: none for this lever. Left on trig_cte: the per-firing hide / restore of the caller's materialized
+  binding (`MaterializedBindingsVisibilityGuard::hide_reserving` builds a set of every table and view name and
+  rebuilds the schema indices twice per firing, about 10k; trig_cte minus trig_src, callgrind).
+
+## 2026-11-23 - REJECTED on its regression kill line (trig_values_20000 +4.7M Ir, +0.19%, against +0.1%), with upd_case_txn_20000 -254.2M (x3.00 -> x2.56 stock 3.54.1) and sel_case_20000 -235.0M beyond its prediction: a CASE whose parts are plain counts as plain, so a statement holding one skips placeholder renumbering and the subquery rewrite (bd-fpr5g, trig lane round 2, lever 2b)
+
+- Target: bd-5310l's plain-statement predicates (`expr_is_plain` in `crates/fsqlite-core/src/connection.rs`) refused
+  any CASE. Callgrind on main eb7cd85b2, 2,000 statements in one transaction: an UPDATE with a CASE in SET spent 6.0k
+  per statement in `canonicalize_update_placeholders` (two renumberings, each a clone; 6.5% of the run), a point
+  SELECT with a CASE result column 9.7k in `rewrite_subqueries` (5.3%). That met the 2026-11-12 bd-5310l entry's
+  retry condition for widening to CASE (2% or more, and a keeper that the rewrite returns it unchanged).
+- Change: a CASE arm in `expr_is_plain` (operand, each WHEN and THEN, ELSE all plain), with the property test extended
+  by CASE values and a CASE filter, CASE negatives in the refusal test (anonymous / named placeholder, `x AND 0`, IN
+  list, row value, subquery inside the CASE), and a stock keeper binding every kind of placeholder inside CASE in
+  UPDATE, DELETE, INSERT and SELECT, ad hoc and prepared. All of them passed.
+- Prediction (bead, before the build): upd_case_txn -100M to -140M; sel_case -140M to -200M; every other row within
+  +-0.1%. Kill: upd_case_txn gaining under 50M; any other row above +0.1%; a replicated time LOSE above 1%.
+- Result. Arms in one rch job on hz2 (parent 297d47109 cargo link 78fc4582710dc3c2, lever c76c9f7337c9c9d4; the
+  parent's 1,960 sources equal git, the lever differs only in connection.rs, equal to HEAD + patch). thinkstation1,
+  powersave, stock 3.54.1 (rl12/stock354) live, answers equal everywhere. Instructions:u, single ELFs, 5 reps, the A/A
+  copy within 0.09%:
+  - upd_case_txn_20000 1,749.8M -> 1,495.5M (-254.2M, -14.5%; x3.00 -> x2.56 stock), sel_case_20000 3,584.1M ->
+    3,349.1M (-235.0M, -6.6%; x5.85 -> x5.47). Both beyond the band.
+  - trig_values_20000 2,462.8M -> 2,467.6M (+4.7M, +0.19%; reps 2,467.4-2,467.7M against 2,462.8-2,463.1M):
+    above the posted +0.1% line, so the lever is reverted under it. Every other row within +-0.05%.
+  - Time (bd-es2im layout-averaged, K=6, 7 reps): runs 1, 3 and 4 were VOID (P-vs-Q nulls |z| 4.97, 6.09,
+    9.93; other projects' rch jobs ran on this host, load 30-58 on 64 cores); runs 2 and 5 are valid (null max |z|
+    1.69 and 2.61). 2b's arms ran in runs 1-3 only (they were dropped once its instruction line had decided it),
+    so run 2 is its one valid run: upd_case_txn cycles 0.905 and sel_case 0.935 WIN there, every other row TIE. Not
+    replicated; the instruction line decides the lever.
+  - The trig_values increase depends on the statement count: on the same two ELFs, perf stat instructions:u on
+    trig_values_2000 is 250.33M -> 249.80M (-265 per statement; callgrind agrees, 251.58M -> 251.03M) and on
+    trig_values_20000 2,462.9M -> 2,467.4M (+230 per statement). So something in 2b's path costs more as statements
+    accumulate (a cache keyed by statement text is the first suspect); not attributed further.
+- Retry condition: find what grows with the statement count on trig_values (callgrind at 2,000 and 20,000 statements,
+  both arms) and remove it; then rebuild and re-measure with stock live, the same lines. The keepers and unit tests
+  above are ready to reuse.
+
+## 2026-11-23 - WIN (landed as b9964a27f; inside every kill line, both instruction predictions missed): a rowid seek the cache answers on a resident cached leaf lands without a wait, and a probe scans the seek cache once; join_1M_to_pk_1000 -178.1M Ir, cpu 0.932 / 0.933 (bd-w4pr1.12, serial read lane round 13, lever SL2 v3)
+
+- Target: join_1M_to_pk_1000 (`SELECT count(*), sum(length(u.name)) FROM t JOIN u ON u.a = t.a`). Most of its 1M probes
+  into u are seek-cache hits on a cached leaf other than the cursor's own, which went through the async
+  table_move_to: try_table_seek_cache's load_page future and the seek wrappers, about 363 Ir a probe on b04628fe8
+  (the six functions that vanish from the lever's profile).
+- Retry of SL2 v2 (2026-11-21 entry, rejected at rowid_lookups_200k +1.75%). Its retry condition, met here: one slot
+  scan a probe with its answer handed to try_table_seek_cache, load_page's decode tail inlined, callgrind on
+  rowid_lookups (within +0.5%) and on the join (at least 100M) before any time run. PR1 (d95fb43fb, table descents
+  reuse the stack's clean pages) landed first, as the coordinator required.
+- Touched: `crates/fsqlite-btree/src/cursor.rs` only.
+  - try_table_seek_within_leaf: the newest slot on the current leaf first (SL1 v3); otherwise the first slot that
+    admits the target is answered synchronously when its leaf is resident (read_resident_btree_page_data), landing
+    as the cache hit in table_move_to lands. A per-cursor resident_seek_declined flag stops asking after the
+    reader's first refusal.
+  - The fast path's slot scan is kept in TableSeekCache as a 16 B hint (rowid, first admitting slot or none);
+    try_table_seek_cache starts there for that rowid (take_hint, used once); clear, push_front, the bench-only
+    front write and the test iter_mut drop it.
+  - load_page's tail in stack_entry_for_page, #[inline(always)] (with #[allow(clippy::inline_always)]).
+  - Keepers (btree lib): v2's test_try_table_seek_within_leaf_answers_resident_cached_leaves and
+    test_try_table_seek_within_leaf_hands_its_slot_scan_to_the_general_path (the general path starts at the
+    declined slot: a cache hit reading only its leaf; a hint for one rowid does not apply to another; a probe no
+    slot admits descends once; landings equal a reference cursor's).
+- Prediction (on the bead before the build): the join -180 to -280M Ir; rowid_lookups +0.0 to +0.25%; every other
+  row within +-0.1%; the join cpu a replicated WIN at 0.93 to 0.96. Kill: the join under 100M; rowid_lookups above
+  +0.5%; any other row beyond +-0.5% Ir; any replicated cycles or cpu LOSE; a keeper red or a mutant passing.
+- Result (b04628fe8 + diff 7c0a0dbe60bef144; one layout job on hz3, -j 2, K=6; parent fsqlite-cargo
+  63e323f2e4e6046b, lever 1e9a74882bd1f7b3; stock sqlite3 3.54.1 live; thinkstation1, load up to 31):
+  - Instructions (callgrind, single ELF, fresh copies of one database; answers equal): join 3,588.07M ->
+    3,410.00M (-178.1M, -4.96%; 1.9M short of the band); rowid_lookups_200k 2,485.81M -> 2,493.64M (+7.83M,
+    +0.315%, above the band, under the kill line). Judge Ir: memory_script_200k +0.36% (outside the +-0.1%
+    prediction, inside the kill line); every other row within +-0.02%.
+  - Why (cg_selfdiff per probe): on the join, try_table_seek_within_leaf +153.4 Ir while the async path vanishes
+    (table_seek_for_insert -181.1, load_page's future -62.0, the BtreeCursorOps / table_seek / CursorBackend
+    futures -102.8, finish_btree_op -17.4), with read_resident +13.4, the stack push / truncate +22.3,
+    is_page_dirty +14.6. On rowid_lookups the one scan runs in the fast path (+152.5) instead of
+    try_table_seek_cache (-117.4): the same scan costs ~35 Ir more there, plus load_page +5.1.
+  - vs stock 3.54.1: the join Ir x2.53 -> x2.40; cpu x2.22 -> x2.07 and x2.33 -> x2.17; cycles x2.30 -> x2.12 and
+    x2.39 -> x2.16.
+  - Time (runs 1 and 5 valid at max null |z| 1.58 / 1.75; runs 2-4 void at 3.15 / 4.23 / 6.82, the join a cycles
+    WIN in each): the join cpu 0.932 / 0.933 and cycles 0.921 / 0.905 WIN; no replicated LOSE. Single-run LOSEs,
+    not repeated: run 1 gb_id cpu 1.017 / cycles 1.033 at Ir 1.0000, gb_id_mod100k and rowid_lookups cpu; run 5
+    scan_filter_agg, gb_a_mod10, bulk_insert_1M_one_txn and memory_script_200k cpu.
+- Unit (b04628fe8 + the lever): btree lib 581 passed; m1 (hint one slot late) and m2 (hint not keyed by rowid) fail
+  the hand-off keeper with a descent ([2, 3] / [2, 4] read instead of the leaf alone); m3 (flag never set) fails
+  v2's keeper. Dropping the hint on push_front / clear is unobservable (every seek takes the hint before it changes
+  the slots): an equivalent mutant.
+- Gate (rch; b04628fe8 + diff 7c0a0dbe60bef144): clippy -D warnings btree, vdbe, core all targets clean; btree lib
+  581 passed; vdbe + core libs with golden_bytecode_snapshots and hot_arm_stream_reachability 5,480 passed; 28 core
+  join targets 105 passed; 69 core seek / rowid / cursor targets 175 passed; 25 e2e oracles 149 passed; the fsqlite
+  crate's 123 targets in 7 batches 1,105 passed; no failure. Three jobs were stopped by worker disk budgets or a
+  lost remote and rerun (no test had failed). rustfmt --check clean after wrapping two keeper assertions
+  (whitespace only, after the gate). ubs exit 0 (2,481 warnings against 2,426 on main's file: the keepers'
+  unwrap() / assert! setup). Landed on ad675517a: the commits since b04628fe8 touch core, codegen, pager and VFS,
+  not the cursor or its callers.
+- Retry / extend condition: the fast path's scan costs ~35 Ir a probe more than try_table_seek_cache's on
+  rowid_lookups_200k (+0.315%); a cheaper scan there (the admits test hoisted, slot 0 not tested twice) would take
+  the regression back under +0.1%. memory_script_200k's +0.36% was not attributed.
+
+## 2026-11-23 - REJECTED on its GAIN kill line (-2.9k Ir per FULL autocommit INSERT against at least -3k; prediction -5k to -9k): under the WAL append gate, the cross-process conflict scan is skipped when no commit was published since the batch's snapshot (bd-fuwx0, single-writer lane round 12, lever O-B1, the under-gate half only)
+
+- Target: the autocommit one-row INSERT's commit path, #9 in bd-fuwx0's cost map. Under the gate,
+  `conflicting_pages_since_batch_snapshots` made one boxed `conflicting_pages_since_snapshot` call per batch:
+  - candidate sort and dedup, a HashSet, a second (fast-returning) preflight;
+  - all for a horizon that, in a single writer, has not moved, so only the bd-o81ov EOF guard can answer.
+- Change: `WalBackend::conflict_horizon_unmoved_under_gate` (default false).
+  - The path-refreshing adapter and the WAL adapter answer true only in the states where that call passes its
+    pending-publication and recovery checks, takes `preflight_native_append`'s proven-baseline return, and finds
+    (commit_count, generation, last_commit_frame) not past the snapshot.
+  - The flush then skips the call when no conflict or route-watch page lies above the allocator base (the EOF
+    guard's only case). Every other case makes main's call.
+  - Files: `crates/fsqlite-pager/src/traits.rs`, `crates/fsqlite-pager/src/pager.rs`,
+    `crates/fsqlite-core/src/wal_adapter.rs`.
+- Not built: the bead's pre-gate half (skip the Phase-A conflict-page prediction, route-watch pages and baselines
+  when the horizon is unmoved before the gate), which was -5.8k of the band. It cannot keep outcomes identical:
+  - the prediction reads PagerInner's freelist (`freelist_metadata_dirty_with_inner`,
+    `durable_freelist_pages_with_inner`), which the file's in-process connections share and mutate without moving
+    the horizon (pager.rs 29964, 32975), so computing it later under the gate is not main's computation;
+  - `batch.conflict_pages` also feeds `conflicting_pages_across_group_commit_batches` and the bd-dk9ra refusal.
+  - The correction was posted on the bead before any measurement.
+- Arms: one rch job on vmi1153651, K=6 relinks each, the parent's 1955 source hashes checked against git.
+  - Parent: origin/main 8ad61918f. CLI 8c30aef350cefefa, mt-mvcc-bench da1a49513bda725b.
+  - Lever: the parent plus the patch. CLI e08f254f2240c31d, mt-mvcc-bench 90a02903fdf2968c.
+  - Stock: SQLite 3.54.1 (scripts/build_stock_sqlite3.sh) live in every run.
+- Result, exact counts (callgrind, whole process, io_uring refused, WAL on tmpfs, per unit = (N800 - N400)/400):
+  - FULL INSERT, 7 replicate pairs: parent median 180,407 (177,788 to 182,394), lever 176,915 (176,234 to
+    178,807).
+    - L - P: median -3,492 (-1.94%; x8.50 -> x8.34 stock's 21,224).
+    - The +/-2k spread is where the adaptive autocheckpoint runs: inside the run in 3 of 7 replicates per arm, at
+      close in 4. Grouped that way, the checkpoint-at-close replicates give -2.85k and the in-run ones -3.4k.
+    - The scan's own subtree went from 3,190 / 3,296 to 210 Ir per INSERT (-2.98k / -3.09k).
+  - Single runs: NORMAL -2,360 (-1.32%). txn10 -2,179 per transaction (-0.40%; x3.72 -> x3.71). Point SELECT +296.5
+    (+0.42%), and -217 on an A/A rerun: noise, since the change runs only under the append gate.
+- Result, perf stat instructions:u (the timing runs: io_uring allowed, 2 runs of 42 per arm, A/A at most +67 per
+  INSERT):
+  - FULL INSERT -2,856 / -2,888 per INSERT (-1.53% / -1.55%);
+  - NORMAL -2,934 / -2,967;
+  - txn10 -2,917 / -3,022 per commit;
+  - point -17 / -330 per SELECT (A/A -382 / -352).
+- Result, time (layout-averaged lines, K=6, two runs, both A/A valid):
+  - FULL INSERT: cpu TIE (-1.25%, -1.62%); cycles:u a replicated WIN (-1.42%, -2.04%). vs stock 3.54.1 on cpu:
+    x8.16 -> x8.06 and x7.89 -> x7.76.
+  - NORMAL and txn10: TIE.
+  - Point SELECT: cpu +2.43% LOSE in run 1 and +2.35% TIE in run 2, so not replicated.
+  - mt-mvcc-bench (--one-row-per-transaction, 200 rows per thread, 11 iters; stock is the bench's bundled 3.54.1):
+    - run 1 VOID: host load 43-50 from other projects, A/A 1.30 and 1.57;
+    - run 2: 4 writers L/P 1.007 TIE, 8 writers 0.980 TIE (A/A 0.995 and 0.980);
+    - no LOSE.
+- Why rejected: the precise estimators put the gain at -2.86k to -2.98k per FULL INSERT. Only the
+  checkpoint-mixed callgrind median (-3.49k) is past the line, and its per-replicate spread is larger than the
+  margin.
+- Gate on the lever (partial, since it does not land):
+  - clippy -D warnings (pager, core, all targets) clean;
+  - pager lib 1130 / 0, core lib 4203 / 0 (the bd-i0tn6 window test included);
+  - core keepers: one red, gh410 gh462_schema_only_readers_leave_repair_for_a_real_writer, with an identical
+    BusySnapshot on 8ad61918f;
+  - e2e cross-process batch: one red, the known bd-mc5pp;
+  - e2e concurrent batch: one red, the bd_3wop3_1_3 ordered-region timing assertion (see the bead).
+- Keepers (crates/fsqlite-core/tests/bd_fuwx0_lazy_conflict_validation.rs):
+  - the tests: a peer process commits a page the transaction wrote, also when both grow from the same end of file;
+    write skew in one process and across processes on one leaf; a read-only snapshot held across commits;
+  - 4/4 on main and on the lever; 3 of 3 red on a skip-all validation mutant.
+- Kept: commit 303c98293 on the local branch ob1-lazy-validation in /data/projects/frankensqlite-s10p (the patch
+  is scripts/lane_r12/lever_src.patch there). Evidence in the lane scratchpad's r12/ (cg/, cg_reps.txt,
+  cg_classes.txt, ir_abs.txt, time_verdict.txt, time1.json, time2.json, mt1b.json, mt2b.json).
+- Retry condition: together with a sound cut of the Phase-A prediction in the same commit-path lever.
+  - `freelist_metadata_dirty_with_inner` runs twice per commit, from `predicted_commit_pages_with_inner` and
+    `page_one_in_pending_commit_surface_with_inner`, without the early return that
+    `freelist_metadata_dirty_with_pending_free_pages` has. In r11's profile that is about 3.5k Ir of the
+    prediction's 4.7k.
+  - Computing it once, with inputs exact as of Phase A, would stack with this half.
+  - Or: an owner decision that -2.9k Ir (1.5%, a replicated cycles WIN) is worth one trait method.
+  - Do not retry the pre-gate skip of the prediction without carrying its Phase-A inputs (the PagerInner freelist
+    state and the read-cache images) into the batch.
+
+## 2026-11-22 - WIN (landed as 986d2ca38; inside every kill line, prediction missed low by 1.0M on rowid_lookups_200k, x5.46 -> x4.94 stock 3.54.1 in instructions): an eviction on a sparse access trace waits for one batched compaction instead of searching and moving the whole trace (bd-w4pr1.13.18, read/seek round 11, lever BF1)
+
+- Target: `S3FifoEvictionTracker::forget`, run on every page-cache eviction. Callgrind on main 5aa8fd2f7: 1,587 per
+  eviction, 297.5M of rowid_lookups_200k (11.9%, 187,524 evictions), 11.26M of each judged 1M-row scan (7,105
+  evictions). The read-path eviction (`take_clean_buffer`) does not consult the tracker; the trace is replayed only
+  by `evict_any`, the queue metrics and page snapshots. Records happen on admission only (two per miss), so the
+  live trace holds about two entries per resident page (1,000 of the 4,000-entry bound at the 500-page cache).
+- Touched: `crates/fsqlite-pager/src/page_cache.rs`. A new `AccessTrace` holds both trackers' history (S3-FIFO and
+  ARC), with the eager history's logical contents entry for entry. A forget on a sparse trace (no forget waiting and
+  live length under 3/8 of the bound, or forgets waiting and the physical length under 1/2) stores the page in an
+  open-addressing table (`ForgottenTracePages`, 1,024 slots of key and cut at the default cache, 8 KiB) with its cut,
+  the trace length at the forget; entries before the cut are dead, entries recorded after it live. One compaction
+  pass drops every waiting page's dead entries at half the bound, a half-full table, or a record into a full trace;
+  the front is popped only after a compaction. A forget on a denser trace removes the page at once with the old block
+  search. Records are unchanged.
+  - Keepers `test_bd_w4pr1_13_18_access_trace_forgets_like_the_eager_history` (an eager-history oracle at bounds 64,
+    128, 4,000 and 8,192 that must exercise readmission while a forget waits, a record into a full trace while
+    forgets wait, a forget above 4,096 physical entries while forgets wait, both compaction triggers, skipped and
+    eager forgets) and `test_bd_w4pr1_13_18_trackers_replay_the_eager_history_while_forgets_wait` (S3-FIFO and ARC
+    victims, snapshot and assignments equal to trackers replaying the eager history). Three planted mutants (a
+    waiting page's entries all die; a full trace pops without compacting; the 4,096 rule on the physical length)
+    each fail the oracle keeper. The two existing forget tests assert on the logical trace and, after a compaction,
+    on the physical ring; the block search is still checked directly for every length and ring layout.
+- Ledger preflight: 2026-11-11 (admission stamps in a map, ~250 per admission), 2026-11-12 (per-page count map; its
+  retry condition named this design: forget touches no trace entry and the consumers skip dead entries, with an
+  all-hits kill line), 2026-11-14 (lazy deletion with a page-to-slot map, cost on admission), S3F v1 / v2 (O(1) node
+  list; v2 killed by update_10pct_300k cycles, attributed by bd-v3i4s to its 176 KB tracker). BF1 adds no work per
+  admission and 8 KiB per tracker.
+- Prediction (bead, before the build): tracker forget 60-200 per call; rowid -240M to -285M; each 1M-row scan -9.0M
+  to -11.0M; write rows within +-0.3%; all-hits control within +-0.1%; rowid cycles and cpu a replicated WIN, every
+  other row TIE. Kill: rowid better by less than 200M; any row above +0.5% Ir or the all-hits control above +0.3%;
+  any replicated layout-averaged LOSE; an answer differing; clippy or the keepers red; a mutant passing.
+- Result. Parent = main 5aa8fd2f7, lever = parent + BF1, one rch job on ovh-a (clippy, keepers, mutants, then
+  layout_shuffle_pair.sh K=6; parent fsqlite-cargo 0239b49a6ad8d35b, lever a9d14f21b4e2118f). thinkstation1,
+  powersave, io_uring refused, stock SQLite 3.54.1 (rl12/stock354) live.
+  - Callgrind, single cargo ELFs: rowid 2,495.25M -> 2,257.75M (-237.5M, -9.52%; x5.43 -> x4.92 stock); all-hits
+    control +0.009%. `AccessTrace::forget` 331 per call: 252 of it the 375 compactions (126k each, about 63 Ir per
+    scanned entry), 79 the rest.
+  - Judge instructions (median of six layouts' minima, identical in both runs to 0.05M): rowid 2,506.4M -> 2,267.4M
+    (-239.0M, -9.54%; x5.46 -> x4.94); each 1M-row scan -9.0M to -9.5M (scan_filter_agg -0.78%, join -0.25%,
+    order_by_text_limit10 -0.79%, the GROUP BY rows -0.07% to -0.41%); delete -0.14%, update -0.09%, bulk -0.14%,
+    memory_script -0.27%.
+  - Time (bd-es2im layout-averaged, two valid runs, null max |z| 1.36 / 3.05): rowid_lookups_200k cycles 0.949 /
+    0.963, a replicated WIN (cpu 0.984 TIE / 0.970 WIN, a TIE); order_by_text_limit10 cycles 0.983 / 0.985, a
+    replicated WIN; no replicated LOSE (single-run LOSEs: update_10pct cpu run 1 and cycles run 2, memory_script
+    cycles run 1, group_by_1000_groups cpu run 2). Answers equal stock everywhere.
+  - MISSED: rowid -239.0M against -240M to -285M and tracker work 331 against 60-200 (the compaction loop costs about
+    63 Ir an entry, not 10-25); rowid cpu not a replicated WIN; order_by cycles a WIN where TIE was predicted.
+- Gate: Gate (rch; the lever on 5aa8fd2f7, 5b01fb9d1): clippy -D warnings fsqlite-pager (all targets)
+  clean; fsqlite-pager lib 1,132 and fsqlite-core lib 4,202 (+1) passed; T3+XP 268, PS 184, e2e (14 targets) 130;
+  the fsqlite crate in 7 batches, 1,104 passed in 125 binaries; all 0 failed. Landing tree (BF1 on 31ac790f3):
+  clippy fsqlite-pager clean, pager lib 1,132 passed; rebased with no conflict onto 95f4ee645 (42d0f716c changed
+  pager.rs's group-commit flush, not the page cache) and pushed as 986d2ca38. rustfmt: ignored crate. ubs
+  page_cache.rs: 0 critical; the 32 new warnings are the keepers' asserts, unwraps and clones and the table's masked
+  indexing.
+- Retry condition / next: the compaction loop (about 47M of the remaining tracker cost on rowid) could take a
+  cheaper membership test per entry (a bitmap prefilter in front of the table, or a bulk pass that skips entries
+  recorded after the oldest cut); measure that alone first, since the forget path is now under 0.4k per eviction.
+  take_clean_buffer's flat-slot search (about 0.4k per eviction) and InFlightReadLeader::finish's other work remain.
+
+## 2026-11-22 - REJECTED on its time kill line (gb_id cycles a replicated layout-averaged LOSE, 1.0104 / 1.0252, at Ir 1.0000), with select-index -1,423 Ir an execution (-2.2%) and the point rows -0.9% to -1.3%: a cursor open reads its root page and the page-1 header as the image the transaction shares, not as a 4 KiB Vec copy (bd-05xlf, read/seek round 11, lever 3a)
+
+- Target: `VdbeEngine::open_storage_cursor`, two `SharedTxnPageIo::read_page` calls per cursor open (the root, then
+  page 1 through `btree_cursor_page_layout_from_page_one`, which keeps 100 bytes); `read_page` is
+  `get_page(..).into_vec()`, a 4 KiB allocation and copy of an image the transaction already shares.
+- Touched (not landed; patch `scripts/layout_patches/l3a.patch` in frankensqlite-perf5-shm, sha256 fef9c1ced3fcc5c0,
+  and local branch lane-l3a-r11 1de7d0a1d with a keeper): `crates/fsqlite-vdbe/src/engine.rs`. Both reads use
+  `read_page_data` and parse from `as_bytes()`; error classes, the MemDatabase fallback, the zero-page check and the
+  read witness are unchanged. Keeper `test_bd_05xlf_cursor_layout_reads_page_one_without_a_copy` (a reader whose
+  `read_page` fails the test must still give the page-1 layout, reserved bytes and UTF-16le; a page-1 `Busy` from
+  `read_page_data` must propagate); the parent's `read_page` copy (mutant m0) fails it.
+- Prediction (bead, 2026-11-21, re-checked on 2026-11-22 before the build): select-index -400 to -900 an execution;
+  select-rowid within 0.15k; insert-autocommit -0.2% to -0.6%; point rows -0.3% to -0.8%, multicol -0.2% to -0.5%;
+  the judged rows within +-0.05%. Kill: select-index better by less than 300; any row above +0.5% Ir; select-rowid
+  above +0.15k; any replicated layout-averaged LOSE, cpu or cycles; an answer differing; a keeper red.
+- Result. Parent = main 5aa8fd2f7, lever = parent + 3a; the CLI pair (K=6) and both probe arms in one rch job on hz4
+  (parent fsqlite-cargo cc150df888106ecd, probe 63bef4b6dd86fbe6; lever a25231cbcecf2fd4, 368e2ab7dd4e92b1).
+  thinkstation1, powersave, io_uring refused, stock SQLite 3.54.1 live.
+  - select-index 64,064 -> 62,641 (A/A 64,022; x11.63 -> x11.37 stock); select-rowid 8,665 in every arm;
+    insert-autocommit +0.1% (A/A +0.04%). Sweep, two runs: point_rowid -0.87%, point_hot -1.14%, point_sec_key
+    -1.29%, multicol -0.44%, rowid_lookups 0, every row a replicated TIE in time. Judged rows within +-0.013% Ir.
+    Answers equal stock everywhere.
+  - Time: run 1 VOID (null max |z| 6.75; its write rows overlapped another lane's stock callgrind at 18:35-18:36Z);
+    runs 2 and 3 judge (null max |z| 3.06 / 2.66): gb_id cycles 1.0104 (T 1.00%) / 1.0252 (T 1.75%), a replicated
+    LOSE at Ir 1.0000 (1.0227 in the void run too). KILL LINE FIRES. Every other row a replicated TIE.
+  - MISSED (beyond): select-index -1,423 against -400 to -900, the point rows beyond -0.8%. MISSED: insert-autocommit
+    no gain.
+- Gate before the verdict (local branch): clippy vdbe (all targets) clean; vdbe page-1 and cursor-open tests 20,
+  libs btree 579 / core 4,202 / vdbe 1,264, goldens + hot-arm 9, T1+T2 79, all 0 failed.
+- Retry condition: with lever 3's remaining cursor-open cost (the page-1 layout cached per transaction) in the same
+  lever, so a judged row moves beyond its T; or the same two ELFs re-judged if a later finding shows gb_id's cycles
+  move between same-source builds (bd-v3i4s's N1 two-build null found none in 28 tests, so this kill stands as a real
+  cost until then). Main has since replaced gb_id's sorter (31ac790f3, lever GR), so on a base after it the row
+  that killed this lever runs another program; a retry there needs its own prediction and the same kill lines.
+
+## 2026-11-22 - WIN (landed as be2bce0d3; inside its prediction; trig_cte x14.40 -> x11.57 stock 3.54.1 in instructions): a trigger body INSERT, UPDATE or DELETE runs its compiled program without the dispatcher's per-statement validation and rewriting (bd-fpr5g, trig lane round 1, lever 3b)
+
+- Target: bd-fpr5g's script, an AFTER INSERT trigger with a WHEN guard and an INSERT and an UPDATE in its
+  body, over 20,000 rows. After lever 3a every bound body statement still went through the whole statement
+  dispatcher on every firing. Callgrind on main 488ae3f6a: differential trig_src variants (one or two copies
+  of each body statement, a WHEN that never holds, no trigger), stock 3.54.1 on the same files.
+  - body INSERT 36.4k instructions per firing: its program 21.9k, the dispatcher ~14.5k;
+  - body UPDATE 54.6k: its program 20.6k, the dispatcher ~34.0k. That covers two placeholder
+    canonicalizations that clone the statement (a CASE is not "plain"), the UPDATE arm's limit-scope copy,
+    semantic validation (~2.2k), the subquery-rewrite walk, the statement text and the cache lookup.
+  - Stock pays 2.75k and 2.94k for the whole statements.
+- Ledger preflight: levers 1, 2 and 3a (2026-11-18 to 2026-11-20) are this bead's WINs; no entry covers a
+  trigger body's dispatcher. The 2026-11-22 C API L3 rejection (sqlite3_step reusing prepare_v2's
+  statement) is the nearest. It removed a second parse, which is not where this cost sits.
+- Change (connection/insert_batch.rs, connection.rs):
+  - Each TriggerBodyTemplate holds a kernel slot. After the template's statement has run once through the
+    ordinary dispatcher and succeeded, the slot takes the compiled cache's own entry for the text that
+    dispatcher compiled, with the GH#516 replay identity.
+  - Admitted (once per template): a one-row INSERT ... VALUES, an UPDATE or a DELETE with no WITH, FROM,
+    RETURNING, ORDER BY, LIMIT, upsert, subquery or row value, already in canonical form, that no outer-layer
+    rewrite changes, on a MAIN table that has no triggers of its own and is not a view, a virtual table, a
+    sqlite_ table, a TEMP name or an attached target.
+  - Per row, falling back to the ordinary path otherwise: the identity is unchanged and the cache still holds
+    that program; foreign keys are off; the cache is not bypassed; no statement or compat tracing is on; the
+    connection is not at an autocommit retry boundary or a committed-pager refresh point; it is not
+    encryption-locked.
+  - The kernel keeps every step with an effect, in the dispatcher's order. INSERT runs the shared GH#516
+    kernel (execute_insert_dispatch with the program); UPDATE and DELETE run their arm's tail for a target
+    without triggers.
+- Prediction (posted before the build, restated on the rebased profile): -450M to -700M instructions on
+  each trigger row. Kill lines: trig_cte gains less than 250M; any answer differs; any keeper red; any
+  non-trigger row worse than +0.5% Ir; any replicated cycles or cpu LOSE above 1%.
+- Defect found before measuring: the first lib test run counted 85 kernel runs where 170 were due. The
+  admission used statement_may_target_attached_schema, a coarse dispatcher gate that holds for every UPDATE
+  and DELETE. It now uses the exact delegation predicate, attached_target_schema(target) == None.
+- Measured (scratchpad trig1):
+  - Arms: parent ab9184258 and lever (the landed diff on it, patch 6eee026e2a060ecb), built in one rch job on
+    hz4. Cargo-link sha256 69b5758e9e0544ed (parent) and e286ba2202681e5d (lever).
+  - The parent's 1,954 sources equal git. Only the lever ELF carries the kernel. Every ELF matches the
+    worker's manifest and gives stock's output on the smoke script.
+  - Conditions: thinkstation1, powersave, stock 3.54.1 (scripts/build_stock_sqlite3.sh) live, answers equal
+    on every row and run.
+
+  | row | Ir lever / parent (single ELF, 5 reps; A/A within 0.06%) | x stock, Ir | x stock, cycles | x stock, cpu |
+  |---|---|---|---|---|
+  | trig_cte (the bead's script) | 0.803 (-651M) | 14.40 -> 11.57 | 40.2 -> 26.6 | 33.7 -> 22.6 |
+  | trig_src | 0.790 (-646M) | 11.83 -> 9.35 | 33.4 -> 21.8 | 27.9 -> 18.3 |
+  | trig_values | 0.787 (-669M) | 2.69 -> 2.11 | 6.7 -> 4.7 | 6.5 -> 4.5 |
+  | notrig_cte, ctl_insert_txn, ctl_select | 1.0000, 1.0010, 1.0001 | | | |
+
+  - Layout-averaged time (bd-es2im lines, K=6, 7 reps):
+    - Run 1 was VOID (a Q-vs-P null at |z| 4.31). My judge's process name did not match the lanes'
+      bracketed bench pattern, so another lane's judge could start alongside it. Run 3 ran as
+      trig1/trig_probe.py, which the pattern sees.
+    - Runs 2 and 3 are valid (max |z| 2.64 and 2.93). Every trigger row is a replicated WIN on cycles and
+      cpu (lever/parent 0.63 to 0.70). Every control is a replicated TIE.
+    - The cycles and cpu columns in the table are from run 2.
+- Keepers:
+  - insert_batch.rs lib tests count kernel runs: exact counts on :memory: and a file; none with foreign keys
+    on; one ordinary run after CREATE INDEX on the target, then integrity_check ok; a trigger on the target
+    keeps that statement off the kernel.
+  - bd_fpr5g_trigger_body_cache_under_cte.rs `kernel_run_trigger_bodies_follow_targets_pragmas_failures_and_rollback`,
+    stock 3.54.1, :memory: and a file.
+- Gate (rch, on the lever commit over ab9184258):
+  - clippy -D warnings, fsqlite-core all targets: clean; it ran clean again on the rebased commit;
+  - the kernel lib tests: 2 passed;
+  - 38 trigger / conflict / RETURNING keeper targets: 190 passed, 0 failed;
+  - fsqlite-core --lib: 4,203 passed, 1 failed. The failure is bd-c2mbm's load flake, the identical
+    assertion; it passed on its rerun in the same job;
+  - 8 e2e trigger targets: 51 passed;
+  - the fsqlite crate: 125 binaries, 1,104 passed, 0 failed.
+  - The rebase onto b04628fe8 crossed main's btree, rowid-allocator, WAL-open, ignore_check_constraints and
+    trigger-DQS commits. The UPDATE / DELETE arms and execute_insert_dispatch are byte-identical across it,
+    and the kernel's cache check inherits the new ignore_check_constraints key.
+- Retry condition: none for this lever.
+- Left on the row (main 488ae3f6a per inserted row): the outer replay's ~34k (lever 5, scoped on bd-fpr5g:
+  GH#516's kernel refuses SELECT sources and any temp root); per firing ~19k outside the body statements, of
+  which ~13k is the outer INSERT losing its retained cursors to the body programs on the one cached VDBE
+  engine; and the body programs themselves (~21k each against stock's ~3k whole statements). The bead's
+  script is x11.6 stock in instructions against its 5x target.
+
+## 2026-11-22 - WIN (landed as 31ac790f3; beyond its prediction, inside every kill line): a GROUP BY on the rowid alone streams the table scan's groups in rowid order with no sorter; gb_id -6,593.1M Ir on 488ae3f6a (bd-w4pr1.12, serial read lane round 13, lever GR v3; v1 never fired, v2 rejected)
+
+- Target: gb_id's inner `SELECT id g, count(*) n FROM t GROUP BY id` (1M rows, 1M groups). Its program inserted every
+  row into a sorter, sorted it and read it back, although the table scan already delivers the rows in rowid order.
+  Stock 3.54.1 walks the rowid order with no sorter.
+- Touched: `crates/fsqlite-vdbe/src/codegen.rs`, codegen_select_group_by_aggregate only. With no index input (no
+  equality, IN, range or walk, no covering index), a rowid table, no tracked key spellings for min() / max(), and one
+  key that resolves to the rowid (the INTEGER PRIMARY KEY, `rowid`, a table-qualified spelling), the grouping
+  streams: the scan's row body jumps into the group accumulation, which steps the table cursor itself and falls
+  through to the final group past the last row. The streamed scan's cursor stays open to Halt. Keeper
+  `grouping_on_the_rowid_alias_streams_in_rowid_order_without_a_sorter` in
+  `crates/fsqlite-core/tests/bd_group_by_depth_oracle_probe.rs` (file-backed, strict mem-fallback rejection, rusqlite
+  oracle on ordered results, the VDBE's SorterInsert count; every statement runs and the failure lists each broken
+  one; two HAVINGs on finalized outputs among the streaming statements).
+- Prediction (made on d52d8908b): gb_id -500 to -650M Ir; the a-keyed and expression-keyed GROUP BY rows within
+  +-0.05%; every other row within +-0.1%; gb_id cpu a replicated WIN at 0.80 to 0.90. Kill: gb_id under 350M; any
+  other row beyond +-0.5% Ir; any replicated cycles or cpu LOSE; answers unequal to stock; the keeper red on the lever,
+  green on main's codegen or green on mutant m1 (streams under a range or IN input too).
+- v1 (never fired): the condition matched GroupByKey::Column with is_ipk, but parse_group_by_output keys a GROUP BY
+  on the INTEGER PRIMARY KEY as GroupByKey::Expression. Fixed by resolving the key through resolve_column_ref.
+- v2 (REJECTED on kill line 1, gb_id +3,642.5M Ir, +84.7%): the scan stream's `Next cursor` in the accumulation
+  came after pass 1's `Close cursor` in program order. A cursor op after its close makes the program need the
+  MemDatabase, so the statement went to the connection's in-memory GROUP BY evaluator (SqliteValue::cmp +2,409 Ir a
+  row, BTreeMap insert +1,231). Retry condition met by v3: the streamed scan keeps its cursor open.
+- First v3 measurement, WITHDRAWN as landing evidence: arms on d52d8908b, inside the GROUP BY spill-bug window
+  (after e0e82ede7, before 269f4b0ac; rules_common MEASUREMENT HAZARD). Every arm answered every row as stock did
+  there (the parent ran its full 4,299.96M), and GR measured -1,150.2M Ir with gb_id cpu 0.787 / 0.717 WIN, but the
+  rule forbids measuring on that window, so it was re-measured.
+- Result (v3 on origin/main 488ae3f6a; tree 488ae3f6a + GR's codegen hunks, one layout job on vmi1227854, -j 2, K=6;
+  parent fsqlite-cargo 8eb631b53ba4b25a, lever 1caf8d77745f203f; stock sqlite3 3.54.1 live; thinkstation1, governor
+  powersave, load 4-8):
+  - Instructions (callgrind, single ELF, fresh copies of one database; answers equal stock): gb_id 9,725.47M ->
+    3,132.35M (-6,593.1M, -67.8%). gb_id_mod100k -3.6K, group_by_1000_groups +29K. The prediction is missed, far
+    beyond its range: on this main the sorter GR removes spills (see the finding below), so its cost is the spilled
+    sort and merge, not d52d8908b's in-memory sort.
+  - vs stock 3.54.1: gb_id Ir x7.34 -> x2.36; cpu x6.29 -> x2.89 and x6.35 -> x2.83; cycles x5.63 -> x2.25 and
+    x5.54 -> x2.23.
+  - Time (layout-averaged, runs 2 and 3 valid at max null |z| 2.01 / 2.13; run 1 void at 3.27 with gb_id a cpu and
+    cycles WIN): gb_id cpu 0.459 / 0.446 and cycles 0.400 / 0.402 WIN; no replicated LOSE. Single-run LOSEs, not
+    repeated: run 2 rowid_lookups_200k cycles 1.019 and update_10pct_300k cycles 1.026 (run 3: 0.988 WIN, 0.998 TIE),
+    both at Ir 1.0000. Every other row's Ir within 0.06%.
+- Unit (488ae3f6a + diff 072d76a76ef2eed6): the keeper's target 5 passed on the lever; on main's codegen the keeper
+  fails on its 7 streaming statements over t (one SorterInsert a row), answers equal stock; on m1 it fails 3 ways
+  (range and IN statements answer in index order, the range one with no sorter).
+- Gate (rch; 488ae3f6a + diff 072d76a76ef2eed6): clippy -D warnings vdbe + core all targets clean; vdbe + core libs
+  with golden_bytecode_snapshots, hot_arm_stream_reachability and issue_531_grouped_index_input 5,489 passed; 22 core
+  aggregate targets 55 passed; 18 window targets 68 passed; 15 plan / EXPLAIN-pinning targets 109 passed; 25 e2e
+  oracles 149 passed; 27 extra core / e2e targets that group on a rowid-like key 2,080 passed, 1 failed; the fsqlite
+  crate's 123 targets in 7 batches 1,104 passed, 0 failed. The one failure,
+  bd_4t938_table_function_forward_reference (`SELECT j.value, t.id FROM json_each(t.tags) AS j LEFT JOIN t`: frank
+  Ok([]), stock 3.54.1 an error), fails identically on main's codegen. After PR1 (d95fb43fb, cursor.rs) landed, on
+  71ee5c412 + GR (diff e6b078c9d5cbc3c4): clippy clean, libs + goldens 5,491 passed, aggregate 55 and plan 109 passed.
+  Landed rebased onto 82d391472 (core-only commits in between). rustfmt: ignored crates (vdbe, core). ubs on the test
+  file: exit 0 (87 warnings against 80 on main's file: the keeper's unwrap() / assert! setup).
+- Keeper defect found on the way: a bare-column statement (`SELECT id, b, count(*) FROM t GROUP BY id`) added to the
+  keeper without a unit run is refused by parse_group_by_output on every codegen ("result column not in GROUP BY
+  clause"), which strict mode surfaces; replaced by `SELECT count(*), id, avg(a) FROM t GROUP BY id`.
+- Measurement trap found on the way (judge harness, not changed): the A/A group Q reuses P's ELF files, so each P
+  ELF serves two arms and each L ELF one. On a host that evicts page cache mid-run, the L files lose residency first
+  (fincore 80 s after a run: P ELFs 3,104..6,852 resident pages of 33,986, L.s2 29), and L alone pays extra faults
+  and kernel time that the Q null cannot see. In the write rows (the only ones that record faults) of this lever's
+  d52d8908b judgements and lever DS's, every cpu-only LOSE at TIE cycles had an L-only fault excess in the same row
+  (+30..+300 per-seed median faults in most seeds), and every row whose L faults equalled P's was a TIE. An excess
+  does not always cross the threshold (bulk_insert_1M_one_txn in GR run 4: +193..+280 faults, cpu 1.013 TIE).
+  Worth retrying DS's update_10pct_300k verdict once the A/A group has its own file copies or the ELFs are
+  pre-faulted.
+- Finding on main, not this lever (retry condition for a new lever): between d52d8908b and 488ae3f6a the parent's
+  gb_id went 4,299.96M -> 9,725.47M and gb_id_mod100k 2,646.33M -> 9,283.20M (x1.08 -> x3.78 vs stock). On
+  gb_id_mod100k: compare_sorter_rows +2,460.9M, SorterCursor::sort +2,363.6M, SqliteValue::cmp +1,513.9M, the spill
+  reader / run iterator / spill_to_disk about +300M, while sort_rows_by_single_integer_key's (i64, u32) quicksort fell
+  from about 330M to 44M: a spilled sorter sorts and merges with the generic record comparator, not the
+  single-integer-key path. GR removes this cost only for rowid groupings.
+- Retry / extend condition: a GROUP BY whose key is not the rowid but arrives in key order from the scan (none today
+  without an index) could stream the same way; the spilled-sorter finding above is the next lever for every other
+  large GROUP BY whose sorter spills (gb_id_mod100k x3.78 vs stock). GR needs revisiting if
+  codegen_select_group_by_aggregate ever scans in reverse (it always opens with Rewind; reverse_unordered_selects
+  reaches only plain SELECT scans).
+
+## 2026-11-22 - FEC OFF BY DEFAULT (owner decision, landed as 7d15bd341; a cost removed from the default commit, not a win against stock): WAL-FEC repair-symbol generation is opt-in on every API (bd-71vt5, bd-yt7te)
+
+- Decision: bd-71vt5 (2026-11-17), kept on 2026-11-21 after bd-1hi.11 made a writable open repair damaged WAL frames
+  from the symbols. Generation runs only for a database opted in with `PRAGMA raptorq_repair_symbols = N > 0`.
+- Touched:
+  - `crates/fsqlite-wal/src/{lib.rs,wal_fec.rs}`: DEFAULT_RAPTORQ_REPAIR_SYMBOLS 2 -> 0.
+  - `crates/fsqlite-core/src/connection.rs`: no worker or sidecar at budget 0. A connection that cannot run the worker
+    now refuses the opt-in, and refuses an opted-in database at open, instead of skipping generation.
+  - Tests in fsqlite-core, fsqlite-cli, fsqlite and fsqlite-c-api; README (opt-in, and repair at open once opted in).
+- Measured (single-writer lane round 9, base 4c729b0cf):
+  - Shape: CLI one-row autocommit INSERTs at synchronous=FULL; per commit = (N1200 - N200)/1000; 7 rotated reps, perf
+    stat. Arms from one rch job on hz2: main 419dc3522daaac25 and the change 139017b30211f4fa. Stock sqlite3 3.54.1
+    ran live, and main ran twice as A/A.
+  - User instructions: 246.4k -> 177.7k on tmpfs (x12.2 -> x8.8 stock), and 318.0k -> 177.2k on disk (x15.8 -> x8.8).
+    The disk figure is approximate: main's A/A pair was 4.4% apart there, because the worker runs on background threads.
+  - CPU: 172.7 -> 116.6 us on tmpfs, 402 -> 286 us on disk.
+  - Syscalls: 37.7 -> 27.8 on tmpfs, 39.4 -> 27.8 on disk.
+  - -wal-fec written over 1,200 commits: 3.9-10.2 MB -> none.
+  - Wall time per commit is unchanged within noise (generation runs after the fsync), so no time claim is made.
+- Retry condition for default-on (from the decision): generation's per-commit cost below about 5% of a FULL commit,
+  or the owner asks for self-healing by default.
+
+## 2026-11-22 - WIN (landed as d95fb43fb; inside its prediction on rowid_lookups_200k, x5.86 -> x5.44 stock 3.54.1 in instructions): a table descent reuses the clean pages its previous descent left on the cursor's stack, as stock's moveToRoot keeps the root (bd-t0g9w, read/seek rounds 9-10, lever PR1)
+
+- Target: the scorecard's worst row, rowid_lookups_200k (200k random rowid probes into a depth-3 table; x5.83 stock
+  3.54.1 in instructions on the scorecard), and bd-t0g9w's per-entry table seek of index-driven lookups. A probe the
+  seek cache does not answer cleared the cursor's stack and loaded the root, then every page below, again.
+- Touched: `crates/fsqlite-btree/src/cursor.rs` (`table_seek_for_insert`; the new `PageReader::tracks_dirty_pages`,
+  default false, true for `TransactionPageIo`; the keeper), `crates/fsqlite-vdbe/src/engine.rs`
+  (`SharedTxnPageIo::tracks_dirty_pages`).
+  - At each depth the descent keeps the entry the previous descent left there when it is the page about to be read
+    and the reader says this transaction has not changed it: `load_page`'s stack-top elision rule along the path. The
+    first page off the path truncates the stack. A seek-cache or SL1 same-leaf hit leaves only the leaf, so the next
+    descent reloads the root.
+  - Only readers that track dirty pages qualify (`TransactionHandle::is_page_dirty` defaults to `true`), so
+    MemPageStore keeps the full descent.
+  - Keeper `test_table_descent_reuses_its_clean_path_and_reloads_pages_a_peer_cursor_rewrote`: a reusing cursor, a
+    reference cursor that never reuses, and a writer that splits, grows and shrinks the tree under both, uncommitted;
+    answers, positions and payloads must match and the reuse must read far fewer pages.
+- Ledger preflight: SL1 v3 (landed), SC8 v1-v4 (v4 landed 4e15416e8), SL2 v1/v2 (rejected; v2 added a slot scan to
+  every probe no slot admits, rowid_lookups +1.75%), DEC v1, bd-k96op / bd-y8zgm. None reused the descent's upper
+  pages.
+- Round 9 (base 47ec41f99, stock 3.46.1 for the read set): rowid_lookups -7.06%, the bd-79p0a statements -2.8%, a
+  layout-averaged rowid_lookups WIN (cpu 0.952 / 0.961, cycles 0.935 / 0.935), no replicated LOSE; not landed before
+  the session ended. Rebased with no conflict over CL1 (009856eb4), SC8 v4 (4e15416e8), AFC (f921f63c4), secure-delete
+  (588b17d07) and the freeblock fix (467491919); re-predicted on the bead before the rebuild.
+- Prediction (bd-t0g9w, 2026-11-21, before the rebuild): rowid_lookups -170M to -200M Ir; join 0 to -12M;
+  memory_script -5M to -35M; bd-79p0a statements at 40,000 rows -2.0% to -3.2%, at 400 rows within 0.1%;
+  select-index / select-rowid / insert within 0.1%; every other row within 0.1%; rowid_lookups cycles and cpu a
+  replicated layout-averaged WIN. Kill: any judged row above +0.5% Ir; rowid_lookups better by less than 4% or the
+  bound statement by less than 2%; any replicated layout-averaged LOSE; answers differing; a keeper red; the
+  dirty-reuse mutant passing.
+- Result. Parent = main 579ab83ce, lever = parent + PR1; the CLI arms in one rch job (layout_shuffle_pair.sh, K=6,
+  hz4; parent fsqlite-cargo b5ec3211adbb26b3, lever 9651a9f38d4fca6e), the probe and statement-loop arms in one
+  second job (hz4; probe 36844a63cd0ef0df / c420288320f2ea6d, loop 72ebbc27de19036f / 5607d57725080d00). Every ELF
+  matches its manifest and stock on the smoke script; the parent's sources equal git. thinkstation1, powersave,
+  io_uring refused, stock SQLite 3.54.1 (rl12/stock354) live in every run.
+  - Read set and write rows (two layout-averaged judgement runs; instructions are the median of the layouts' minima,
+    identical in both runs to 0.01M):
+
+    | row | stock 3.54.1 | parent | PR1 |
+    |---|---|---|---|
+    | rowid_lookups_200k | 459.2M | 2,689.9M (x5.86) | 2,499.3M (x5.44), -190.6M, -7.09% |
+    | join_1M_to_pk_1000 | 1,420.4M | 3,608.9M | -1.45M (-0.04%) |
+    | memory_script_200k | 1,692.2M | 3,219.7M | -0.22M / -0.38M |
+    | every other row | | | within +-0.02% |
+
+  - bd-79p0a statements (rs9/aggloop.py, 7 reps, A/A arm within 0.03%): 40,000 rows bound 31.112M -> 30.229M
+    (-2.84%), literal 30.188M -> 29.306M (-2.92%), count bound 30.950M -> 30.068M (-2.85%), count literal
+    30.027M -> 29.145M (-2.94%); x5.47 -> x5.32 stock on the bound statement. 400 rows within 0.02%.
+  - prepared-dml-probe (rs6_lookup.py, 7 reps): select-index 63,904 -> 63,983 (+0.12%; A/A +0.17%), select-rowid
+    8,616 both, insert-autocommit 140,333 -> 140,321.
+  - Time: bd-es2im layout-averaged, K=6. Run 2 was VOID (null |z| 5.18 on gb_a_sum_c cycles and 3.14 on gb_id, two
+    of the error rows below) and was replaced by run 3, so runs 1 and 3 judge (null max |z| 2.51 / 2.89):
+    rowid_lookups_200k cycles 0.948 / 0.925, a replicated WIN; its cpu 0.961 WIN / 0.997 TIE (T 7.5%), a TIE.
+    No row a replicated LOSE (single-run LOSEs: scan_filter_agg cpu, order_by_text_limit10 cycles, memory_script cpu,
+    and the error rows). Void run 2, for the record: rowid_lookups cycles 0.950, cpu 0.981.
+  - Main defect seen in these runs (not PR1's): the arms were built at 579ab83ce, inside bd-46l13's window, so
+    gb_id, gb_a_sum_c and gb_id_mod100k fail in both arms with "synchronous VFS temp file I/O unexpectedly returned
+    Pending" (reported from this lane). Those three rows measure an error path and are judged instead from round 9's
+    run (pre-window binaries, the same PR1 code, stock 3.46.1): a replicated TIE on cpu and cycles, Ir 1.0000.
+  - MISSED: memory_script -0.2M against -5M to -35M (SC8 v4's eight slots now answer its probes, so few descents
+    remain); rowid_lookups cpu not a replicated WIN (its cycles are); select-index +0.12% against 0.1% (inside its
+    A/A spread of +0.17%).
+- Mutant (never committed): the descent reuses dirty pages too (`&& (true || !is_dirty)`). On 579ab83ce + PR1 it
+  PASSED the round-9 keeper: SC8 v4's eight-slot seek cache answered the keeper's revisited targets from their cached
+  leaves, so no probe descended through a dirty root. The keeper now clears both cursors' seek caches before every
+  probe; on main 94395a013 + PR1 the mutant fails it at "peer writes: target 106" (rch vmi1227854, rc 101).
+- Gate, two trees, rch.
+  - 579ab83ce + PR1 (9061b48d4): clippy -D warnings btree, wal, pager, vdbe, core (all targets) clean; lib btree 576,
+    wal 1,263, pager 1,126, vdbe 1,189, core 4,201; goldens 8 + hot_arm_stream_reachability 1; T1+T2 (bd_79p0a,
+    bd_d4rbi, bd-5i14u, bd_aavtp, join_aggregate_lookup_oracle, bd_kcf1h among them) 79; T3+XP 268; PS 184; EQP 100;
+    e2e (14 targets, --test-threads=1) 120; the fsqlite crate in 7 batches of up to 19 targets, 1,103 passed in 125
+    binaries: all 0 failed. A second e2e run of that tree hit bd-1epn5's "Rowid out of order"; that base predates its
+    fix 87b4a8741.
+  - 94395a013 + PR1 with the stronger keeper (9ee59eafe), after f5c997356 (auto_vacuum) landed in cursor.rs and
+    engine.rs: clippy btree, wal, vdbe (all targets) clean; lib btree 579, wal 1,263, vdbe 1,189, core 4,201; goldens
+    8 + 1; T1+T2 79; bd_1q134_auto_vacuum_oracle 6; auto_vacuum_stock_database_write_guard + stock_file_variant_matrix
+    16; e2e 124; the mixed stock+fsqlite explicit-writer test 30 runs, 0 failed, no "out of order"; the fsqlite crate
+    1,103 passed, 1 failed: agg_index_range_oracle grouped_index_order_streams_and_matches_sqlite (its strict-HAVING
+    assertion, stale on that base; main updated the test in 8f0c8ac6d, bd-4uurt).
+  - Landing tree (PR1 on 488ae3f6a; the 107 commits after 94395a013 touch none of PR1's functions or callers):
+    clippy -D warnings btree, vdbe, core (all targets) clean; btree lib 579 (the keeper among them), fsqlite lib 750,
+    agg_index_range_oracle 7 (rch vmi1227854), all 0 failed. rustfmt --check cursor.rs clean (engine.rs: ignored
+    crate). ubs cursor.rs: 0 critical; the new findings are the keeper's test inventory and the four `stack[depth]`
+    indexings right after the entry at that depth is matched or pushed. Pushed on 86d102bdf (4 later commits, none in
+    PR1's files) as d95fb43fb.
+- Retry condition / next: the SL1 and seek-cache hits still drop the root (a v2 could keep the path when the same
+  leaf lies under the same parent; SL1's keeper pins the current stack shape). On rowid_lookups the interior page
+  below the root is reused only when two probes share it; its load still decodes the cell pointers on a memo miss.
+  Where rowid_lookups_200k's probe goes after PR1 (callgrind of the lever's fsqlite-cargo ELF, statement minus open,
+  per probe of about 12.4k callgrind Ir): table_move_to 10.5k, of which load_page 7.2k and the page-cache miss
+  (get_nonresident_page) 5.9k; inclusive and nested inside it: read_page_copy 4.6k, InFlightReadLeader::finish 2.3k,
+  trim_to_page_budget 2.1k, take_clean_buffer 1.9k, S3-FIFO forget 1.5k (first_access_trace_position 1.1k). The VDBE
+  loop 1.6k.
+
+## 2026-11-22 - REJECTED on two kill lines (callgrind one-key cost +73.8 Ir a statement against +60; its own keeper red: an admitted one-key count over a TEXT column takes a different plan bound than literal), with multicol_eq_1000 x7.20 -> x5.37 stock 3.54.1 and its cpu and cycles replicated WINs: a literal SELECT of aggregates or columns over ANDed integer keys runs parameterized only when its keys are exactly an ascending index prefix (bd-w4pr1.13.18, read/seek round 10, lever L5 v3)
+
+- Target: multicol_eq_1000 of the read sweep (`SELECT count(*), sum(val) FROM s WHERE g = <int> AND h = <int>`, 1,000
+  distinct literal pairs, each its own autocommit statement). Retry of L5 v2 (2026-11-15 entry below), whose keeper
+  kill line fired on a bare column beside an aggregate over a key left beside the index prefix.
+- Touched (never committed to main; patch `scratchpad rs9/l5v3_v1_p1.patch` of the read/seek lane, applied in a
+  scratch worktree as `lane-l5v3-r10`): `crates/fsqlite-core/src/connection/literal_params.rs` (the first key stays
+  `key_column`, further keys in `more_key_columns: Vec<String>`, `aggregate: bool`; a list mixing aggregates and
+  columns stays text), `crates/fsqlite-core/src/connection.rs` (`literal_statement_may_run_parameterized`: an
+  aggregate or ANDed keys also need a rowid table with no partial index and either the rowid alias alone or distinct
+  keys that are exactly the leading columns of an ascending plain-column index), the bd_5310l keeper (access path of
+  the `?N` form equals the literal form's for 11 admitted shapes; 6 shapes kept as text; a negative control).
+- Ledger preflight: L5 v1 and v2 (below), L2, bd-5310l's entries.
+- Prediction (bd-w4pr1.13.18, round 9, restated for main 579ab83ce + bd-t0g9w PR1 and stock 3.54.1 before the build,
+  2026-11-21): multicol_eq_1000 -80k to -110k instructions a statement; one-key controls +0.00% to +0.05%; callgrind
+  one-key cost +10 to +50 Ir. Kill: multicol under -60k; the one-key cost above +60 Ir; a control above its band in
+  both runs; a replicated layout-averaged LOSE; multicol cpu not a replicated WIN; a keeper red; an answer differing.
+- Result. Parent = main 579ab83ce + PR1 (commit 9061b48d4), lever = parent + v3, one rch job (layout_shuffle_pair.sh,
+  K=6, ovh-a; parent fsqlite-cargo 474a19910ebe247f, lever cf7b64bc0bec5f9b). rs10/sweep354_probe.py (rs9/sweep.py
+  with the stock arm SQLite 3.54.1), arms P/L/Q x 6 layouts, 7 reps, two runs (both valid, max null |z| 2.53 / 2.17),
+  thinkstation1, powersave, io_uring refused. Answers equal stock on every row. Instructions, median of the layouts'
+  minima, run 1 / run 2:
+
+  | row | stock 3.54.1 | parent | L5 v3 |
+  |---|---|---|---|
+  | multicol_eq_1000 | 54.4M | 392.0M (x7.20) | 291.7M (x5.36); -100.3M / -99.9M, -100k a statement |
+  | point_rowid_2000 (band 0.2%) | 41.2M | 175.2M | +0.105% / +0.116% |
+  | point_hot_2000 (band 0.2%) | 40.2M | 164.6M | +0.138% / +0.231% |
+  | point_sec_key_2000 (band 0.35%) | 64.4M | 263.9M | +0.076% / +0.089% |
+  | insert_literal_400 (band 0.3%) | 8.7M | 72.4M | -0.007% / +0.054% |
+  | orderby_page_500x20, rowid_lookups_200k (band 0.05%) | 69.0M / 459.2M | 281.4M / 2,498.6M | +0.008% / 0.000% |
+
+  - Time (bd-es2im layout-averaged): multicol_eq_1000 cpu 0.747 / 0.735 and cycles 0.715 / 0.711, replicated WINs;
+    every other row a replicated TIE (single-run LOSEs: point_hot cycles run 2, point_sec_key cpu run 1,
+    insert_literal cycles run 1).
+  - Callgrind of point_rowid_2000's statements 100-300 on the two fsqlite-cargo ELFs ((n300 - n100) / 200):
+    `parameterize_literal_statement` 2,217.7 -> 2,282.5 Ir (+64.8), `literal_statement_may_run_parameterized` 859.5 ->
+    868.5 (+9.0), together +73.8; the whole statement 92,374 -> 92,515 (+141). Self diff: `Scan::key_filter` -163,
+    the new `Scan::key_term` +115, `parameterize_literal_statement` +69, `Scan::result_column` +44, admission +11,
+    drop glue +6.
+  - Kill line 2 (one-key cost above +60) CROSSED.
+  - Keeper line CROSSED (rch, vmi1152480, the lever tree 7659bc151 = 579ab83ce + PR1 + v3): bd_5310l
+    `literal_statements_run_identically_parameterized_as_text_and_on_stock` fails at line 1054, "the bound form of an
+    admitted shape takes its literal plan", on `SELECT count(*) FROM sk WHERE t = 13` (t TEXT, index sk_t). Literal:
+    OpenRead sk_t, SeekGE, Column, AggStep COUNT, Next, then OpenRead sk, Rewind, Column, AggStep COUNT, Next (a
+    stepped count plus a fallback scan). Bound: OpenRead sk_t, SeekGE, IdxCountBefore, ResultRow (bd-zgbhb's
+    exact-prefix count). So "an exact index prefix leaves codegen no choice a literal could steer" is false for a
+    one-key aggregate on this TEXT column. The other keepers in the step passed: bd_79p0a 3/3, bd_d4rbi, and the PS
+    set (bd_9zuif 4, bd_tj811 2, bd_xml0z 3, boundary_duplication_census 5, fast_path_separation 38, gh525 3,
+    prepared_hit_rate_proof 8, gh239 6, cross-process staleness).
+  - REJECTED; nothing landed.
+  - MISSED: point_rowid / point_hot +0.10% to +0.23% against +0.00% to +0.05% (inside their bands).
+- Also run (scratch worktree, rch): clippy -D warnings fsqlite-core + fsqlite, all targets, clean.
+- Retry condition: an L5 v4 whose one-key statement costs at most +60 Ir in callgrind (statements 100-300 of
+  point_rowid_2000), measured before any time run. The one-key path is the cost: `key_term` and `result_column` replace
+  `key_filter` for every statement, aggregate or not. A one-key column SELECT should take v2's / main's path
+  unchanged, and only a statement whose result list opens with an aggregate, or that has a second `AND k = int`,
+  should pay the new scan. The admission must also refuse a one-key aggregate on a column whose literal and bound
+  plans differ (observed: TEXT affinity, sk.t), or the keeper's access-path equality must hold on every admitted
+  affinity before any time run.
+
+## 2026-11-22 - WIN (landed as 18c00643a; under its prediction on instructions, inside every kill line): MakeRecord's serializer keeps a record's layouts in a stack array and writes the record through one slice, without its layout SmallVec; bulk -288.4M Ir and its cycles a replicated WIN (bd-w4pr1.13, bulk-write round 16, lever MR)
+
+- Target: the 4-column MakeRecord of bulk_insert_1M_one_txn. Callgrind on 94395a013 (100k rows): the serializer
+  about 698 Ir a row against stock 3.54.1's OP_MakeRecord body 237. `write_serialized_record_from_layouts` 505.7
+  inclusive: 182 in out-of-line `append_serialized_value` calls (one `extend_from_slice` each), 65 in one memcpy (the
+  layout `SmallVec`, about 400 bytes, moved into the writer), 45 in out-of-line `write_varint` calls, 64 in
+  `smallvec::IntoIter::next`; in the lane one more 65-Ir memcpy (the `SmallVec` moved into its `IntoIter`).
+- Touched: `crates/fsqlite-types/src/record.rs`. Records of 3..=16 values (size hint) cache their layouts in a
+  `[Option<(&SqliteValue, u64, usize)>; 16]`; the writer sizes the buffer once and writes each header byte (one-byte
+  varint inline) and payload into its slot; wider records keep the `SmallVec` cache and the same writer by slice; an
+  iterator longer than its size hint falls back to the cached path; integer payloads are fixed-width copies. Byte
+  output unchanged. Keeper `record::tests::test_record_writer_matches_the_file_format_byte_for_byte` (reference
+  encoder from the file-format document, widths 1-20 at every serial-type boundary, hand-written bulk-row bytes, a
+  dirty reused buffer, an under-hinted iterator, a two-byte header size); three mutants each fail it (rc 101).
+- Ledger preflight: not FusedAppendInsert / BulkTableLeafPage* (page builders), S3F v2 (eviction trace) or SR
+  (cursor stack); the 2026-07-24 code-screen REJECT counted the sideband buffer, not this serializer; the May 2026
+  record entries were the prepared direct-INSERT lane in connection.rs; `write_varint` itself is unchanged (05-06).
+- Prediction (on the bead before the build): bulk -300M to -460M Ir, cycles and cpu -2% to -5%; memory_script_200k
+  -55M to -100M; update_10pct_300k -8M to -15M; other rows within +-0.5% or lower. Kill: bulk under 150M (2% of the
+  row, the smallest gain worth a third serializer path); any row's Ir up more than 0.5%; a replicated
+  layout-averaged LOSE above 1%; a failing test, a surviving mutant or a differing answer.
+- Result (stock SQLite 3.54.1 live; parent 4a81b25a9, one layout_shuffle_pair job on hz4, K=6, two valid runs,
+  null max |z| 2.86 / 2.81; answers equal stock, integrity_check ok):
+  - Instructions (cargo ELFs): bulk 7,040.8M -> 6,752.4M (-288.4M; x1.950 -> x1.870 stock 3,610.9M);
+    memory_script -69.8M (x1.911 -> x1.868); update -9.0M (x2.365 -> x2.326); delete -0.5M; the read rows -0.07% to
+    -0.81%. Callgrind 100k: 710.2M -> 682.8M (stock 335.1M).
+  - Time (layout-averaged): bulk cycles 0.9651 / 0.9544 WIN (against stock x2.585 -> x2.494 and x2.559 ->
+    x2.442), cpu 0.9657 TIE / 0.9747 WIN (x2.241 -> x2.164, x2.343 -> x2.284);
+    update cycles 0.9724 / 0.9755 WIN; every other row and metric a replicated TIE.
+  - An earlier pair on 8a9a6410c gave the same instruction lines (bulk -277.9M) but both its time runs were void
+    (null |z| 3.50 and 6.68, load 9-14), and its GROUP BY rows errored in both arms (bd-46l13's spill defect, fixed
+    by 269f4b0ac after that parent).
+- Lesson (prediction miss): the band assumed the writer would inline into the lane at about 140 a row. It stayed
+  out of line (334 a row), and so did `encode_serialized_value` (400k calls, 110 a row); the header bytes are
+  written through a fresh sub-slice per value (about 65 a row).
+- Retry / next: the remaining writer cost above: `encode_serialized_value` inlined into the writer and the one-byte
+  serial type stored straight into its header slot (about 80-110 a row, measured by callgrind on the bulk row
+  first). The lane's own MakeRecord lines (the layout match, 52 a row; the integer-record probe, 15) are separate.
+
+## 2026-11-22 - REJECTED on its GAIN kill line (reused INSERT -6.3% Ir against -10%); point SELECT -22.2%: sqlite3_step runs the statement sqlite3_prepare_v2 compiled instead of parsing and preparing the SQL again (bd-e64z4 part 2, single-writer lane round 10, lever L3)
+
+- Target: `crates/fsqlite-c-api/src/lib.rs`. prepare_v2 compiled the statement only to read its column count and
+  dropped it; every sqlite3_step ran `Connection::execute_with_params` / `query_with_params` on the SQL text, a second
+  parse and prepared-cache lookup per step. L3 keeps the `PreparedStatement` in the handle (its borrow widened to
+  'static: sqlite3_close refuses while a statement is registered, and finalize drops it before the release) and step
+  runs it.
+- Prediction (bead, before the build): user Ir per call -12 to -30% (autocommit INSERT, prepare/bind/step/finalize),
+  -20 to -40% (reused INSERT), -15 to -40% (point SELECT); GAIN kill under -10% on the reused INSERT.
+- Result: dlopen driver cdrv, per call = (N1300 - N300) / 1000, perf stat, 7 rotated reps on thinkstation1. Arms from
+  one rch job on vmi1153651: main ad5f63595 (710c5d129880ee42) and L3 (c38c7ce161101eeb). Stock libsqlite3 3.54.1 was
+  live in the same invocation, and main ran twice as A/A (within 0.15%). Results: autocommit INSERT 197,402 -> 188,234
+  (-4.6%; x10.98 -> x10.47 stock); reused INSERT 168,526 -> 157,852 (-6.3%; x14.96 -> x14.02); point SELECT
+  62,372 -> 48,503 (-22.2%; x3.94 -> x3.06). Kernel Ir -3.0 / -3.5 / -39.8%; statx -2 per call on each mode. All 58
+  fsqlite-c-api tests passed.
+- Why it is small: on a reused INSERT the second parse plus prepared-cache hit is about 10.7k Ir of about 168k. Only
+  the short SELECT shows the double work clearly.
+- Defect found in L3 v1: a statement held across PRAGMA reverse_unordered_selects keeps its first program (with the
+  pragma on, L3 reads 1 2 3, while stock and main read 3 2 1; stock expires statements after a flag pragma). v2
+  recompiles a kept statement after any PRAGMA the handle runs. Its keeper, test_prepared_statements_follow_pragmas_and_peer_ddl,
+  pins stock's answers and also holds an INSERT across another connection's CREATE INDEX.
+- Kept: v1 dea847726 (clone frankensqlite-s10e) and v2 d6c1d13a1 (clone frankensqlite-s10c,
+  `scripts/lane_r10/l3.patch` there); v2 was not built.
+- Retry condition: a C API workload dominated by statement setup (the SELECT shape decides), or a commit path cut far
+  enough that the second parse is above 10% of a reused INSERT. Take v2, not v1, either way.
+
+## 2026-11-22 - REJECTED on its time kill line (update_10pct_300k cpu a replicated layout-averaged LOSE, +6.2% / +12.5%, at identical instructions and cycles:u), every instruction line inside its prediction: a join or derived-table projection that is the joined row moves the row into the result instead of copying it (bd-w4pr1.12, serial read lane round 13, lever DS)
+
+- Target: gb_id's outer aggregate over its 1M-row derived table. On d52d8908b execute_join_select cost 355.1M outside
+  the inner statement: a new vector per row, a clone of each value (direct slots, lever W2), and a free of the
+  source row. The drop of the evaluator's rows (242.4M, free 192 Ir each) was out of scope.
+- Touched: `crates/fsqlite-core/src/connection.rs`, execute_join_select's projection only: when result column i reads
+  slot i (or is the raw projection's NULL for an unnamed column) and nothing is appended for ORDER BY, a row of that
+  width is moved (`Row { values: row }`) with the NULLs written in. Keeper `join_projection_move_tests` (rusqlite
+  oracle, 14 direct statements with the rows each must move, 6 outer statements). Mutants: moving a permutation and
+  moving a narrower prefix both fail it.
+- Prediction: gb_id -280 to -320M Ir, window_sum_over -195 to -235M, gb_id_mod100k -27 to -32M, every other row within
+  +-0.1%; gb_id and window_sum_over cpu replicated WINs. Kill: gb_id under 150M or window under 100M; any row beyond
+  +-0.5% Ir; any replicated cycles or cpu LOSE.
+- Result (perf-ds tree d52d8908b + patch, one layout job on vmi1227854, K=6; parent fsqlite-cargo 2238ee96467d2505,
+  lever b664daca642bfe91; stock sqlite3 3.54.1 live; thinkstation1, load 8-12, the controller disk at 99-100%):
+  - Instructions (callgrind, single ELF): gb_id 4,299.94M -> 4,009.96M (-290.0M), window_sum_over -200.0M,
+    gb_id_mod100k -29.0M, window_row_number -201.0M (not in the prediction's list: its outer reads a derived table
+    too). Every other judged row within +-0.08%.
+  - vs stock 3.54.1: gb_id Ir x3.25 -> x3.03, cycles x3.22 -> x2.88; window_sum_over Ir x0.57 -> x0.54.
+  - Time (runs 2 and 3; run 1 void, max null |z| 3.26): gb_id cycles 0.895 / 0.898 WIN, cpu 0.943 WIN / 0.976 TIE;
+    window_sum_over cycles 0.946 / 0.954 WIN, cpu TIE; update_10pct_300k cpu 1.062 / 1.125 LOSE (T 4.0% / 4.4%) with
+    instructions 1.0000 / 1.0004 and cycles 0.999 / 1.003. Its P / L / Q cpu medians were 154.4 / 164.0 / 155.8 and
+    132.0 / 148.5 / 133.1 ms: the excess is kernel time. LINE 3 CROSSED.
+  - Diagnostic: the write rows judged once with L = the parent's six ELFs copied to other paths (one trailing NUL
+    appended so the harness accepts them): update_10pct_300k cpu 0.995 TIE, cycles 1.012 TIE. A per-file effect does
+    not explain the lever's update result. The same copies gave memory_script_200k cycles 1.012 LOSE at T 1.03% in that
+    single run.
+- Retry condition: the same two ELFs (sha256 above) re-judged on a quiet host with update_10pct_300k's sys and user
+  time recorded separately; the lever lands only if no replicated LOSE remains. Its code path never runs on update,
+  so a reproduced kernel-time LOSE needs its own explanation before any retry.
+
+## 2026-11-22 - REJECTED on its gain line (join_1M_to_pk_1000 +263.3M Ir, +7.3%, against at least -100M): `length(column)` read from the stored record through ColumnOctetLength with a characters flag, instead of `Column` + `PureFunc LENGTH` (bd-w4pr1.12, serial read lane round 13, lever LN)
+
+- Target: join_1M_to_pk_1000 (`SELECT count(*), sum(length(u.name)) FROM t JOIN u ON u.a = t.a`), 3,615.6M Ir on
+  d52d8908b. Per joined row the profile showed the TEXT value built for u.name (71.2M), LengthFunc (115.2M), the
+  function lookup (~48M) and set_reg (86.0M).
+- Touched: `crates/fsqlite-types/src/opcode.rs` (P5 flag COLUMN_OCTET_LENGTH_CHARACTERS), `crates/fsqlite-vdbe/src/codegen.rs`
+  (try_emit_column_octet_length takes `length`; the lookup-join aggregate emitter emit_join_expr emits the opcode for
+  `length(<stored column>)`), `crates/fsqlite-vdbe/src/engine.rs` (column_char_length_direct: NULL, a BLOB's header
+  length, a UTF-8 database's TEXT counted in its stored bytes as LengthFunc counts valid UTF-8; everything else reads
+  the value and calls LengthFunc). Keeper in `crates/fsqlite-core/tests/bd_iubwb_octet_length_encoding.rs`
+  (`length_of_a_column_reads_the_record_and_matches_stock`, UTF-8 and UTF-16le, invalid UTF-8, overflow, LEFT JOIN
+  NULL rows; fails on main's source and on three mutants).
+- Prediction: join -150 to -300M Ir; every other row within +-0.1%. Kill: join down less than 100M.
+- Result (lnab tree d52d8908b + patch, one layout job on hz4; parent fsqlite-cargo 03b40c870e70ebb5, lever
+  1f5bd607b8da4203; callgrind, single ELF): join_1M_to_pk_1000 3,615.78M -> 3,879.09M (+263.3M), rowid_lookups_200k
+  +0.01%. Answers equal. No time run: line 1 is a deterministic instruction line.
+- Why (cg_selfdiff per row): ColumnOctetLength is not a synchronous hot-lane opcode. It leaves run_hot_opcodes_sync for
+  the async lane (try_execute_hot_opcode_async +385 Ir) and rebuilds the general storage-cursor row layout
+  (begin/ensure/finish_storage_cursor_row_layout and the payload prefix, about +590) that the sync lane's Column reads
+  in place; the value, the call and the result write it removed cost about 330 less than the lane it added.
+- Retry condition: a length() that stays in run_hot_opcodes_sync and reads the cell in place as the sync Column does
+  (try_read_column_in_place), with no async lane and no general row-layout pass; join_1M_to_pk_1000 at least 100M
+  down on callgrind before any time run. ColumnOctetLength itself pays the same lane (not measured here).
+
+## 2026-11-21 - MAINTENANCE (landed as ad5f63595; inside its prediction): fsqlite::blocking changes() / total_changes() read the connection's counters instead of running a SELECT per call (bd-e64z4, part 1)
+
+- Target: `crates/fsqlite/src/blocking.rs`. `Connection::changes()` and `total_changes()` ran `SELECT changes()` /
+  `SELECT total_changes()` through block_on on every call, about 52k user instructions each. They now read
+  `Connection::last_change_count()` / `total_change_count()`, the fsqlite-core accessors bd-zqr9h L2 added.
+- Keeper: `blocking::tests::changes_and_total_changes_match_stock`. The C API differential's 19 statements run through
+  execute_batch on stock (rusqlite's bundled 3.54.1) and on fsqlite::blocking. The outcome and both counters must be
+  equal after each one: prepare-time errors (bd-rwo47), a UNIQUE failure mid-UPDATE, an UPDATE of no rows, DDL, SELECT.
+- Prediction (bead, before the build): -99% to -99.99% per changes() + total_changes() pair; GAIN kill under -90%.
+- Result: example driver `crates/fsqlite/examples/r10_changes.rs` (scratch only). Per iteration = (Ir(N_hi) - Ir(N_lo))
+  / (N_hi - N_lo), perf stat instructions:u, 7 rotated reps on thinkstation1. Arms came from one rch job on vmi1227854:
+  main 11cc30b26 (129fac924fd1e0a9) and the change (53e7272dcbad7317). Stock is rusqlite's bundled SQLite 3.54.1 in
+  the same binary, live in the same run. main 103,144 -> 10.0 (-99.99%); stock 78.0, so 0.13x stock on this pair of
+  accessor calls. A microbench of two calls, not a workload result.
+- Retry condition: none for these two calls; the per-call statement is gone. The blocking API's remaining
+  per-statement cost is its prepare / execute path, a different lever measured on a statement workload.
+
+## 2026-11-21 - MAINTENANCE (landed as f16f01ccb; inside its prediction, on instructions; every row still a loss to stock 3.54.1): the C API reads sqlite3_changes from the connection's counter instead of running `SELECT changes();` after every step, and exports sqlite3_total_changes (bd-zqr9h, lever L2)
+
+- Target: `crates/fsqlite-c-api`. After every successful sqlite3_step and every sqlite3_exec statement, the shim ran a
+  second statement, `SELECT changes();`, through block_on to refresh a cached count (refresh_last_changes), about 159k
+  Ir per step under callgrind before L1.
+- Touched: `crates/fsqlite-c-api/src/lib.rs` (the cache and refresh are gone; sqlite3_changes reads the connection's
+  counter; sqlite3_total_changes is new) and `crates/fsqlite-core/src/connection.rs` (public accessors
+  Connection::last_change_count / total_change_count, the values SQL changes() / total_changes() return).
+- Semantics (dlopen differential, 19 statements, stock 3.54.1 live): L2 equals stock on 18 lines. The parent differed
+  on all 19 (no sqlite3_total_changes; after a UNIQUE failure part-way through a multi-row UPDATE it kept the cached 2
+  where stock reads 0). The 19th, `UPDATE w SET (x, nope) = (SELECT 1, 2, 3)`, keeps main's return codes (prepare 0,
+  step 1; stock rejects it at prepare: bd-4l4y3), with stock's counts since bd-rwo47 (2a359ad03). Keeper:
+  test_changes_and_total_changes_match_stock.
+- Prediction (bead, before the build): user instructions -25 to -45% (autocommit INSERT), -25 to -50% (reused INSERT),
+  -40 to -80% (point SELECT); syscalls not higher. Kill: below the low end on any row, a C API test red, an A/A pair
+  off by more than 2%, a differential line not identical to the parent's or stock's.
+- Result (dlopen C driver, per call = (N1300 - N300)/1000, 11 rotated reps, perf stat user instructions on each single
+  ELF; arms built in one rch job on vmi1156319, main 13db363cb 1e656774d0d194f4 and L2 62c314f9f3daa2e5; stock
+  libsqlite3 3.54.1 from scripts/build_stock_sqlite3.sh and main each twice as A/A, live in the same invocation;
+  thinkstation1): autocommit INSERT 298.1k -> 194.7k (-34.7%; x16.6 -> x10.8 stock), syscalls 37.6 -> 29.1; INSERT on
+  a reused statement 269.5k -> 166.4k (-38.3%; x23.9 -> x14.8), 35.6 -> 27.1; point SELECT 117.7k -> 61.7k (-47.5%;
+  x7.4 -> x3.9), 13.0 -> 5.0. A/A: stock exact, main within 0.12%. No time claim (not layout-averaged).
+- Gate (rch, the tree rebased onto 89ae732c9): clippy -D warnings on fsqlite-c-api and fsqlite (all targets) and
+  fsqlite-core --lib clean; fsqlite-c-api 57 passed, 0 failed; the fsqlite crate in 7 batches of 19, 124 binaries,
+  1,103 passed, 0 failed, 24 ignored.
+- Retry condition: none for the per-step refresh. Next on the bead: the shim's double work per statement (prepare_v2
+  prepares a statement only to count its columns and drops it; step executes the SQL text from the start). Same
+  pattern still open: `fsqlite::blocking::Connection::changes()` / `total_changes()` run `SELECT changes()` /
+  `SELECT total_changes()` through block_on per call and could read the same accessors.
+
+## 2026-11-21 - REJECTED on its regression line (rowid_lookups_200k +47.0M Ir, +1.75% against +0.5%), the join -167.8M: a seek-cache hit on a resident cached leaf other than the cursor's own is answered without a wait, and a per-cursor flag stops asking a reader that holds none (bd-w4pr1.12, serial read lane round 12, lever SL2 v2)
+
+- Target: join_1M_to_pk_1000 on the SC8 v4 code. 405,000 probes are seek-cache hits on a cached leaf other than the
+  cursor's own, and they run the async table_move_to at 1,642 Ir each (665.0M; callgrind).
+- Retry of SL2 v1 (2026-11-19 entry, rejected on memory_script_200k's per-probe NotResident lookups). Its retry
+  condition, a landed multi-slot cursor cache, was met by SC8 v4 (4e15416e8).
+- Touched (not landed; patch `scratchpad rl12/sl2v2_v1.patch`): `crates/fsqlite-btree/src/cursor.rs`.
+  - try_table_seek_within_leaf keeps SL1 v3's newest-slot test first. When that does not answer, it takes the first
+    admitting slot and answers it from the reader's resident image (read_resident_btree_page_data). load_page's tail
+    moves into stack_entry_for_page so both can use it.
+  - A per-cursor `resident_seek_declined` flag is set by the first refusal.
+  - Keeper `test_try_table_seek_within_leaf_answers_resident_cached_leaves` (reference cursor; three negatives; the
+    flag).
+- Prediction (on the bead before the build): join -180 to -260M Ir, rowid_lookups +0.2 to +0.35%, memory_script
+  within +-0.1%. Kill: the join under 100M; rowid_lookups above +0.5%; any other row beyond +-0.5%; a replicated LOSE.
+- Result (parent 83fee06b2 against parent + v2, one layout_shuffle_pair job, callgrind of the fsqlite-cargo ELFs;
+  answers equal stock):
+  - join 3,615.6M -> 3,447.8M (-167.8M, under the band);
+  - rowid_lookups 2,679.2M -> 2,726.2M (+47.0M), line 2 crossed;
+  - the judgement runs were stopped during run 1, because a deterministic instruction line had already decided.
+- Why (callgrind self diff on rowid_lookups, 200k probes, almost none admitted by any slot):
+  - try_table_seek_within_leaf +150.5 Ir a probe: every probe the newest slot does not answer runs the flag test and
+    next_table_seek_slot's eight-slot scan before declining, and try_table_seek_cache then scans again;
+  - +82.7 a load from splitting load_page's decode tail into a non-inlined stack_entry_for_page (load_page -243.0,
+    stack_entry_for_page +325.7);
+  - total +235 a probe against the +40 predicted.
+- Mutants (rch, rc 101): the flag never set; a resident landing on the wrong cell. Remembering the hit in slot 0 was
+  an equivalent mutant: the general hit path re-derives the same slot.
+- Retry condition: an SL2 v3 that adds no instructions to a probe no slot admits.
+  - The slot scan runs once a probe and its answer is handed to try_table_seek_cache.
+  - load_page's decode tail stays inlined.
+  - Callgrind-attributed on rowid_lookups_200k (within +0.5%) and on the join (at least 100M) before any time run.
+
+## 2026-11-21 - WIN (landed as f921f63c4; inside its prediction): AggFinal and AggValue observe a requested cancellation with one atomic load, not two full checkpoints, per group; gb_id -724.0M Ir (bd-w4pr1.12, serial read lane round 12, lever AFC)
+
+- Target: gb_id (`SELECT count(*), sum(n) FROM (SELECT id g, count(*) n FROM t GROUP BY id)`). Callgrind on
+  742438e55: Cx::checkpoint 732.4M inclusive, 722.1M of it in 2,000,245 calls from execute_program_body (361 Ir
+  each). Those were AggFinal's two full checkpoints, before and after finalize, over 1M groups.
+- Touched: `crates/fsqlite-vdbe/src/engine.rs`. AggFinal's and AggValue's four observe_execution_cancellation calls
+  become observe_requested_execution_cancellation, the per-row boundary rule of VNext (bd-i3csr.2), AggStep and
+  AggInverse. Keepers on hand-built programs (a GROUP BY shape and a window shape, about 1M groups):
+  `test_aggregate_boundaries_observe_a_requested_cancellation_at_the_next_group` and
+  `test_aggregate_statements_observe_native_timeouts_and_spent_budgets_within_the_interval`.
+  `crates/fsqlite-vdbe/Cargo.toml`: asupersync test-internals as a dev-dependency.
+- Behaviour bounds (on the bead before the build):
+  - a requested cancellation is still observed at the same sites;
+  - the e-process, native-runtime and deadline / budget planes are observed at the statement loop's interval
+    checkpoint, at most 4096 opcodes later;
+  - Cx::checkpoint consumes no budget and does not yield;
+  - fsqlite has no progress handler.
+- Prediction: gb_id -690 to -725M Ir, gb_id_mod100k -68 to -73M, every other row within +-0.05%. Kill: gb_id under
+  500M; any row beyond +-0.5% Ir; a replicated layout-averaged LOSE; a mutant passing.
+- Result:
+  - Setup: parent b2f988834 against parent + AFC, one layout_shuffle_pair job (K=6), two judgement runs (both valid).
+    Stock sqlite3 3.46.1 live; ratios against 3.54.1 from one extra invocation. Answers equal stock.
+  - Instructions (callgrind, single ELF): gb_id 5,023.9M -> 4,299.9M (-724.0M); gb_id_mod100k -72.4M; window_sum_over
+    +0.002%; every other row within +-0.06%.
+  - vs stock 3.54.1: gb_id Ir x3.89 -> x3.25, cpu x4.78 -> x3.67; gb_id_mod100k Ir x1.11 -> x1.07.
+  - Time (layout-averaged): gb_id cpu 0.759 / 0.767 and cycles 0.675 / 0.676 WIN; gb_id_mod100k cpu 0.963 / 0.952
+    WIN; every other row a replicated TIE.
+- Mutant (rch, rc 101): the four atomic loads removed. The requested-cancellation keeper then delivers 500,736 rows
+  against 500,000.
+- Gate (3678e7153 + diff 50e29ff110609d91; the commits up to the landing touch neither the changed sites nor the
+  cancellation helpers): clippy vdbe / core clean; libs + goldens 5,473 passed; 22 core aggregate oracles 48 passed;
+  18 window / aggregate-misuse oracles 68 passed; 16 e2e oracles 86 passed; fsqlite crate in 7 batches, 124
+  binaries, 1,103 passed, 0 failed.
+- Retry condition: none for this shape. Left on gb_id (x3.25 Ir against 3.54.1), on the AFC build:
+  - the inner GROUP BY program, 3,587M: its sorter (330.6M in execute_sorter_insert) for a GROUP BY on the rowid
+    alias, which stock walks in rowid order without one;
+  - the outer evaluator's derived-table copy (355.1M in execute_join_select) and the drop of the 1M-row
+    materialization (242.4M): the derived-table streaming lever.
+
+## 2026-11-21 - FIX (landed as e1605fc92; a correctness fix measured like a lever, inside its regression lines): PRAGMA secure_delete reaches the storage policies, so ON and FAST erase removed content as stock does (bd-i2u1c, bulk-write round 15)
+
+- Target: drop-in and security. 588b17d07 added OFF / ON / FAST policies to the pager and b-tree, but nothing
+  set them, so every deletion ran at OFF whatever the PRAGMA said. Touched: `crates/fsqlite-core/src/connection.rs`
+  (`begin_pager_txn_with_busy_timeout` hands each new transaction the connection's setting; `PRAGMA secure_delete=N`
+  also sets it on the active and parked autocommit transactions), `crates/fsqlite-vdbe/src/engine.rs`
+  (`SharedTxnPageIo` forwards `secure_delete_mode` and `note_freed_page_zeroed`; without them the VDBE's cursors read
+  the trait's OFF default). Keeper `crates/fsqlite-e2e/tests/secure_delete_file_bytes_oracle_e2e.rs` (file bytes
+  against rusqlite, WAL and rollback, OFF / ON / FAST, six shapes and four connection cases).
+- OFF-path cost, P = e0e82ede7 and L = P + the wiring, one pair job on vmi1153651 (P cargo f7db248cb4f7fca6, L cargo
+  8fa1141b55616d3d), stock 3.46.1 live: single-ELF instructions delete_14pct_300k +0.26% (358.5M -> 359.4M, about 22
+  a deleted row: the RefCell borrow and dispatch of `secure_delete_mode` per cell removal), every other row within
+  +-0.04%; layout-averaged lines (runs sda and sdc valid; sdb VOID at null max |z| 3.37): no replicated LOSE,
+  scan_filter_agg cpu and cycles replicated WINs at identical Ir (a layout effect, as bd-v3i4s's N2 showed one).
+- With secure_delete=1 in every arm (7 reps): delete_14pct_300k L 360.3M Ir against stock 3.46.1 120.7M and 3.54.1
+  107.5M (2.98x / 3.35x), task-clock 126.2 ms against 46.9 / 47.6; update_10pct_300k 557.6M against 273.4M / 236.8M;
+  memory_script_200k 3,417.1M against 1,913.9M / 1,692.2M. The zeroing itself costs fsqlite +1.8M Ir on delete
+  (perf counts a `rep stosb` once) and nothing visible in time.
+- Stock difference pinned in the keeper, not a secure_delete matter: fsqlite's leaf delete repacks the page
+  (compact-on-delete), so at OFF a deleted cell with cells below it leaves no residue, where stock's freeblock keeps
+  it.
+- Retry / follow-up: an unqualified PRAGMA does not reach ATTACHed databases (stock sets every attached b-tree). If
+  the +0.26% on delete matters, cache the policy in `SharedTxnPageIo` at each `set_transaction` instead of borrowing
+  the transaction per removal.
+
+## 2026-11-21 - WIN (landed as 4e15416e8; under its prediction on the join and over it on rowid_lookups, inside every kill line): the table seek cache keeps eight leaves, slot 0 in the cursor and slots 1..7 in one array moved as a slice, so BtCursor shrinks by 88 B (bd-w4pr1.12, serial read lane round 12, lever SC8 v4)
+
+- Target: join_1M_to_pk_1000, whose 1M probes into u step across five leaves while the four-slot seek cache
+  missed on every leaf change.
+- History: SC8 v2 (eight inline slots, BtCursor 1,800 B) lost scan_filter_agg cycles at identical Ir (the
+  2026-11-19 entry). SC8 v3 (slots 1..7 boxed, accessed slot by slot) was rejected at rowid_lookups_200k +1.93% Ir
+  (2026-11-21 entry). Callgrind of v3 attributed the cost to its per-slot push_front (219 Ir a missed probe) and
+  per-slot scan (73).
+- Touched: `crates/fsqlite-btree/src/cursor.rs`. `TABLE_SEEK_CACHE_SLOTS` 4 -> 8. `TableSeekCache` holds slot 0
+  inline and slots 1..7 in one `Box<[Option<TableSeekCacheEntry>; 7]>`. `rest()` returns them as a slice.
+  `push_front` is `rest[..end].rotate_right(1); rest[0] = first; first = entry`. `landing_slot` is a slice
+  position. A hit's move to the front is one push_front. Keeper `test_table_seek_cache_keeps_the_cursor_footprint`
+  and the rewritten LRU / loads-only tests. BtCursor<MemPageStore> 1,672 -> 1,584 B.
+- Prediction (bd-w4pr1.12, before the build): join -430 to -465M Ir, rowid_lookups 0 to +4M, memory_script -180 to
+  -240M, every other row within 0.1%. Kill lines: the join at least 300M down; rowid_lookups no more than +0.5% Ir;
+  every other row within 0.5%; no replicated layout-averaged LOSE; answers equal stock; planted mutants fail.
+- Result:
+  - Setup: parent 1eb109005 against parent + v4, one layout_shuffle_pair job (K=6), two judgement runs (both valid).
+    Stock sqlite3 3.46.1 live; thinkstation1. Answers equal stock; parent sources equal git.
+  - Instructions (callgrind, single ELF): join 4,021.5M -> 3,615.7M (-405.8M, under the band; x2.34 -> x2.10 stock);
+    rowid_lookups 2,667.9M -> 2,677.9M (+10.0M, +0.37%, over the band; per missed probe +40 in the eight-slot scan,
+    +30 in the rotate's memmove, -20 in the landing); memory_script ratio 0.942; every other row within +0.11%.
+  - Time (layout-averaged): join cpu 0.852 / 0.828 WIN (x2.15 -> x1.83 stock); memory_script cpu 0.935 / 0.941
+    WIN; every other row a replicated TIE (rowid_lookups LOSE in run 1 only). scan_filter_agg is a TIE in both runs:
+    at a smaller cursor the v2 loss does not appear, which supports the footprint hypothesis.
+- Mutants (rch, rc 101): the last slot cleared after every landing fails both rewritten tests; the old front dropped
+  fails all five seek-cache tests.
+- Gate (b405417ab + diff 496146c312bdccfe; the commits before landing do not touch fsqlite-btree): clippy btree /
+  vdbe / core clean; libs + goldens + hot_arm_stream_reachability 6,045 passed; 46 core seek / join oracles 195
+  passed; 15 e2e oracles 103 passed; fsqlite crate in 7 batches of 19, 124 binaries, 1,103 passed, 0 failed.
+- Retry condition: none for this shape. Left on rowid_lookups_200k: the eight-slot scan's +50 Ir a missed probe (a
+  probe no slot admits); the point-lookup lane owns that row. SL2 v2's retry condition ("a landed multi-slot cursor
+  cache", 2026-11-19 entry) is met by this landing; it returns to the coordinator's queue.
+
+## 2026-11-21 - MAINTENANCE (landed as c0e568aaf; inside its prediction, on instructions; every row still a loss to stock): the C API drives engine futures with `fsqlite::blocking::block_on` instead of entering a thread-local runtime per call (bd-zqr9h, lever L1)
+
+- Target: `crates/fsqlite-c-api`, every C entry point. Each call entered a thread-local asupersync current_thread
+  Runtime (`RUNTIME.with(|rt| rt.block_on(f))`), three entries per autocommit INSERT through prepare_v2 / bind /
+  step / finalize, each paying the reactor, timer and scheduler turn (futex, epoll_ctl, epoll_pwait,
+  timerfd_settime, sched_yield). The index row for `block_on` above recorded "the C API shim still does".
+- Touched: `crates/fsqlite-c-api/src/lib.rs` (uses `fsqlite::blocking::block_on`; the asupersync dependency is
+  gone from `crates/fsqlite-c-api/Cargo.toml`), `crates/fsqlite/src/blocking.rs` (`block_on` made public). Keeper
+  `test_busy_timeout_waits_then_returns_busy` (busy_timeout 300 waits, 0 refuses at once, the holder's COMMIT
+  releases), green on the parent and on L1.
+- Prediction (bead, before the build): autocommit INSERT user instructions -30% or more, at least 3 syscalls fewer
+  per call. Kill: under -10%, syscalls not lower, an A/A pair off by more than 2%, any C API test change, a busy
+  semantics change.
+- Result (dlopen C driver, per call = (N1300 - N300)/1000, 11 rotated reps, perf stat user instructions on each
+  single ELF; stock libsqlite3 3.46.1 and the parent cdylib each twice as A/A, live in the same invocation;
+  thinkstation1): autocommit INSERT 433.6k -> 297.5k (-31.4%; x21.6 -> x14.8 stock), syscalls 83.5 -> 37.4;
+  INSERT on a reused statement 362.9k -> 268.5k (-26.0%; x30.1 -> x22.3); point SELECT 244.5k -> 117.8k (-51.8%;
+  x14.2 -> x6.9), syscalls 68.5 -> 13.0. A/A: stock exact, parent within 0.63%. No time claim (not
+  layout-averaged).
+- Side effect: WAL-FEC starts only for a connection with a caller-owned native runtime. The parent shim opened
+  every connection inside its runtime, so C API connections started the repair pipeline; with L1 they do not
+  (gdb: `WalFecRepairPipeline::start_scoped` reached on the parent, never on L1). Part of the INSERT rows' drop is
+  that pipeline's close-time flush (bd-9v52c: sqlite3_close after 1,000 INSERTs, 783.8M Ir on the parent, 2.0M on
+  L1, 38.8k stock), not the runtime entry; the SELECT row writes nothing per call. At `synchronous=FULL` a C API
+  connection no longer writes `-wal-fec`, the default bd-71vt5 sets for every API.
+- Gate (rch, the tree of c0e568aaf; the 17 commits it was rebased over touch neither file): clippy -D warnings on
+  fsqlite-c-api and fsqlite, all targets, clean; fsqlite-c-api 56 passed, 0 failed; the fsqlite crate in 7 batches
+  of 19 (--lib in the first), 125 binaries, 1,103 passed, 0 failed (batch 5 re-run after an rch disk-guardian rc
+  137 before any test ran); rustfmt clean; ubs: no new findings beyond test-code inventory.
+- Retry condition: none for the runtime entry. Next on the bead: L2 (drop the shim's `SELECT changes();` after
+  every step; measured inside its band, -34.6% / -38.4% / -47.5% user instructions against L1, and held by its
+  differential kill line until bd-rwo47's engine fix), then the shim's double work per statement (prepare_v2
+  parses the SQL and prepares a SELECT/INSERT/UPDATE/DELETE only to count its columns, then drops it; step
+  executes the SQL text from the start).
+
+## 2026-11-21 - REJECTED on its kill line 3 (rowid_lookups_200k +51.8M Ir, +1.93% against +0.5%), the join -361.0M and its time WIN in both runs: the table seek cache keeps eight leaves with slot 0 in the cursor and slots 1..7 in one box, so BtCursor shrinks by 88 B (bd-w4pr1.12, serial read lane round 11, lever SC8 v3)
+
+- Target: join_1M_to_pk_1000, whose keys step across five leaves while the four-slot seek cache cycles through
+  them. This is the one priced retry of SC8 v2 (2026-11-19 entry): v2's behaviour, eight slots scanned in place,
+  with BtCursor's in-struct footprint at or under the parent's, to test whether v2's scan_filter_agg loss came from
+  its 8-slot inline array.
+- Touched (not landed; patch `scratchpad rl9/sc8v3_v1.patch`): `crates/fsqlite-btree/src/cursor.rs`
+  (`TABLE_SEEK_CACHE_SLOTS` 4 -> 8; `TableSeekCache` holds slot 0 inline and slots 1..7 in a
+  `Box<[Option<TableSeekCacheEntry>; 7]>` made on the first second-leaf landing; get / set / push_front /
+  move_to_front replace the array's rotate; keeper `test_table_seek_cache_keeps_the_cursor_footprint`; the LRU and
+  loads-only tests rewritten for any slot count).
+- Sizes (one print test on rch): `BtCursor<MemPageStore>` 1,672 B on the parent, 1,800 B with v2, 1,584 B with v3.
+- Unit checks (rch, on b12c2739b): clippy clean; fsqlite-btree lib 564 passed, 0 failed. The capacity-minus-one
+  mutant (last slot cleared after every landing) fails both rewritten tests, rc 101.
+- Prediction (on the bead, before the build), single ELF: join -430 to -465M Ir, rowid_lookups_200k within +-0.3%,
+  every other row within 0.1%. Lines: the join a replicated cpu WIN; any replicated cycles or cpu LOSE kills;
+  the join at least 300M down and no other row above +0.5% Ir; answers equal stock.
+- Result (parent 742438e55 against parent + v3, one layout_shuffle_pair job on vmi1227854, K=6 relinks per arm,
+  parent sources equal git file by file, two judgement runs each with its own Q group, stock sqlite3 3.46.1 live,
+  thinkstation1, answers equal stock on every row):
+  - instructions: join 4,023.7M -> 3,662.7M (-361.0M, below the band); rowid_lookups 2,679.4M -> 2,731.2M
+    (+51.8M, +1.93%), which crosses line 3; memory_script ratio 0.945; every other row within +-0.04%;
+  - time: run 2 is void (one null comparison at |z| 4.01). In run 1 and run 2 the join is a WIN (cpu 0.866 /
+    0.857), memory_script a WIN (cpu 0.953 / 0.930) and scan_filter_agg a TIE (cycles 0.992 / 0.995);
+  - vs stock (cpu): join x2.14 / x2.08 -> x1.85 / x1.78; rowid_lookups x1.86 / x1.83 -> x1.84 / x1.88.
+- Why (inferred from the code, not attributed by a profile): rowid_lookups' 200k probes miss every slot and land on
+  new leaves. Each pays next_table_seek_slot's scan through TableSeekCache::get (a branch and a copy out of the box
+  per slot) and push_front's seven get / set pairs through the Option<Box>, where v2 rotated an inline slice:
+  about +259 Ir a probe. The same cost would explain the join's shortfall against v2 (-361M against -463M).
+- Footprint hypothesis: not settled. scan_filter_agg is a TIE at a smaller cursor, but in one valid run and one
+  void run, not a replicated verdict.
+- SL2 v2 (2026-11-19 entry) closes. Its retry condition is now "a landed multi-slot cursor cache".
+- Retry condition: an SC8 v4 that keeps the footprint (all eight slots in one out-of-line array behind one
+  pointer) and scans and rotates that array as a slice, as v2 did. rowid_lookups_200k must stay within +0.5% Ir
+  (single ELF, callgrind-attributed before any time run), judged under the same four lines, with a replacement run
+  for any void run. The coordinator decides whether to price it.
+
+## 2026-11-20 - WIN (landed as 009856eb4; inside its prediction, on instructions): a column read on a new row takes its record bytes from the one cursor call that locates the row (bd-w4pr1.13.4, read-loop round 10, lever CL1)
+
+- Target: the in-place Column lane (`try_read_column_in_place`). On a row new to its view it asked the cursor
+  three times for the same bytes: the row span, then the page span to parse the header, then the page span again
+  for the value. Each call pays CursorBackend's three-way match, the EOF check and the stack top, about 34
+  instructions; the join row's two column reads cost 136 a row in those calls (callgrind on main).
+- Touched: `crates/fsqlite-btree/src/cursor.rs` (`BtCursor::current_local_table_row` returns the rowid, payload
+  range and record bytes from one call); `crates/fsqlite-vdbe/src/engine.rs` (the lane parses a new row and its
+  short-record rowid-alias check from those bytes; keeper
+  `test_in_place_column_lane_reads_new_and_parsed_rows_like_the_copying_lane`).
+- Prediction (on the bead, before the build): join_1M_to_pk_1000 -80 to -120M Ir, scan_filter_agg -35 to -60M.
+  Kill: the join under 60M, scan_filter_agg under 25M, or any row above +0.5% Ir.
+- Result (parent 75b68af7a against parent + this change, one layout_shuffle_pair job, K=6 relinks per arm, two
+  judgement runs; stock sqlite3 3.46.1 live; thinkstation1; answers equal stock on every row): join -101.4M
+  (4,125.1M -> 4,023.7M; x2.40 -> x2.34 stock); scan_filter_agg -45.5M (1,271.4M -> 1,225.8M; x2.55 -> x2.46
+  stock). Every row that reads a column falls 20-51M, and no row rises. Time (layout-averaged): every row a
+  replicated TIE, so it lands on instructions, not on time.
+- Planted mutant (rch, rc 101): `current_local_table_row` returning the record bytes shifted by one fails the
+  keeper and the existing lane test.
+- Gate (75b68af7a + diff d5a9807e7ce5a05e, byte-identical after the rebase; the commits between touch neither
+  file): btree and vdbe libs 1,821 passed; clippy clean; 58 test binaries, 6,251 passed, 0 failed; fsqlite-e2e 21
+  binaries, 145 passed; fsqlite crate in 7 batches of 19, 125 binaries, 1,100 passed, 0 failed; rustfmt and ubs
+  clean.
+- Retry condition: none for this shape. Left on the join row is the rest of the per-row cursor and record cost (x2.34
+  stock): attribute it before a next lever.
+
+## 2026-11-20 - REJECTED on its first kill line (bulk -151M Ir against 170M, the low end of its band; the in-place update cost 91 a row, not 10-25): an append to the cached rightmost leaf updates the cursor's stack entry in place instead of rebuilding it (bd-w4pr1.13, bulk-write round 13, lever SR)
+
+- Target: the stack rebuild after every append in `try_append_on_cached_rightmost_leaf` (`crates/fsqlite-btree/src/
+  cursor.rs`): a clone of the leaf's whole cell-pointer array, `stack.clear()` dropping the previous entry, and a new
+  entry, ~230 a row by callgrind of the 100k bulk row (clear 9.5M, clone 8.4M, push 3.1M, grow 2.1M). Preflight: the
+  2026-11-14 V2 entry (buffer reuse, rejected) asked for a change that removes the rebuild itself. Touched (not
+  landed; patch `scratchpad/r13/sr1_on_cf0c8483e.diff` of the bulk-write lane): a `place_stack_on_appended_leaf`
+  helper for both rebuild sites: when the stack was the cached leaf alone at the image the append started from
+  (same page and image token, read before the append), the entry takes the new pointer, image, header, counter and
+  index in place; otherwise the rebuild as before. A btree test checks the stack against the cache after every
+  append across splits and forced rebuilds; fsqlite-btree lib 564 passed, clippy clean.
+- Prediction (bd-w4pr1.13, before the build): bulk_insert_1M_one_txn -170M to -220M Ir, memory_script -30M to -45M.
+  Kill lines at the low ends: bulk down less than 170M, memory_script less than 30M, any row up 0.3%, a replicated
+  time LOSE.
+- Result, both arms in one job on vmi1227854 (P sha256 27c4e3ca3dc2422a, L 5e5c1af9fa35b765), stock 3.46.1 live,
+  single ELF: bulk 7,030.7M -> 6,879.6M by min (-151.1M; -160.6M by median; 1.683x -> 1.647x stock),
+  memory_script -30.4M, delete and update unchanged; answers equal stock's. Single-ELF bulk cycles:u -6.1%,
+  task-clock median 897.9 -> 861.7 ms (not layout-averaged; not run after the kill). Callgrind of both arms on the
+  100k row: 710.2M -> 695.3M (149 a row); the removed calls were 23.1M and the outlined helper costs 9.06M (91 a
+  row: the page handle's clone and the old one's drop, the pointer push, the header and counters), where 10-25
+  was predicted.
+- Retry condition: V2's first clause, a stack entry that shares the rightmost-leaf cache's pointers and page
+  handle (one copy maintained per append, not two), or a cursor that defers the stack until a read needs it;
+  either removes the 91 too. Measure that shape alone by callgrind first.
+
+## 2026-11-20 - WIN (landed as c03a452df; inside its prediction): a trigger body statement is bound once per frame shape, not once per row (bd-fpr5g, SQL lane rounds 6-8, lever 3a)
+
+- Target: bd-fpr5g's script, an AFTER INSERT trigger with a WHEN guard and an INSERT and an UPDATE in its
+  body, over 20,000 rows. Per firing row, `bind_trigger_body_statement` cloned each body statement and
+  rewrote its NEW/OLD references into `?N` parameters: about 8.8k instructions per statement, 17.7k per
+  firing (callgrind, symbolized main 3816d43a6).
+- Ledger preflight: levers 1 and 2 (the 2026-11-18 and 2026-11-19 entries) were this bead's earlier WINs;
+  no entry covers trigger body binding.
+- Change (connection.rs): a per-connection cache of `TriggerBodyTemplate`s, keyed on the trigger's Arc (by
+  pointer), the statement index, main-relation pinning, the firing statement's conflict override, the
+  schema generation and the frame shape. Each holds the bound statement and the binder's recipe
+  (`TriggerBoundParams` keys). Later rows read their values through `TriggerFrame::lookup_value` and run the
+  cached statement through the unchanged `execute_bound_trigger_statement` tail. Only parameter-bound
+  INSERT / UPDATE / DELETE statements are cached.
+- Prediction (posted before the build): -230M to -320M instructions on each trigger row. Kill lines: trig_cte
+  gains less than 150M (at or below the band's low end, per the 2026-11-19 rule); any answer differs; any
+  keeper goes red; any non-trigger row worse than +0.5%.
+- Measured at the landing commit (scratchpad r8). Arms: parent 142d00570 and lever acf5feef1 (the same code
+  as c03a452df), built in one rch job on vmi1227854; cargo-link sha256 2f23857fd759f517 (parent) and
+  e55b12a5f9e6444a (lever). The parent's 1,930 sources equal git, and the lever ELF alone carries the
+  template symbols. thinkstation1, powersave, stock 3.54.1 live, answers equal everywhere.
+
+  | row | Ir lever / parent | x stock, Ir | x stock, cycles | x stock, cpu |
+  |---|---|---|---|---|
+  | trig_cte (the bead's script) | 0.895 (-335M) | 13.2 -> 11.8 | 31.7 -> 28.5 | 26.4 -> 23.8 |
+  | trig_src | 0.899 (-321M) | 11.5 -> 10.4 | 27.9 -> 24.7 | 24.6 -> 21.7 |
+  | trig_values | 0.894 (-344M) | 2.72 -> 2.43 | 5.64 -> 5.02 | 5.41 -> 4.84 |
+  | notrig_cte, ctl_insert_txn, ctl_select | 1.0000 to 1.0007 | | | |
+
+  - Layout-averaged time lines (bd-es2im), two valid runs, each with its own Q group: every trigger row is a
+    replicated WIN on cycles and cpu (0.881 to 0.903); every control is a replicated TIE.
+  - CLI scorecard Ir guard (7 reps, stock 3.46.1 live): 11 rows pass, the largest +0.17%. count_star is
+    undecidable (its A/A moved 0.62%; lever 0.9994). The four file-backed rows went to the coordinator's
+    2026-11-20 rule: 21 interleaved reps x 3 arms (parent, an A/A copy of its ELF, lever) x 2 runs,
+    T = max(0.5%, 2 x 1.2533 x sqrt((sd_P^2 + sd_L^2) / 21)). All four are TIE: txn_1000x10_rows
+    R 1.0102 / 1.0046 (T 2.56% / 4.02%), create_index 1.0003 / 1.0001 (0.50% / 1.18%), delete 1.0003 /
+    0.9896 (4.15% / 4.30%), multiproc 1.0000 / 0.9918 (3.57% / 3.00%).
+  - Integrity check (gate-fix step b), on this pair: under the posted 7-rep rule, txn passes and the other
+    three rows are undecidable; under the corrected rule, 4 TIE and 0 OVER. On round 7's pair the posted rule
+    read txn as OVER at +0.73%, with a per-arm spread of 6.7% to 8.4%.
+- Gate: g34 on cd852b5cc (the same diff on 7c6942608 + bd-u608s): clippy clean; 19 trigger / RETURNING /
+  conflict / error-message keeper targets rc 0; core lib rc 0; the fsqlite crate in 7 batches of 19, 125
+  binaries, 1,100 passed, 0 failed; e2e red only on bd-mc5pp's storm test, identical on the parent. The
+  rebase onto 142d00570 and b81a6da26 crossed GB1 (a disjoint grouped-aggregate region of connection.rs),
+  VFS commits and beads only.
+- Lesson: file-backed Ir rows (txn_1000x10_rows, create_index, delete, multiproc_8x500) vary 3% to 13% run to
+  run, even on the main thread alone. Single-draw A/A tests on 2 or 7 reps cannot resolve a 0.5% line; they
+  need the noise-aware rule above, or a deterministic Ir harness. Callgrind is not one here: two parent runs
+  differed 3x.
+- Retry condition: none for this lever. Left on the row, in bd-fpr5g's order: the dispatcher around each body
+  statement (about 30k of its 56k), which needs a kernel-level UPDATE / DELETE replay path (lever 3b), and the
+  outer row-by-row replay (about 49k). The bead's script is still 11.8x stock in instructions, against its 5x
+  target.
+
+## 2026-11-19 - WIN (landed as 2f4aac8bb): a grouped built-in aggregate of a plain column reads the group's values in place (bd-w4pr1.12, read-loop round 8, lever GB1)
+
+- Target: GROUP BY id over a derived table. The connection's grouped evaluator collected a (value, ORDER BY keys)
+  entry per row for sum(n): a 72 MB block and 1M value clones (DHAT, a7c78382f); 94,624 page faults against
+  stock's 700.
+- Touched: `crates/fsqlite-core/src/connection.rs` (execute_group_by_join_select_inner's catch-all aggregate
+  branch); `crates/fsqlite-core/tests/aggregate_edge_oracle.rs` (keeper `derived_table_column_aggregates`).
+- Change: a built-in aggregate of a plain column, with no DISTINCT and no in-aggregate ORDER BY, collects
+  references to the FILTER-kept rows' non-NULL values. It ends in the same compute call, so no result changes.
+  Recorded before the build as a deviation from the predicted design (stepping an accumulator).
+- Prediction (2026-11-18, before code): GROUP BY id -17k to -19k faults, CPU -35 to -70 ms, Ir -40 to -150M.
+  Kill: GROUP BY id CPU not 25 ms lower in each of two runs; any row +0.5% Ir; a row's cycles pair median above
+  its A/A arm's highest pair ratio in both runs; an aggregate / derived-table / FILTER / DISTINCT / group_concat
+  oracle red.
+- Result (parent 9ce1f49d7, CLI sha256 efaff92a36e9e388, against ac6ac78bb06d734c, an A/A arm; stock sqlite3
+  3.46.1 live; thinkstation1; two runs of 7 interleaved reps; single layout, as predeclared): gb_id Ir 5,278.3M
+  -> 5,154.5M (-123.8M; x3.68 -> x3.59 stock); page faults 94,703 -> 77,131 (stock 698); CPU paired difference
+  -57.0 / -78.0 ms, single-layout (x5.19 -> x4.84 and x5.44 -> x4.83 stock). Every other row within +0.013% Ir;
+  line 3 pass.
+- Planted mutants (rch, rc 101): M1 (no NULL filter) fails "aggregates of a derived column with a NULL row"; M2
+  (unfiltered rows) fails "FILTER keeps only its rows".
+- Gate (fd9074201 + diff 721f804b2bc08815): clippy btree / vdbe / core clean; 70 test binaries (libs, goldens, 46
+  seek / join and 19 aggregate / derived-table / FILTER / DISTINCT / group_concat / JSON-aggregate oracles), 6,274
+  passed, 1 failed; fsqlite-e2e 23 targets, 155 passed; fsqlite crate in 7 batches of 19, 124 binaries, 1,100
+  passed, 0 failed. The one red is bd-gazf2's :memory: GROUP BY order
+  (bd_group_by_depth_oracle_probe::indexed_group_by_predicates_match_sqlite_without_table_scans), which fails
+  identically on the parent cac612a6c without GB1 (line 225, file=false, fsqlite NULL,a,z against stock z,a,NULL).
+- The landed parent (20fa52bc6) was not measured on its own; the commits after 9ce1f49d7 do not touch this function
+  or what it calls. The instruction and page-fault figures are exact, the CPU figures single-layout (predeclared).
+- Retry condition: none for this shape. Left on GROUP BY id: the derived table's projection copies (96 MB + 24 MB
+  in execute_join_select: stream the derived table's rows instead) and the sorter's rows.
+
+## 2026-11-20 - REJECTED on its time kill line (update_10pct_300k cycles a replicated LOSE at unchanged Ir), every instruction line passing and rowid_lookups_200k's cpu and cycles replicated WINs: S3F v2, a miss's second record folded into the tail node (bd-s3fifo-forget-trace-cost-hv2rd, bulk-write round 13)
+
+- Target and construction: as S3F v1 (entry below), plus a per-node count, so the read right after an admission adds
+  to the newest node and a page read once is one node; a full history drops one entry from the oldest node. Kill
+  lines at or below the low end of each band (coordinator's rule, 2026-11-19). Touched (not landed; patch
+  `scratchpad/r13/s3fifo3_on_06963bd47.diff` of the bulk-write lane): `crates/fsqlite-pager/src/page_cache.rs`.
+  Keepers as v1, a third of the generated records doubled; fsqlite-pager lib 1,116 passed, clippy clean.
+- Prediction (bead, before the build): tracker work about 222 a miss (195-245); rowid -266M to -277M, count_star
+  -10.1M to -10.45M, join -9.5M to -9.85M. Kill lines: rowid down less than 265M, count_star less than 10.0M, join
+  less than 9.4M, any row's Ir up more than 0.3%, a replicated time LOSE on any row, a keeper or answer failing.
+- Result, both arms in one job on vmi1227854 (P sha256 db608b401c1d76a1, L 26d4e46bed10c461), stock 3.46.1 live:
+  single ELF rowid 2,699.4M -> 2,430.6M (-268.8M; 4.87x -> 4.38x stock, about 238 a miss), count_star -10.2M
+  (-17.1%), join -10.2M; layout-averaged, two valid runs: rowid cpu 0.955 / 0.952 and cycles 0.942 / 0.939
+  replicated WINs (x-stock cpu 1.800x -> 1.718x), each 1M-row scan -9.6M..-10.6M Ir, no row's Ir up;
+  update_10pct_300k cycles 1.040 / 1.025 LOSE / LOSE (T 1.05% / 1.70%) at Ir 0.9998 / 0.9996, where v1 was TIE.
+- Retry condition: the same construction re-judged after the coordinator settles whether replicated time verdicts
+  at unchanged Ir on rows a lever barely touches come from build-to-build data or heap layout, which a
+  same-build layout A/A (bd-8oo13) does not sample: the fourth such kill (SC8 v2, BR, FB, this one). The tracker's
+  memory went from 16 KB to about 176 KB per cache, a heap-layout change.
+
+## 2026-11-19 - REJECTED on its first kill line (rowid_lookups_200k -259M Ir against the 279M that means tracker work under 170 per miss), every other line passing: the eviction trackers' access trace forgets a page in O(1) per removed entry (bd-s3fifo-forget-trace-cost-hv2rd, bulk-write round 12, lever S3F)
+
+- Target: `S3FifoEvictionTracker::forget` on every page-cache eviction. Callgrind on main (cac612a6c's ELF;
+  page_cache.rs unchanged to 5c7963d88): 1,589 per eviction, 297.9M of rowid_lookups_200k (11.06%, 187,524
+  evictions), 11.26M of count_star (16.4%), 11.27M of join_1M_to_pk_1000; 79% of the clean-buffer take's 2,017 per
+  eviction (the flat-tier search is the other ~430). The trackers record on admission only, never on a hit.
+  This is the fourth try; the bar is the 2026-11-14 entry's retry condition (under 170 per miss, an
+  open-addressing table keyed by page, no sweep). Touched (not landed; patch
+  `scratchpad/r12/s3fifo2_on_5c7963d88.diff` of the bulk-write lane): `crates/fsqlite-pager/src/page_cache.rs`
+  (`AccessTrace` shared by the S3-FIFO and ARC trackers: a slab of nodes in a recording-order list, each chained
+  to its page's next entry; a linear-probing table, power of two at least twice the bound, page -> oldest and
+  newest node, backward-shift removal; the ring-compaction helpers and their two tests replaced by a keeper that
+  drives both trackers beside the old ring over 40,000 generated steps at bounds 64..8,192 and checks lengths,
+  forgotten pages, whole sequences and chosen victims, and a test of `forget` keeping a history past 4,096).
+- Prediction (bead, before the build): rowid -270M to -290M, count_star and join -9.5M to -11M, each 1M-row scan
+  -9.5M to -11M. Kill lines: rowid down less than 279M (tracker work per miss at or above 170), count_star or join
+  down less than 9M, any row's Ir up more than 0.3%, a keeper or an answer failing.
+- Result, stock 3.46.1 live (thinkstation1): single ELF, rowid 2,699.4M -> 2,440.4M (-259.0M; 4.87x -> 4.40x stock),
+  count_star 59.6M -> 49.8M (-16.4%), join -9.2M. Layout-averaged, two valid runs: rowid cpu 0.964 / 0.965 and
+  cycles 0.940 / 0.939, replicated WINs (x-stock cpu 1.800x -> 1.735x); every other row TIE, no replicated LOSE;
+  the scans -9.35M..-11.1M Ir each. Callgrind of the lever on rowid: about 290 tracker instructions per miss
+  (`AccessTrace::record` 64 a call, two calls a miss; the tracker wrapper and its lock ~19 a call; `forget` 123,
+  of which the table removal 25), against l1's 354 and the old ~1,659.
+- Retry condition: tracker work per miss under 170 by callgrind, or a coordinator / owner decision that the bar
+  (set for lazy deletion, whose cost lands on hits) does not apply to a tracker that records only on admission.
+  For the first: fold a miss's second record (the read right after its admission) into the tail node as a
+  count, so a page read once is one node; estimated 180-200 a miss, so measure that alone first.
+
+## 2026-11-19 - REJECTED on its kill line (delete_14pct_300k task-clock a replicated LOSE at unchanged Ir), with bulk -62M Ir and its time TIE as predicted: an appended row raises the rowid floor without building the bump's future (bd-w4pr1.13, bulk-write round 11, lever FB)
+
+- Target: the explicit-rowid floor bump on bulk_insert_1M_one_txn, 175 Ir a row (callgrind on 1292d7b3c:
+  `bump_concurrent_storage_rowid_floor::{closure#0}` 71 self, of which ~50 are the async fn's entry, exit and argument
+  moves into its state; `ensure_table_floor` 104). Every bulk row is an append; no other scorecard row calls it
+  (memory_script runs on `:memory:`; UPDATE, DELETE and CREATE INDEX make no call). Touched (not landed; patch
+  `scratchpad/r11/fb1_on_cac612a6c.diff` of the bulk-write lane): `crates/fsqlite-vdbe/src/engine.rs` (a synchronous
+  `try_bump_concurrent_storage_rowid_floor_after_append` for a row the cursor just inserted as its rightmost, the
+  async bump kept for every other row; the floor value is the same at every call site;
+  `test_explicit_rowid_inserts_claim_their_table_for_the_session` pins it).
+- Prediction (bd-w4pr1.13, before the build): bulk -40M to -60M Ir, task-clock -0.3% to -0.9% (a TIE, landing as
+  maintenance); every other row within +-0.3% Ir. Kill lines: bulk Ir down less than 30M, any row's Ir up more than
+  0.3%, any row a replicated LOSE in cpu or cycles.
+- Result (bd-es2im lines; base cac612a6c, two valid runs, stock live; .text +1,024 B; `run_hot_opcodes_sync`
+  instruction-identical): bulk Ir -63.1M / -61.6M (0.991), cpu and cycles TIE both runs (x-stock task-clock 2.015x ->
+  2.025x and 1.993x -> 1.992x, instructions 1.684x -> 1.669x); every other row's Ir unchanged (read rows within +-8k,
+  memory_script +0.05%); delete_14pct_300k task-clock 1.020 / 1.018 LOSE / LOSE (T 1.57% / 1.46%) at Ir 1.0000, a
+  row whose code path the lever does not touch.
+- Retry condition: with the explicit-rowid floor's other 104 Ir (the allocator's per-row lock and table lookup) in
+  the same lever, so that bulk's time can clear T; or after an owner decision on how the bd-es2im lines treat a
+  replicated time LOSE on a row whose instructions do not move (third such kill: SC8 v2 scan_filter_agg, BR
+  gb_a_sum_c, this one; the null group reruns the parent's same six ELFs, so it does not sample a second relink set).
+- bd-8oo13 (2026-11-19): layout A/A on one build, 0 replicated false verdicts in 56 tests; this rejection stands.
+
+## 2026-11-19 - REJECTED on two kill lines (bulk task-clock a TIE then a WIN, not a replicated WIN; gb_a_sum_c cycles a replicated LOSE at -0.01% Ir), with bulk -33M..-43M Ir and its cycles a replicated WIN: the page cache's budget check counts the overflow shards without locking them (bd-w4pr1.13, bulk-write round 11, lever BR)
+
+- Target: `ShardedPageCache::budget_resident_pages` on bulk_insert_1M_one_txn. Callgrind on 1292d7b3c: 22,324 calls,
+  33.46M Ir, 1,499 a call. Once an overflow insert sets `shards_dirty` (cleared only by a full clear), every count
+  locks all 128 shards, and a trim counts up to three times. Every other scorecard row counts on the flat path
+  (~23 Ir a call): rowid_lookups_200k 563,074 calls, the 1M-row scans 21,817, update / delete 6,285. Touched (not
+  landed; patch `scratchpad/r11/br2_on_cac612a6c.diff` of the bulk-write lane): `crates/fsqlite-pager/src/page_cache.rs`
+  (`PageCacheShard` keeps a cache-wide `Arc<AtomicUsize>` in its mutators, a new `take` replaces the direct
+  `shard.pages.remove` in `take_clean_buffer_at`, and the count reads flat + that counter; a unit test holds the
+  counter equal to the locked sum through every way a shard gains or loses a page; 162 page_cache tests pass).
+- Prediction (bd-w4pr1.13, before the build): bulk -33.0M to -33.6M Ir, cycles -0.8% to -1.6%; every other row within
+  +-0.1% Ir. Kill lines: bulk Ir down less than 25M, bulk task-clock not a replicated WIN, any row a replicated LOSE
+  in cpu or cycles, any row's Ir up more than 0.3%.
+- Result (bd-es2im lines; base cac612a6c, two valid runs, stock live; .text +192 B): bulk Ir -43.1M / -32.9M, cycles
+  0.980 / 0.968 WIN / WIN, task-clock 0.995 TIE (T 2.49%) / 0.964 WIN; gb_a_sum_c cycles 1.027 / 1.016 LOSE / LOSE
+  (T 1.06% / 1.00%) at Ir 0.9999; rowid_lookups_200k Ir -10.3M (-0.38%, outside the +-0.1% predicted: its 563k
+  flat-path counts lost ~18 Ir each); every other row Ir -0.03%..+0.02%, cpu and cycles TIE.
+- Retry condition: as part of a page-cache lever that also removes the trim's other costs, judged on bulk and the read
+  rows together: the clean-buffer search that finds nothing when every page is dirty (bulk: ~13.2M Ir, all 128
+  shards locked again per trim) and the eviction search the read rows pay per admitted page (rowid_lookups_200k
+  412M Ir, 15.3% of the row; count_star 22.8%).
+- bd-8oo13 (2026-11-19): layout A/A on one build, 0 replicated false verdicts in 56 tests; this rejection stands.
+
+## 2026-11-19 - REJECTED again, by its layout-averaged landing run (scan_filter_agg cycles a replicated LOSE at identical Ir; join and memory_script replicated WINs): the table seek cache keeps eight leaves, scanned in place (bd-w4pr1.12, read-loop round 9, lever SC8 v2)
+
+- Lever, target, prediction and kill lines: the 2026-11-18 SC8 v2 entry (ledger 9ce1f49d7), which rejected it on
+  its single-layout third kill line at parent 5afb99152. The bulk-write lane's layout-averaged re-judge at 5afb99152
+  (bd-es2im entry) turned that veto into a pass; a single-layout four-arm run at 9ce1f49d7 passed too (join -463.3 /
+  -463.4M Ir, CPU pair 0.821 / 0.812).
+- Gate of the SC8 v2 tree (9ce1f49d7 + diff cb739f4beca55950): clippy btree / vdbe / core clean; 52 test binaries,
+  6,223 passed, 0 failed; fsqlite-e2e 15 targets, 103 passed; fsqlite crate in 7 batches of 19 targets (one
+  unbatched step spends its whole test timeout building the crate's 124 test targets), 124 binaries, 1,099 passed,
+  0 failed.
+- Landing run (bd-es2im step 5; lines declared on the bead before the measurement): parent cac612a6c against
+  parent + SC8 v2, K=6 relinks of each arm (built on vmi1153651; parent sources equal git file by file; every ELF
+  matches its manifest and stock's smoke output), two runs each with its own Q group, stock sqlite3 3.46.1 live,
+  thinkstation1. join_1M_to_pk_1000 cpu 0.857 / 0.852 and cycles 0.846 / 0.851 WIN (Ir 0.888); memory_script_200k
+  cpu 0.933 / 0.926 WIN (Ir 0.940); scan_filter_agg cycles 1.044 (T 2.02%) / 1.039 (T 2.29%) LOSE at Ir 1.0000; every
+  other row TIE. Kill line "any row with a replicated cycles or cpu LOSE" fires: not landed.
+- What the loss is not: no function among scan_filter_agg's 40 hottest changed size between the arms (the 57
+  size-changed symbols are seek / insert / delete / bulk-load / cursor-open code). The per-layout medians repeat run
+  to run (parent 424 / 388 / 389 / 390 / 388 / 407M cycles, lever 410 / 401 / 391 / 412 / 404 / 414M), while on the
+  unshuffled links the lever is faster (388 against 407M) at equal L1-dcache misses. Candidate, named in the bd-es2im
+  entry: SC8 grows BtCursor's in-struct seek-cache array from 4 to 8 slots, a data-layout change that code shuffling
+  does not randomize.
+- Retry condition (coordinator decision, bd-w4pr1.12 2026-11-19): one priced retry, SC8 v3, with BtCursor's
+  in-struct footprint unchanged (the slot array out of line, allocated on first use beyond slot 0), judged
+  layout-averaged at its exact landing commit under the same four lines. If scan_filter_agg still loses with the
+  footprint unchanged, the footprint hypothesis is refuted and SC8 is rejected with no further retry from this lane.
+- bd-8oo13 (2026-11-19): layout A/A on one build, 0 replicated false verdicts in 56 tests; this rejection stands.
+
+## 2026-11-19 - REJECTED on its kill lines 2 and 3 (memory_script_200k +1.74% Ir; group_by_1000_groups cycles): a seek-cache hit on a resident cached leaf other than the cursor's own is answered without a wait (bd-w4pr1.12, read-loop round 8, lever SL2 v1)
+
+- Target: join_1M_to_pk_1000 after SC8 v2, the 405k cached-leaf hits at about 1,556 Ir each through
+  CursorBackend::table_move_to.
+- Touched (not landed; patch `scratchpad rl8/sc8v2_sl2v2_full.patch`, which includes SC8 v2):
+  `crates/fsqlite-btree/src/cursor.rs` (try_table_seek_within_leaf takes the first admitting slot and answers a
+  non-current leaf the reader holds resident; load_page's decode moves into stack_entry_for_page; keeper
+  test_try_table_seek_within_leaf_answers_resident_cached_leaves with three negatives).
+- Prediction and kill lines (bd-w4pr1.12, 2026-11-18, before the build): join -250 to -400M Ir; kill: join under
+  150M or CPU not lower in each run; any row +0.5% Ir; a row's cycles pair median above the A/A arm's highest in
+  both runs.
+- Result (four arms on parent 9ce1f49d7, sl2 against sc8v2, stock live, two runs of 7 reps): join -186.4 /
+  -186.1M Ir, CPU pair 0.938 / 0.947 (line 1 passes); memory_script_200k +1.738% / +1.748% Ir (line 2 fails);
+  line 3 fired on group_by_1000_groups (single layout).
+- Why (callgrind of memory_script_200k, sc8v2 -> sl2: 3,268.97M -> 3,325.74M): on the script's :memory: join,
+  about 81k probes whose first admitting slot names a non-current leaf pay is_dirty and a resident lookup
+  (TransactionKind::get_resident_page +35.0M, 94,027 -> 175,022 calls). That lookup answers NotResident there, so
+  the fast path never lands one of them (stack_entry_for_page runs exactly as often as load_page, 94,023), and
+  the general path loads the page as before; try_table_seek_within_leaf's first-slot scan adds +13.4M over 200k
+  probes. About +540 Ir per declined probe.
+- Retry condition: PARKED behind SC8 v3 (its decline path scans SC8's other slots, which main does not have). SL2
+  v2 declines a non-current cached leaf without a resident lookup when that lookup cannot answer (for example a
+  per-slot record that the leaf's last resident lookup failed, or the reader saying it holds no resident images),
+  adds no instructions to memory_script_200k (instruction line, single ELF), and is judged on the same four arms and
+  lines, every cycles or time line layout-averaged (bd-es2im). If SC8 v3 is rejected, the retry condition becomes
+  "a landed multi-slot cursor cache".
+
+## 2026-11-19 - NOT ATTEMPTED (scoped): the :memory: time-travel capture without its page copies (bd-w4pr1.12, read-loop round 8, queue item c)
+
+- Target: memory_script_200k's CREATE TABLE u, 17.2M Ir and 3,069 page faults against stock's ~0, all in
+  capture_time_travel_image's read of every page (1,502 TransactionKind::get_page, 10.1M Ir; callgrind of
+  statements 1-3 on a7c78382f).
+- Where it goes: every read misses the page cache (the 200k-row INSERT committed on the retained autocommit path),
+  so each page is read from the MemoryFile into a pool buffer and inserted in the cache (in-flight read claim and
+  finish, 3.3M Ir), then copied again for the snapshot (malloc + memcpy): two copies per page, the 3,069 faults.
+- Why no cheap lever: the first copy fills the cache that the next statements scan, so a capture that reads
+  around the cache (the existing read_page_copy_uncached) moves that copy to the next reader. Only the second copy
+  is removable, and that needs the cache to hand out its buffer as an immutable shared image without copying
+  (CachedPage::shared_page() copies; MemoryFile keeps the database in one Vec<u8>): a PageData / page-cache
+  representation change. Its ceiling is about 1.5k faults and 2-3 ms, at most 1% of memory_script_200k, whose
+  own A/A CPU pair medians move 0.983-1.015.
+- Retry condition: the page cache holding committed images as shared immutable (copy-on-write) buffers, or a
+  workload where :memory: DDL / COMMIT captures are a measured share of CPU (several percent of a row).
+
+## 2026-11-19 - REJECTED on its declared kill line (gh19 still red; its close drops from over 600 s to 39.7 s against a 30 s wait): WAL-FEC encodes a large repair group with asupersync's inactivation solver instead of the dense page-width SystematicEncoder (bd-mcpbv item 2, gh19, multi-process lane round 6)
+
+- Target: wal_reset_with_foreign_reader::gh19_public_native_full_commits_grow_shared_segments_before_stock_refresh.
+  - It fails "segment-writer reader failed to exit within 30 seconds".
+  - The segment writer makes two commits of about 4,100 frames at 512-byte pages, and its close drains the WAL-FEC
+    queue.
+  - Each commit is one repair group. Recovery depends on that: a group must start right after the committed frames
+    and end at a commit frame.
+  - A group with k * 4 > symbol size goes through `SystematicEncoder::new`, whose `ConstraintMatrix::solve` is a
+    dense elimination cubic in L.
+  - The test profile builds asupersync at opt-level 0.
+- Lever: for such a group, feed `InactivationDecoder` the constraint symbols plus the K source pages. Each repair
+  symbol is then the sum over `repair_equation_rfc6330(esi)` of coefficient times intermediate symbol: the
+  equations WAL-FEC recovery already decodes with.
+  - Byte-identical to the page-width encoder. `test_coefficient_repair_symbols_match_systematic_encoder` now covers
+    K = 129, 200, 300 and 513 on this path, with a changed-source negative.
+  - fsqlite-wal lib and tests: 15 targets, 1,309 passed.
+- Ledger preflight: no earlier entry covers WAL-FEC encode cost. bd-w4pr1.7 round 3 (the coefficient cache) is the
+  small-K path and is kept.
+- Result (rch, test profile):
+  - Encode alone, solve and two repair symbols, 512-byte symbols:
+    - K=513: 0.6 s (dense 1.4 s);
+    - K=1,025: 1.9 s (dense 8.8 s);
+    - K=2,050: 5.7 s;
+    - K=4,100: 19.5 s.
+    - It grows about 3.2x per doubling, so it is not linear.
+  - gh19's writer close, measured with the wait widened to 600 s in a scratch copy of the test (never committed):
+    - main (d1aad9457): over 600 s, no exit;
+    - with the lever: 39.7 s.
+  - The unchanged test still fails 2 of 2 with the lever (rch, two workers). Kill line: "gh19 not green 3 of 3".
+  - The CLI runs no WAL-FEC pipeline: no `-wal-fec` sidecar after a bulk insert, and the scorecard's bulk row
+    takes about 1 s. So no CLI row can show this change.
+- Not tried, because each is a gate change or a decision above this lever:
+  - raptorq_repair_symbols=0 or another runtime in the test;
+  - asupersync's opt-level 0 in [profile.dev.package.asupersync] (86220d567, no stated reason);
+  - bounding close to the in-flight encode (it breaks the close-drains contract and its keeper).
+- Retry condition, either of these:
+  - with the encode of a connection's independent repair groups run in parallel, so gh19's close waits for about
+    one encode instead of two (about 20 s in the test profile);
+  - or with bounded groups: a large commit split into several RaptorQ source blocks (OTI z > 1) or several groups,
+    which needs recovery to accept groups that do not end at a commit frame.
+  Either combines with this lever. Release builds would cut the two encodes from about 54 s each (this bead's
+  2026-10-11 numbers) to about 1.3 s each (estimated as test profile / 15).
+- Retried 2026-11-19 under the second condition, and landed (bd-mcpbv item 2, the commit that adds this line):
+  - bounded RaptorQ source blocks inside the commit's one group (OTI z > 1, at most 256 frames per block), so
+    recovery's commit-frame rule is unchanged;
+  - with this lever's inactivation-solver encode per block;
+  - gh19 green 3 of 3 on each of two workers.
+  - Measured release on ovh-a corrects the /15 estimate above: main's close of one 4,335-frame commit at 512 B takes
+    35.1 to 35.3 s; with the blocks it takes 0.17 to 0.19 s.
+
+## 2026-11-19 - REJECTED in all three constructions (plain programs' instructions do not stay unchanged): the synchronous lane chosen per program, so that only a program with a Concat or an Affinity runs them on it (bd-w4pr1.13, bulk-write round 11, lever LA v3)
+
+- Target and kill lines: as LA v1 (entry below), plus the coordinator's line: rows whose programs contain neither
+  opcode keep their instructions exactly. Touched (not landed; patches `scratchpad/r11/la3_on_1292d7b3c.diff`,
+  `la3b_on_1292d7b3c.diff`, `la3c_on_1292d7b3c.diff` of the bulk-write lane): `crates/fsqlite-vdbe/src/engine.rs`,
+  `crates/fsqlite-vdbe/src/lib.rs` (`HotLane` precomputed in `ProgramBuilder::finish`; the main loop's Concat and
+  Affinity bodies moved into out-of-line `execute_concat` / `execute_affinity`).
+- Static check, declared before each build: today's `run_hot_opcodes_sync` (98,414 B on 1292d7b3c) keeps its size and
+  its address-masked instruction sequence (`scratchpad/r11/fn_same.py`; controls: two builds of the parent match,
+  v3b's lane does not).
+- v3 (`run_hot_opcodes_sync<const ROW_BODY: bool>`, two instances, picked once per statement through a function
+  pointer): the `false` instance is 53,351 B. Seven helpers the single lane inlines today
+  (`try_column_to_reg_in_place`, `try_column_to_reg_direct_local`, `try_sorter_column_to_reg`,
+  `execute_vcolumn_hot`, `execute_vnext_hot`, `take_reg_with_subtype`, `CursorBackend::try_next_within_leaf`) have
+  two lane callers and went out of line. One layout-averaged run (stock live): plain rows +0.95%
+  (rowid_lookups_200k) to +9.3% (gb_a_sum_c) Ir; six rows LOSE in cycles in that run; bulk -119.4M Ir (-1.69%),
+  cpu TIE.
+- v3b (v3 with `#[inline(always)]` on those seven): the `false` instance is 58,356 B. Two more helpers went out of
+  line (`try_read_column_in_place`, `BtCursor::try_advance_next_within_leaf` in three instances). Not run.
+- v3c (today's single lane, wrapped by an out-of-line `run_row_body_lane` that runs Concat and Affinity between
+  its turns, the wrapper or the lane picked per statement through a function pointer): `run_hot_opcodes_sync` is
+  99,914 B from unchanged source, and its call sites changed (`pool_return_reusable` 34 -> 38, `drop_glue<SqliteValue>`
+  6 -> 7, one `set_register_subtype` inlined). One informational run (base 1292d7b3c, stock live, null 1.0000 on
+  every read row): plain rows -0.33% (order_by_text_limit10) to +0.31% (delete_14pct_300k) Ir; bulk -103.6M Ir
+  (-1.47%; predicted -150M to -230M), cpu 0.983 WIN; memory_script -18.0M (predicted -25M to -50M); update +0.17%
+  (predicted -0.2% to -1.0%).
+- Why: with codegen-units=1 and fat LTO, the lane's machine code depends on the engine's whole call graph, not only on
+  its source. A second instance, a second caller, a taken address or a main-loop arm moved out of line each changed
+  what LLVM inlined into the lane. No construction found leaves today's lane byte-identical and adds no instruction
+  per lane entry: selecting by a branch costs every lane entry, and every other selection changes the lane.
+- Retry condition: a construction whose plain-row lane is byte-identical to main's (compare the lane's machine
+  code, not only instruction counts) and that meets its predicted bulk gain. A band for plain rows was proposed
+  and declined (bd-w4pr1.13, 2026-11-19).
+
+## 2026-11-19 - FIX (landed as 0a2ada09a; a regression of the bd-q4o7z landing, judged against its 2% kill line): the commit replay's per-call hook no longer builds a future, and a prepared execute skips the nested wrapper; the one-writer prepared insert's excess drops from +3.7% to +1.84% Ir per row (bd-q4o7z probe 5, multi-process lane rounds 3-4)
+
+- Target: bd-q4o7z probe 5, the recording cost on mt-mvcc-bench at 1/8/32 writers.
+  - The default bulk shape is 1,000 rows per BEGIN CONCURRENT transaction through one prepared
+    INSERT. It never records, so the whole cost is the hook.
+  - Touched: `crates/fsqlite-core/src/connection.rs`, with its 16 public wrappers and the bodies of
+    `PreparedStatement::execute{,_with_params}`. Also `connection/txn_replay.rs`
+    (`txn_replay_leave`, `ReplayLeave`).
+- Cause:
+  - Each row went through two enter/leave pairs: `PreparedStatement::execute_with_params`, and the
+    nested `Connection::execute_prepared_with_params`. The nested one never records, because it
+    always runs inside the outer call.
+  - Each pair awaited an async `txn_replay_leave`. Its state machine, about 330 bytes, was built
+    and polled once per call.
+- Attribution: callgrind, collection toggled on the per-row poll
+  `PreparedStatement::execute_with_params::{closure#0}`, 4,000 rows, symbolized release-perf.
+  - The isolating base is the same tree with a3d329d47 reverted, as an uncommitted scratch build.
+  - v1 (synchronous leave only), on 74bd92b09: +250.8 Ir per row over 6,774.7.
+    - outer wrapper +93;
+    - nested wrapper inlined into the reprepare closure +81;
+    - two out-of-line `txn_replay_leave::<usize>` calls +73.
+  - This change, as landed on bfadb3374 together with bd-7dxmt (d46a7cd1f): +125.1 Ir per row over
+    6,785.4 (+1.84%).
+    - The nested wrapper is skipped, and the leave's non-recording path is inlined.
+    - What remains is the outer wrapper's enter/leave logic, inlined into the per-row closure
+      (+106), and the extra future layer's drop glue (+27).
+    - An earlier bd-7dxmt draft put the commit evidence in the per-call scope. Enter and leave then
+      stopped inlining (+51 Ir per row), so the landed bd-7dxmt keeps that state in
+      TxnReplayState.
+- Ledger preflight: round 2's bd-q4o7z entry. Its v1, an awaited enter/leave around a moved body,
+  cost +1% CPU. v2 then measured only the CLI per-transaction count (+0.9%), never a prepared bulk
+  path.
+- Result: mt-mvcc-bench fsqlite p50 throughput of the landing binary, against the isolating base,
+  with A/A arms. Each line gives the two land arms (the same ELF twice), then the base's own A/A
+  arm.
+  - 1 writer, 12 reps: 0.998 / 0.978; base A/A 1.004.
+    - Paired per rep: 0.996 / 0.976 (mean -1.4%); base A/A 0.9965.
+    - Stock inside each binary pairs at 1.019 / 1.010 / 0.988.
+  - 8 writers, 5 reps: 1.024 / 0.980; base A/A 1.001.
+  - 32 writers, 5 reps: 0.976 / 0.964; base A/A 0.997.
+    - Paired: 0.985 / 0.992.
+    - In the previous run of the earlier landing binary, the base's A/A arm itself read 0.962.
+    - Rows failed in every arm at 32 writers, the base included (28,000-56,000 per arm over 5
+      reps, out of 352,000 per rep). That happened before a3d329d47 too.
+  - Verdict:
+    - The exact instruction excess is +1.84%, under the 2% line.
+    - Time is inside the A/A band at 1 and 8 writers.
+    - 32 writers is not decidable at this rep count.
+  - ELF sha256, self-reported in-process: landing 1ed49967ee43bbb7, isolating base
+    81863b48bc76e560.
+- Setup:
+  - release-perf, symbolized, mt-mvcc-bench;
+  - stock SQLite live in every invocation;
+  - thinkstation1, powersave, TMPDIR on tmpfs;
+  - A/A arms of both binaries. Scratchpad: `mp3/bench_land3_*.txt`.
+  - The bench reports citable=false for every arm under bd-uh1fv's standing policy, so these are
+    internal A/B numbers.
+- Time is placement-bound here:
+  - In the earlier landing binary's 1-writer run, stock's own p50 inside that binary was 0.93 of
+    the base binary's. Stock's code is identical in both, so that is code placement (bd-es2im's
+    METHOD entry), not this change.
+  - The instruction count above is the exact measure.
+- Retry condition: fold the `_unrecorded` body into the public method, so the hot call has one
+  future layer. Worth doing if a later shape shows the outer wrapper above 1% of a
+  prepared-statement profile, or if probe 5 needs the last 1.8%.
+
+## 2026-11-19 - WIN (landed as 3dc23aad9; a little beyond its prediction): firing a trigger clones neither its definition nor its OLD/NEW frame (bd-fpr5g, SQL lane round 5, lever 2)
+
+- Target: the per-firing copies of the trigger machinery. Callgrind on trig_src_2000 (release-perf,
+  LTO off) put TriggerDef clone and drop at 28.4M of 431M (about 14.8k per inserted row):
+  fire_*_triggers collected the matching definitions with `.cloned()`. TriggerFrame clone, drop
+  and the guard's pop added 12.3M (about 6k per row): the base frame was cloned per trigger to
+  stamp its name, and that copy cloned again onto trigger_frame_stack, which is read only for its
+  depth and the recursive_triggers name check.
+- Ledger preflight: no entry on trigger definitions or frames. Lever 1 (the 2026-11-18 entry
+  below) was this bead's first.
+- Change (connection.rs): the trigger list (its TxnRestorableCell, and the savepoint
+  SchemaSnapshot) holds `Arc<TriggerDef>`. The two ALTER RENAME rewrites edit through
+  Arc::make_mut, which copies only a definition a snapshot still shares. trigger_frame_stack holds
+  trigger names. TriggerFrame lost its trigger_name, and the fire loops use the base frame.
+- Prediction (posted before code): -300M to -450M on each 20,000-row trigger row; notrig_cte
+  within 0.5%. Kill line: trig_src gains less than 150M, any non-trigger row worse than 1%, or any
+  answer differs.
+- Measured: release-perf CLIs as shipped. Base: lever 1 on 895ee627a, sha256 07d8430d4c3df48d.
+  Lever: lever 2 on dc7142eec, the same code, sha256 2617db8caf19c7e3. Conditions: :memory:,
+  instructions:u and task-clock, medians of 5, stock 3.54.1 live, answers equal, thinkstation1,
+  powersave. A/A arm of the base (3 reps): trig_cte 0.9923, the other rows within 0.1%.
+
+  | row | base | lever | lever / base | x stock, instructions | x stock, CPU |
+  |---|---|---|---|---|---|
+  | trig_cte | 3,622.1M | 3,166.6M | 0.874 | 15.0 -> 13.1 | 28.8 -> 25.3 |
+  | trig_src | 3,644.5M | 3,156.9M | 0.866 | 13.3 -> 11.5 | 23.3 -> 20.6 |
+  | trig_values | 3,690.3M | 3,219.9M | 0.873 | 3.09 -> 2.69 | 5.54 -> 4.95 |
+  | notrig_cte | 293.9M | 293.9M | 1.000 | | |
+
+  -455M to -488M: a little beyond the predicted range, in the good direction.
+- Landing binary (78a37df18: lever 2 with bd-uy8iy and bd-jlbrk on 5a62e9606, sha256
+  959dee25d140b27e) against lever 1's landing binary (07d8430d4c3df48d), 5 reps, answers equal.
+  trig_cte went from 3,600.0M to 3,166.7M (0.880): x14.9 -> x13.1 stock in instructions and
+  x26.1 -> x23.0 in CPU. trig_src 0.871, trig_values 0.869, notrig_cte 0.999.
+- Keepers: crates/fsqlite-core/tests/bd_fpr5g_trigger_body_cache_under_cte.rs gained two tests,
+  stock live on :memory: and a file. One renames a trigger's table and column, then rolls the
+  rename back with the transaction or to a savepoint, or commits it. The other checks
+  recursive_triggers: OFF stops only self re-entry while a sibling fires, and ON recurses until
+  WHEN stops it. Also held: the bead's trigger keepers, gh448's change counters (file-backed:
+  minutes on a fast worker; it ran over an hour on vmi1293453 and was cancelled there), and the lib
+  tests matching "trigger" (142 passed, 0 failed).
+- Gate (rch, on 78a37df18 with bd-uy8iy and bd-jlbrk):
+  - cargo check --all-targets of vdbe and core at each intermediate commit;
+  - clippy -D warnings, vdbe and core, all targets: clean;
+  - 18 keeper targets: 116 passed, 0 failed;
+  - 19 AUTOINCREMENT / UNIQUE / conflict / conformance targets: 1,760 passed, 1 failed. The
+    failure is indexed_group_by_predicates_match_sqlite_without_table_scans, a known red on main;
+  - vdbe lib and goldens: 1,265 passed, with no .snap change;
+  - core lib: 4,202 passed, 0 failed;
+  - the fsqlite crate, its lib and 123 targets: 1,099 passed, 0 failed;
+  - 6 e2e targets: 57 passed, 0 failed.
+  After the rebase onto 1292d7b3c (main's pager, VFS, connection.rs and CLI changes): clippy
+  clean, 12 keeper and conflict targets 68 passed with 0 failed, and the core lib tests matching
+  "trigger" 142 passed. It was pushed onto 8affa342a with the same diff.
+- Retry condition: none for this lever. Left on the row, in bd-fpr5g's order: the body bound
+  per row (about 17k), the dispatcher around each body statement (about 30k of its 56k) and the
+  outer row-by-row replay (about 49k).
+
+## 2026-11-19 - REJECTED on its instruction clause, worse than v1 (11 of 14 rows over +0.3% Ir, join +2.18%): Concat and Affinity run by an out-of-line handler the synchronous lane asks after its match declines an opcode (bd-w4pr1.13, bulk-write round 10, lever LA v2)
+
+- Target and kill line: as LA v1 (entry below). Touched (not landed; patch `scratchpad/r10/la_v2_on_1b789b749.diff`
+  of the bulk-write lane): `crates/fsqlite-vdbe/src/engine.rs` (`try_execute_row_body_opcode_sync`, `#[inline(never)]`,
+  called in `run_hot_opcodes_sync` when `try_execute_hot_opcode_sync` returns false; the lane's match as on main).
+- Prediction (bd-w4pr1.13, before the build): scan rows +0.0..+0.8% Ir (one decline a scanned row), bulk -280M to
+  -330M Ir.
+- Result (bd-es2im lines; base main 1b789b749, one valid run: instruction counts do not depend on layout): join
+  +2.18% Ir, scan_filter_agg +1.27%, order_by_text_limit10 +1.02%, delete +0.89%, gb_id +0.76%, group_by_1000 +0.64%,
+  gb_a_mod10 +0.58%, gb_id_mod100k +0.50%, rowid_lookups +0.39%, window_sum_over +0.36%; bulk Ir -3.15% (v1 -4.5%),
+  cpu 0.960 WIN; focused benches faster at every size. The call on every declined opcode costs each scanned row
+  (its Next declines to the async lane) and bulk's Insert, three to four times v1's arm cost.
+- Retry condition: both placements cost scan rows; LA waits for a synchronous lane whose scan rows leave it less
+  often than once a row, or for an owner decision on the 0.3% instruction guard against v1's trade (bulk task-clock
+  -3.2..-4.5%, memory_script -2..-3%, join -2..-4%, all replicated layout-averaged WINs, for +0.27..+0.37% Ir on four
+  rows).
+
+## 2026-11-19 - METHOD (measurement only) and RE-JUDGE: cycles and time lines are judged over six linker-shuffled layouts of each arm; of four vetoes, SC8 v2's flips to a pass, TN1's GROUP BY cost is not a cost, AF and D stay rejected (bd-es2im)
+
+- Defect: one unrelated change moved the same rows -5.3%..+6.4% in cycles at identical instructions (TN1-out
+  entry); SC8 v2 was vetoed on scan_filter_agg / gb_id cycles at identical Ir; AF and D on bulk task-clock swings
+  of -34..+22 ms between runs. A single build is a single code placement.
+- Method: `scripts/layout_shuffle_relink.sh`, `scripts/layout_shuffle_pair.sh` (one rch --job per parent/lever
+  pair): build the release-perf CLI once with `-C save-temps --print link-args`, replay the captured cc + rust-lld
+  command unchanged (it must equal cargo's ELF byte for byte), relink K=6 times with
+  `-Wl,--shuffle-sections=.text*=<seed>`. Every workspace source is touched before the parent build and its
+  per-file sha256 list is compared with git (a stale artifact once built D's parent from AF's patched sources: the
+  sync gives a changed file its older local mtime and cargo keeps the newer artifact). Every ELF matches its worker
+  manifest and gives stock's output on a smoke script. No fn_align, no alignment flags (owner decision, bead).
+- Validation (SC8 v2's parent 5afb99152): the six layouts reproduce the band at identical Ir (scan_filter_agg
+  cycles 0.976..1.055 and 0.984..1.066 in two runs, gb_id 0.969..1.032 and 0.963..1.034, bulk 0.963..1.017); a
+  layout's position repeats run to run (rank correlation +0.94 scan_filter_agg, +0.83 gb_id); one ELF re-run stays
+  inside +-2.5%. The unshuffled link sits at 0.966..1.018 of the shuffled median, on the fast side on 9 of 14 rows:
+  the averaged statistic describes random placements, not the shipped one (the bead's NO-CLAIM).
+- Lines (declared on the bead before any lever was judged; three defect fixes published there with their evidence
+  before the runs they apply to): per row and metric, M = median over 6 layouts of each layout's median over reps
+  (read rows 7, delete / update 7, bulk 5, memory_script 5); SE = 1.2533 * sqrt((sd_P^2 + sd_L^2) / 6) from MAD
+  spreads; T = max(1%, 2 SE); WIN / LOSE beyond T only when two independent runs agree. Each run carries Q, the
+  parent's six ELFs again: 168 null comparisons over six runs had median |z| 0.52, 6.5% beyond 2 (normal 4.6%) and
+  1.8% beyond 3.1 (a heavy tail), so one run decides nothing and an "any |z| > 3.1 voids the run" rule voided half
+  the runs and was dropped. Instruction lines unchanged.
+- Re-judge, stock sqlite3 3.46.1 live in every run (thinkstation1, powersave, load 2-10):
+
+  | lever (vetoed by) | layout-averaged, replicated | verdict |
+  |---|---|---|
+  | SC8 v2 (scan_filter_agg / gb_id cycles at equal Ir) | scan_filter_agg 0.991 / 1.005, gb_id 0.994 / 0.996, no row LOSE; join cpu 0.834 / 0.845 WIN, memory_script 0.934 / 0.927 WIN | REJECTED -> passes all its kill lines (the serial lane's lever; not landed here) |
+  | TN1's GROUP BY cost (+3.4 / +4.7% cycles) | every GROUP BY row TIE in three runs (gb_a_sum_c 1.018 / 1.005 / 1.013, gb_a_mod10 1.007 / 0.990 / 0.996); order_by 0.810 / 0.806 / 0.785 WIN | the cost was placement |
+  | AF (bulk task-clock +22 ms, cycles +97.8M) | bulk cpu 1.019 / 0.983, cycles 0.993 / 0.979 TIE; no row LOSE | stays REJECTED: Ir -78.6M, time gain unresolved |
+  | D (bulk task-clock not down) | bulk cpu 0.986 / 0.997, cycles 0.994 / 1.002 TIE (Ir -0.44 / -0.49%); no row LOSE | stays REJECTED: no cost, gain unresolved |
+
+  Integrity split (AGENTS.md gate-change rule): two of four verdicts change (SC8 v2 LOSE -> WIN, TN1's cost LOSE ->
+  TIE), two do not (AF, D). Not every veto flipped to a win.
+- Cost: a pair of arms is one rch --job (a 15-25 min build, 6 relinks, ~1.6 GB of ELFs back); a judgement run is 17
+  min (13 rows, 18 fsqlite arms and stock). Bulk's T was 1.0..2.7%: a lever must move bulk by about 2% before its
+  time can be a replicated WIN.
+- Retry condition: none for the method. A row whose spread makes T larger than a lever's claimed effect cannot
+  carry that claim; a lever that changes a data structure (SC8 v2's slot array) is not randomized by code shuffling.
+
+## 2026-11-19 - REJECTED on its instruction clause (scan rows +0.31..+0.37% Ir against 0.3%; bulk task-clock a replicated layout-averaged WIN, -3.2..-4.5%): Concat and Affinity as arms of the synchronous lane's match (bd-w4pr1.13, bulk-write round 10, lever LA v1)
+
+- Target: the INSERT ... SELECT row body, which left `run_hot_opcodes_sync` three times a row (Concat, Affinity,
+  Insert; `execute_program_body` self 631M over 3.0M dispatches on the bulk row, callgrind of main c216c0852).
+  Touched (not landed; patch `scratchpad/r10/la_v1_on_314ae60b9.diff` of the bulk-write lane, `git diff` sha256
+  a70624847be57cd4): `crates/fsqlite-vdbe/src/engine.rs` (`execute_concat` / `execute_affinity` out of line, the
+  main loop's two arm bodies moved unchanged; two arms in `try_execute_hot_opcode_sync`; test
+  `test_concat_and_affinity_run_on_the_synchronous_lane`).
+- Ledger preflight: the 2026-05-24 Concat and Affinity hot-dispatch promotions (rejected: "not as a standalone
+  patch"; retry on a real workload profile plus the focused criterion benches same-worker); lever AF's retry
+  condition named this; lever S's note that a larger lane loop costs DML scans.
+- Prediction (bd-w4pr1.13, before code): bulk -150M to -300M Ir, task-clock -1.5..-3.5%; memory_script -25M to
+  -60M; update -0.5M to -3M; delete within 0.5M; read rows within 0.1% Ir. Kill: bulk under 100M, bulk task-clock not
+  a replicated WIN, any replicated LOSE, any row +0.3% Ir, a focused bench 5% slower at any size.
+- Result (bd-es2im lines, two valid runs, stock sqlite3 3.46.1 live, thinkstation1; base main 314ae60b9, both
+  arms built behind the stale-artifact guard): bulk Ir -4.5% / -4.65% (-317M / -327M, beyond the prediction), cpu
+  0.956 / 0.968 and cycles 0.955 / 0.964 WIN (stock 4,177.4M); memory_script Ir -1.85%, cpu 0.980 / 0.971 WIN;
+  join_1M_to_pk_1000 cpu 0.977 / 0.957 WIN at equal Ir; update Ir -0.93%; no replicated LOSE. Focused benches
+  (hz4, base -> lever): affinity -3.0 / -16.9 / -36.5%, concat -8.0 / -16.7 / about -19% (64 / 256 / 1024 ops).
+  Killed: scan_filter_agg Ir +0.31%, group_by_1000_groups +0.31 / +0.27%, gb_id_mod100k +0.32%, delete +0.36 /
+  +0.37%: about 4 instructions per scanned row, as two more arms in the lane's match change its code for every
+  opcode a scan runs (lever S's arms cost +19 a row).
+- Retry condition: v2, the same bodies asked only when the lane's match declines an opcode, keeps that match as on
+  main; it is judged on the same lines. If it also costs scan rows over 0.3% Ir, the cost is structural: then a
+  lane that leaves a scanned row less often, or an owner decision on the 0.3% guard.
+
+## 2026-11-19 - REJECTED (tmpfs scorecard row 9-13% slower, predicted 25% faster; CPU at N=8 +28%): a page-conflict retry whose backoff stops growing at 2 ms while a held lock keeps the 50 ms ceiling (bd-1qmz4, multi-process lane round 3)
+
+- Target: the scorecard's `multiproc_8x500` (8 CLI processes x 500 autocommit INSERTs into one WAL
+  database, tmpfs), x8.7-8.9 stock on thinkstation1 today.
+  - Touched, not kept: `crates/fsqlite-core/src/connection.rs` and `connection/txn_replay.rs`.
+  - The change: `BeginBusyRetryHandoff::next_wait_after` capped the sleep at 2 ms when the
+    retried attempt had failed with BusySnapshot or WriteConflict. It applied to the two
+    autocommit statement retries and to the bd-q4o7z replay loop.
+  - Busy, BusyRecovery and DatabaseLocked kept the 50 us -> 50 ms schedule.
+  - Patch: scratchpad `mp3/cap_v1.patch` (sha256 7fb726317ef093ec), with a unit keeper for the
+    capped schedule.
+- Ledger preflight:
+  - lever 1 below, the polling VFS lock wait, REJECTED on explicit refusals;
+  - bd-9kvey's 50 us base with the 50 ms ceiling;
+  - the 2026-05 fences on in-process concurrent backoff tweaks.
+- Mechanism it targeted, from round 1's gdb census:
+  - each writer runs one escalating sequence: 0.7, 1.5, 3.1, 6.1, 12.6, 25.5 ms, then 49.9 ms
+    x6-9;
+  - that is 0.3-0.5 s of a 0.5-0.65 s life, after BusySnapshot refusals under the writer lock.
+- Prediction (on bd-1qmz4 before code): scorecard row -25% (band -15% to -45%); N=8 -20%,
+  N=16 -30%; CPU at N=8 +5-15%. Kill lines: under 10% gain, CPU at N=8 +25%, explicit-rowid
+  committed median 5% below base, A/A outside +-5%.
+- Result:
+  - Setup: release-perf CLIs, base a3d329d47 code (9b643f143363bd3b) against base + the cap
+    (227f7392e256193c); stock sqlite3 3.46.1 live; arms rotated; thinkstation1, powersave.
+    Scratchpad: `mp3/ab_cap1.txt`, `mp3/ab_cap1_tmpfs.json`, `mp3/ab_cap1_disk.json`.
+  - Scorecard row (`mp1_scrow.py`, 15 reps):
+    - base 0.834 s (x8.76), cap 0.908 s (x9.53), A/A copy of base 0.831 s;
+    - rerun: base 0.860 s (x8.93), cap 0.976 s (x10.13), A/A copy of the cap 0.941 s.
+  - Scaled probe, tmpfs, 4,000 rows, 3 reps (wall per txn; CPU per txn):
+
+    | N | base | cap |
+    |---|---|---|
+    | 1 | 118.0 us; CPU 118.5 us | 119.7 us; CPU 119.0 us |
+    | 2 | 144.4 us | 133.6 us |
+    | 4 | 165.7 us | 173.9 us |
+    | 8 | 209.7 us; CPU 231.3 us | 210.5 us; CPU 295.3 us (+28%) |
+    | 16 | 293.0 us | 279.3 us |
+
+  - Disk NORMAL, N=8: wall unchanged (257.7 -> 257.1 us), CPU +35%.
+  - explicit-same 8 x 300 (replayed blind INSERTs): 2,400 in every rep for both; wall 658 ->
+    712 ms.
+  - explicit-rowid 8 x 300 (CLI-style, reads `last_insert_rowid()`): committed median 1,741 ->
+    1,696 (-2.6%).
+  - auto-same: unchanged.
+  - Integrity ok everywhere.
+- Why: a loser that comes back in 2 ms instead of 25-50 ms takes RESERVED and is refused again
+  under the lock. The holder it waited for had just committed to the same rightmost leaf. So
+  sooner returns add refused holds and CPU rather than throughput.
+  - The long sleeps were thinning the race.
+  - That is the same lesson as lever 1, at the connection's retry instead of the VFS lock wait.
+- Retry condition: only together with lead (b), a commit that refuses before taking RESERVED
+  when the shared WAL-index already shows a peer frame for one of its pages. A sooner return is
+  only cheap once a doomed attempt stops costing a lock hold. Not as a standalone patch.
+
+## 2026-11-18 - FIX (landed as 7214b9c57; a correctness fix measured like a lever, inside its kill line): a held prepared rowid lookup reads another process's commit after a WAL reset; the row mirror is stale when the page cache's image epoch moved, not only when the commit sequence did (bd-2mpxx, read/seek round 8)
+
+- Target: bd-2mpxx. A held prepared rowid lookup kept returning a pre-commit value after a stock process committed
+  and the WAL was reset (TRUNCATE or RESTART). Touched: `crates/fsqlite-pager/src/page_cache.rs`,
+  `crates/fsqlite-pager/src/pager.rs`, `crates/fsqlite-core/src/connection.rs`, and the keeper
+  `crates/fsqlite-core/tests/prepared_statement_cross_process_staleness_oracle.rs`.
+- Cause:
+  - In WAL mode the pager's visible commit sequence is the main file's change counter plus the WAL's commits,
+    clamped never to go backward.
+  - A stock writer does not bump the change counter on a WAL commit. So after a WAL reset plus a commit, the probe can
+    land at or below the count the pager already had.
+  - The refresh clears the page cache (a new WAL generation), so pager reads are current. The commit sequence does
+    not move, though, and the connection's row mirror decided staleness only by commit sequence. The prepared rowid
+    fast path answered from it.
+- Not done, and why: advancing the pager's commit sequence on such a change. The WAL commit path takes
+  certificate-assigned sequences (`record_local_wal_commit_at`). An inflated local counter would stop matching them,
+  and own commits would then look like foreign ones.
+- Fix:
+  - The sharded page cache counts its full clears (`image_epoch`). Full clears happen on a foreign commit or WAL reset
+    seen by a refresh, on recovery, and when a validated image is published, never on an own commit.
+  - The connection records that epoch whenever it reloads the mirror, and every mirror staleness decision also fires
+    when it moved.
+  - The prepared schema refresh's lightweight branch drops `memdb_rows_loaded`, as the schema-only reload does. It
+    advanced the mirror's sequence without reloading rows.
+- Ledger preflight: lever 1 (bd-05xlf, round 7, below) moved the prepared read's staleness check into its begin; the
+  rowid probe was red there and on 0dd0e7102 before it.
+- Prediction (on the bead before the build): select-rowid within +0.2% instructions; select-index and autocommit
+  INSERT within their A/A bands. Kill line: select-rowid worse than +5% instructions, stock live.
+- Result:
+  - Setup: thinkstation1, governor powersave, io_uring refused, prepared-dml-probe at N = 2,000 and 22,000 (per
+    execution = difference / 20,000), 7 interleaved reps, medians. Stock 3.54.1 live. The fsqlite arms read copies of
+    one file built by main, sidecars included.
+  - On the landing base 8705691b2 (load about 2): main (probe sha256 4aeaf74b56524472), its A/A copy, and main +
+    this fix + bd-79p0a (a7aada8d82fe95b5; bd-79p0a changes only aggregate programs, which these rows do not run).
+  - First run on f75c6e50c (load about 10): main ab39c95cf75d6376 against this fix alone, c42c6aba1783d97b.
+  - Answers equal across arms in both runs. Scratchpad of the read/seek lane: `rs8/lk2.out` and `rs8/lk1.out`.
+
+  | row | stock | main | A/A | fix (landing base) | fix alone (f75c6e50c) |
+  |---|---|---|---|---|---|
+  | select-rowid | 4,721 | 8,177 | 8,164 | 8,183 (+0.07%) | 8,176 -> 8,171 (-0.06%) |
+  | select-index | 5,054 | 62,840 | 62,867 | 62,753 (-0.14%) | 62,812 -> 62,750 (-0.10%) |
+  | insert-autocommit | - | 138,947 | 139,217 | 139,054 (+0.08%) | 138,994 -> 139,192 (+0.14%) |
+
+  - The INSERT row is the check that an own commit never moves the epoch. If it did, each autocommit INSERT would
+    reload the mirror.
+  - Keeper green, including an uncommitted copy that ran the scenario 10 times on fresh databases.
+- Retry condition: none. A later change that clears the page cache on an own commit, or that reloads the mirror
+  without `set_memdb_visible_commit_seq_from_publication`, must re-measure the INSERT row against this entry: the
+  first would reload the mirror on every write, the second on every read.
+
+## 2026-11-18 - FIX (landed as a65e4c090; a correctness fix measured like a lever: instructions -21% to -30% and inside its kill lines, cycles up to +23% at 40,000 rows, one prediction line missed): an aggregate over a bound index key and a residual term seeks the key's block as its literal spelling does (bd-79p0a, read/seek round 8)
+
+- Target: bd-79p0a. `SELECT id, b, c, count(*) FROM t WHERE a = ?1 AND n = ?2` (t_ab(a, b), n unindexed) scanned the
+  table in rowid order and took bare columns from the first match by rowid: 27|2|v20|7, where stock answers 357|0|v14|7.
+  There were 52 divergences over the round-7 probe. Touched: `crates/fsqlite-vdbe/src/codegen.rs`; keeper
+  `crates/fsqlite-core/tests/bd_79p0a_bound_key_residual_aggregates.rs`; and
+  `crates/fsqlite/tests/agg_leading_eq_residual_oracle.rs`, whose opcode gate pinned the old literal-only rule
+  ("a parameterized PREFIX must decline") and now requires the seek. Its bound-range-bound decline stays.
+- Cause: the aggregate's equality-prefix residual seek (`aggregate_index_prefix_literal_residual_target`) admitted
+  only literal keys, and no later gate matched the bound form, so it fell to the scan.
+- Fix:
+  - The target (renamed `aggregate_index_prefix_residual_target`) takes a `PrefixProbe`. Its parameter form admits
+    `?NNN` keys when every placeholder in the WHERE is numbered, and is tried after every other aggregate seek.
+  - The emitter checks each bound key's storage class with IsType, as bd-aavtp's whole-WHERE seek does, and scans
+    for any other value. A literal key emits nothing new.
+  - The COUNT(*) yield gate admits the parameter form.
+  - The per-term exactness test is one helper shared with the whole-WHERE seek.
+- Ledger preflight:
+  - L5 v2 (2026-11-15, rejected on the bd_d4rbi keeper): this is the plan difference that rejected it, and its
+    retry condition (a) names this fix.
+  - bd-aavtp's run-time exactness rule is reused as is.
+- Prediction (on the bead before the build):
+  - bound form after the fix within +10% instructions of the literal form;
+  - literal form unchanged within its A/A band;
+  - main's bound form about 2-4x the literal at 400 rows and 50-100x at 40,000.
+- Result:
+  - Setup: one prepared statement in a loop (fsqlite::blocking release-perf, and a C loop over the 3.54.1
+    amalgamation for stock). Each execution its own autocommit transaction, (N2 - N1) differences, 7 interleaved
+    reps, medians. Each arm on its own copy of one database, the bead's schema at 400 and 40,000 rows.
+  - On the landing base 8705691b2: main (loop sha256 5f26a835bda17868), its A/A copy, main + bd-2mpxx + this fix
+    (b198f8edee844b18).
+  - First run on f75c6e50c: main + bd-2mpxx (main's codegen) against + this fix, with the same answers and deltas
+    within 1.2 points of these.
+  - The landed commit differs from the measured fix binary only by clippy's `option_option` fix: a `TermExactness`
+    enum in place of `Option<Option<u16>>`. That code runs once at prepare time, which the per-execution difference
+    cancels.
+  - Scratchpad of the read/seek lane: `rs8/agg_q2landing.out`, `rs8/agg_q1before.out`, `rs8/agg_q1after.out`,
+    driver `rs8/aggloop.py`.
+
+  | rows, statement | stock | main | A/A | fix (landing base) |
+  |---|---|---|---|---|
+  | 400, bare-column, bound | 49.5k | 448.5k | 448.5k | 314.0k (-30.0%; cycles +3%, CPU +5%) |
+  | 400, bare-column, literal | 49.1k | 304.0k | 303.9k | 304.1k |
+  | 400, count(*), bound | 48.0k | 437.3k | 437.2k | 308.6k (-29.4%; cycles +12%) |
+  | 40,000, bare-column, bound | 5.50M | 39.95M | 39.95M | 31.32M (-21.6%; cycles +23%, CPU 2.77 -> 3.44 ms) |
+  | 40,000, bare-column, literal | 5.50M | 30.40M | 30.40M | 30.40M |
+  | 40,000, count(*), bound | 5.46M | 39.50M | 39.50M | 31.14M (-21.2%; cycles +21%) |
+
+  - On f75c6e50c the 400-row cycles were +14% / +15%. The 400-row cycle deltas are inside this host's spread for
+    those rows; the 40,000-row ones are not.
+  - The bound form is +3.2% / +3.0% over the literal: the residual filter reads two parameters per visited row.
+  - The literal rows did not move. The bound answers now equal stock's.
+  - MISSED: main's bound form was 1.45x / 1.30x the literal, not 2-4x / 50-100x. fsqlite's scan costs about 1.0k
+    instructions a row and its seek about 8.4k a visited row, so the 11x fewer rows mostly cancel.
+  - So the fix buys stock's row with the cycles the literal spelling already pays.
+- Not changed: a key bound with another storage class (text '5' on an INTEGER column) still scans in rowid order, as
+  the whole-WHERE seek does; stock converts it and seeks, so bare columns can still differ for such binds.
+- Retry condition / next lever: the per-visited-row cost of the index-to-table seek. About 40% of the literal form at
+  40,000 rows is the table SeekRowid per index entry (`table_move_to` -> `table_seek` -> `table_seek_for_insert`),
+  about 3.5k instructions, against stock's 1.5k for the whole row. The block's rowids are not ascending, so SL1 (v2
+  rejected 2026-11-17; v3 landed as f9c9e9965: a seek that lands on the cursor's current leaf) does not apply as
+  such; a cheaper descent does. Lowering it is what turns this fix's cycle cost into a gain.
+
+## 2026-11-18 - WIN (drop-in correctness, stock live; not a speed claim): a plain-BEGIN transaction whose COMMIT loses a page conflict is replayed within busy_timeout when nothing it returned would change; 8 CLI writers x 300 'BEGIN; INSERT; COMMIT' on one table commit 2,400 of 2,400 rows as stock does (median 1,888.5 before) (bd-q4o7z, mp lane round 2)
+
+- Target: the .5.4 shape, explicit-same in `mw_conflict.py`. N CLI processes x M
+  `BEGIN; INSERT; COMMIT` on one shared table, busy_timeout 5000, tmpfs. Landed as a3d329d47.
+  - New: `crates/fsqlite-core/src/connection/txn_replay.rs`.
+  - `connection.rs`: enter/leave around the public SQL calls, plus hooks in `background_status`,
+    statement dispatch, `execute_begin`, the .5.1 refusal path and `last_insert_rowid()`.
+  - `fsqlite-func/src/vtab.rs`: a per-thread virtual-table write count.
+- Ledger preflight: no earlier entry touches transaction replay. Lever 1 v1/v1b (2026-11-17, below)
+  died on explicit-same refusals. This change turns those refusals into replays, one of lever 1's
+  retry conditions.
+- Prediction (bd-q4o7z, before code): explicit-same median 1,910 -> 2,400; wall flat to +30%. Kill
+  lines:
+  - median under 2,390;
+  - any negative keeper committing;
+  - an integrity failure in the one-table or own-tables stress;
+  - single-process cost over 2%.
+- Result, stock sqlite3 3.46.1 live. Landing tree 26d81df3d, release-perf CLIs: base
+  e2079f015e4c5912, this change c6c1e01c3bd9a48e. Host thinkstation1, 64 threads, governor
+  powersave.
+  - explicit-same 8 x 300 (6 reps): 1,736-1,931 committed (3,195 rows lost) -> 2,400 in every rep,
+    0 error lines. Wall median 534 -> 633 ms (stock 146 ms).
+  - 16 x 150: 1,702-1,855 -> 2,400. Wall 638 -> 866 ms (stock 119 ms).
+  - explicit-sep 8 x 300: 583 -> 598 ms. Base lost 1 row in 3 reps; this change lost none.
+  - A first A/B on 25e3e883b gave the same picture: 1,630-2,080 -> 2,400, 561 -> 649 ms.
+  - The scorecard multiproc row (autocommit, which never records), interleaved `mp1_scale.py`:
+    - 787.7 -> 750.8 ms over 15 reps (x5.49 -> x5.23 stock);
+    - 790.1 -> 833.4 ms over 9 reps, and 837.0 -> 831.5 ms on 25e3e883b;
+    - N=16: 1,139.6 -> 1,103.4 ms.
+    Unchanged within noise.
+  - Single process:
+    - User instructions per transaction (`perf stat`, 7 interleaved reps): explicit 220,290 ->
+      222,355 (+0.9%); autocommit 178,853 -> 177,398.
+    - Native CPU (15 reps pinned to one CPU) varies 2-3% between runs of the same pair:
+      - explicit: +0.2% / +0.9% (mean / median) on 25e3e883b; +2.6% / +1.9% on 26d81df3d;
+      - autocommit: -0.5%; and +1.5% / +3.1%.
+  - An earlier shape (v1) took each call's future by value. That cost +1.0% CPU, and callgrind
+    showed about 54 KB per transaction more `memcpy`. The landed shape awaits the call in place
+    between a synchronous enter and a small leave.
+  - Do not use callgrind totals on this CLI. Main-thread Ir at 1,500 transactions swung from 0.37G
+    to 5.3G between runs of one binary: the waits on the WAL-FEC flush at close, and the scheduler
+    polling inside them, follow valgrind's thread scheduling.
+  - Stress, 20 reps each (CLI 25e3e883b plus this change): one table and own tables, 8 x 300. 2,400
+    every rep, integrity ok, 0 error lines.
+- Keepers:
+  - `multiprocess_autocommit_busy_timeout_e2e::cross_process_explicit_writers_on_one_table_commit_every_row_as_stock`.
+    Under a no-replay variant it fails with 747 refusals.
+  - `refused_commit_ends_transaction_e2e::..._is_replayed_when_nothing_it_returned_changes`. Under
+    the no-replay variant it fails with BusySnapshot.
+  - Seven negatives: rowid via API / RETURNING / SQL, changes(), a new constraint error, an
+    application function, PRAGMA / DDL / a streamed read, and the two count-reading refusal
+    keepers. Each fails under a naive-replay variant (no poisoning, no outcome or rowid check).
+- Gate (rch):
+  - Full gate on 26d81df3d plus the change:
+    - clippy clean; fsqlite-core lib 4200/0; fsqlite-func 533/0;
+    - e2e: concurrent-writer 132/0; cross-process 62 pass, 1 fail (the p3_fair_wakeup flake: it
+      never replays, and its worst row took 84 of 100 attempts in 10 repeats); multiprocess 10/0;
+    - wal fault-injection 1314/0; wal 1183/0; mvcc 1687/0; pager 1114 pass, 1 fail (known
+      bd_2jpu6_2); fsqlite crate 1100/0;
+    - core keepers green except gh19 (known).
+  - Re-run on 9c1183f44:
+    - clippy clean; core lib 4200/0; cross-process 63/0; concurrent-writer 132/0;
+    - vfs 531/0; gh519 10/0;
+    - the multiprocess file's stock oracle was invalid on an overloaded worker.
+  - Re-run on dc7142eec:
+    - clippy clean; refused-commit 15/0; multiprocess 10/0;
+    - core lib 4199 pass, 1 fail: a commit_repair timing assertion that passed on both earlier trees
+      and involves no Connection.
+  - Re-run on fa0390991, after rebasing past the single-writer lane's catalog-copy change dc795a9ba
+    (it reshapes BEGIN and ROLLBACK, which the replay runs through):
+    - clippy clean; core lib 4201/0; core keepers green except gh19;
+    - refused-commit 15/0; multiprocess 10/0.
+  - The landed a3d329d47 is fa0390991 rebased past bf5138830 (the cross-process lane's new
+    short-busy_timeout arm, merged by hand into this file's keeper). On it: e2e clippy clean,
+    refused-commit 15/0, multiprocess 11/0.
+  - Not re-run after the last rebases: the WAL, mvcc, pager and vfs libs, the fsqlite crate, and the
+    concurrent-writer and cross-process batches.
+- Retry condition / next:
+  - In-process same-page writers (8 connections, one process) commit 346-416 of 2,400. The losses
+    are INSERT-time page-lock refusals, with 0 replays. Retry when that statement-level conflict
+    has a decided answer: wait for the page lock within busy_timeout, or replay at the statement.
+  - ORM-style transactions that read their new id still get 517 under contention: the
+    rowid-commute follow-up named in the decision.
+  - Streamed `query_with_params_for_each` reads (the compat facade's `query_map`) are not recorded.
+    Retry by digesting streamed rows once a workload shows them refused.
+
+## 2026-11-18 - REJECTED on its time kill line (instructions -78.6M, user cycles +97.8M): the Affinity arm reads its code bytes, maps them inline and clears subtypes only when the program has any (bd-w4pr1.13, bulk-write round 9, lever AF)
+
+- Target: the per-row `Affinity` of an INSERT row body (the scorecard's `bulk_insert_1M_one_txn`, one op over 4
+  registers a row, all no-ops). Touched (not landed; patch `scratchpad/r9/af_v1_on_ec9625181.diff` of the
+  bulk-write lane, `git diff` sha256 4863e84493796119, on ec9625181): `crates/fsqlite-vdbe/src/engine.rs` (the
+  `Opcode::Affinity` arm iterates `aff.as_bytes()`, `char_to_affinity` replaced by an inline `const fn
+  affinity_from_code(u8)` at both call sites, `has_register_subtypes` read once per op; test
+  `test_affinity_codes_map_in_either_case_one_register_a_byte`), `crates/fsqlite-types/src/value.rs`
+  (`#[inline]` on `SqliteValue::affinity_is_noop`).
+- Evidence before (callgrind of the bulk row on main c216c0852, exact call counts): per row `Chars` decoding 53,
+  `char_to_affinity` 32 (not inlined), `affinity_is_noop` 65 (not inlined, cross-crate), `clear_register_subtype`
+  32 instructions; native self cycles 0.74%, 0.43% and 1.19%.
+- Ledger preflight: bd-i3csr.3 (WIN, the no-op path) and bd-w4pr1.13.21 lever A (WIN, the second Affinity removed)
+  are the arm's earlier levers; 2026-05-24 "VDBE `Opcode::Affinity` hot-dispatch promotion" (rejected) is not
+  retried, the op stays in the main match.
+- Prediction (bd-w4pr1.13, before code): bulk -90M to -150M user instructions, task-clock min -5 to -20 ms;
+  memory_script -15M to -35M; update -1M to -5M; delete within +-1M. Kill: bulk down less than 60M, bulk task-clock
+  min not down, any other row up more than 1M.
+- Result (stock sqlite3 3.46.1 live, thinkstation1, governor powersave, `r6_ab.py`, answers equal stock's; base
+  ec9625181 392891538c30..., AF 461c77c6da32...): bulk 7,036.7M -> 6,958.1M min (-78.6M; median -65.8M), user cycles
+  2,932.5M -> 3,030.3M (+97.8M), task-clock min 856.9 -> 878.9 ms and median 879.6 -> 900.0 (stock 4,177.4M,
+  1,386.1M cycles, 435.1 ms): killed. memory_script -17.8M instructions, +26.1M cycles, +6.5 ms; update -2.4M;
+  delete unchanged. The instructions go and the cycles come back with more: the arm sits in
+  `execute_program_body`'s huge match, and inlining `affinity_is_noop` there moved that function's code more than
+  it saved (the same effect as SC8 v2's identical-Ir loss).
+- Retry condition: not as a change to the arm in `execute_program_body`. Take the per-row Affinity only together
+  with moving it (and `Concat`) onto the synchronous lane, under the 2026-05-24 promotion entries' retry condition:
+  this row's profile shows 3 lane exits a row (Concat, Affinity, Insert; `execute_program_body` self 631M over 3.0M
+  dispatches), and the focused criterion dispatch benchmark still needs its same-worker A/B.
+
+## 2026-11-18 - REJECTED on its time kill line at the landing parent (instructions met in six runs): a staged row write borrows the transaction's concurrent context and lends a slot's image with a token-free stand-in (bd-w4pr1.13, bulk-write round 9, lever D)
+
+- Target: every appended, staged-deleted and same-size-updated row: the scorecard's `bulk_insert_1M_one_txn`,
+  `delete_14pct_300k`, `update_10pct_300k`, `memory_script_200k`. Touched (not landed; patch
+  `scratchpad/r9/d_v1_on_dc7142eec.diff` of the bulk-write lane, `git diff` sha256 74a979f25eca6459, on dc7142eec):
+  `crates/fsqlite-vdbe/src/engine.rs` (`SharedTxnPageIo::try_mutate_staged_page_data` borrows `concurrent` for the
+  handle check instead of cloning the `ConcurrentContext`, three Arc increments and decrements a call),
+  `crates/fsqlite-types/src/lib.rs` (`PageData::placeholder`: no bytes, image token 0, which no image is minted
+  with), `crates/fsqlite-btree/src/cursor.rs` (the three `mem::replace` stand-ins of
+  `try_rewrite_top_page_in_staged_image` and `try_append_in_staged_image_of_cached_leaf`, where
+  `PageData::from_vec(Vec::new())` took a token with an atomic add).
+- Ledger preflight: the standalone ConcurrentContext borrow was rejected on 2026-05-05 and 2026-05-07 (twice); its
+  profile and scoped-borrow retry clauses were met (2.28% of bulk user cycles self time).
+- Prediction (bd-w4pr1.13, before code): bulk -15M to -40M user instructions, task-clock min -5 to -20 ms; delete
+  -1M to -3M; update -0.7M to -2M; memory_script within +-1M. Kill: bulk down less than 10M, bulk task-clock min not
+  down, or delete / update instructions up. Tie rule, declared on the bead before it was used: when runs disagree, a
+  15-rep interleaved bulk run decides, killing the lever if its task-clock min or median is not below base's.
+- Result (stock sqlite3 3.46.1 live in every run, thinkstation1, governor powersave, answers equal stock's): bulk
+  user instructions -30.5M, -31.0M, -30.6M, -31.2M, -30.9M and -31.3M min in six runs (-0.44%; 1.68x stock
+  4,177.4M either way); delete -1.1M to -1.2M, update -0.7M to -0.8M, memory_script -2.3M. Bulk task-clock min
+  -34.0, +1.3, -7.5 (first deciding run, pre-rebase binaries 762b140e... / 54d4082d...), -15.1, +22.5 ms. On the
+  landing binaries (base dc7142eec f0465c16..., lever 658a07f4...) the second deciding run gave task-clock min 852.1
+  -> 852.4 ms and median 872.0 -> 879.0, user cycles min 2,859.4M -> 2,875.5M and median 2,949.7M -> 2,980.6M
+  (stock 439.0 ms, 1,389.5M): killed. The ~31 instructions a row are below this row's time resolution, and the
+  rebased layout spent them back in cycles.
+- Retry condition: not as a standalone patch. Fold the borrow and the placeholder into a lever on the same per-row
+  staged-write path whose predicted bulk gain resolves on task-clock (at least ~15 ms at this row's +-20 ms run-to-run
+  spread on min).
+
+## 2026-11-18 - ABANDONED at step 0 (correctness, no code): a row's first change mutates the clean leaf image in place by releasing this connection's other holders (bd-w4pr1.13, bulk-write round 9, lever OWN1)
+
+- Target: the first change of each leaf in `delete_14pct_300k` / `update_10pct_300k` (2,250 leaves; each pays an
+  `Arc::make_mut` copy into a fresh 4 KiB page, part of fsqlite's ~11,000 page faults against stock's ~700).
+- Step 0 (callgrind of `BEGIN; DELETE FROM m WHERE id % 7 = 0; ROLLBACK` and the UPDATE twin on main c216c0852, the
+  300k-row table built by the same binary): every leaf comes from a WAL frame (2,264 `read_frame_page`, 2,264 frame
+  cache inserts, at most 7 published-plane hits), so its clean image is held only by this connection: the cursor's
+  stack entry, a transient clone, the WAL frame cache and `SimpleTransaction.txn_read_cache`.
+- Why abandoned: `txn_read_cache` is the snapshot's record of images already observed, not a cache. It is consulted
+  before every shared latest-image source (GH #129): removing an entry must mark the snapshot incomplete, after which
+  `ensure_uncached_snapshot_sequence` answers an uncached read with BusySnapshot once a peer has committed. And
+  `conflict_page_baselines` takes each written page's pre-image from it for the validator that byte-compares after a
+  mid-transaction WAL generation change, where an in-range page without a baseline fails closed (bd-jygg3). Dropping
+  the entry would turn a savepoint re-read after a peer commit, and a commit spanning a peer's WAL reset, into
+  BusySnapshot: a concurrent-writer behaviour change the lever's sign-off (this connection's caches only) did not
+  cover. Releasing only the other three holders gains nothing: the read cache still shares the image, so make_mut
+  copies anyway. With the pre-image kept, two live images per changed page is this design's minimum; stock keeps one
+  because it re-reads the WAL on rollback and has no cross-process baseline.
+- Retry condition: an owner decision that those two cases may fail closed, or a design that rebuilds a written
+  page's baseline from somewhere other than memory.
+
+## 2026-11-18 - REJECTED on its third kill line at the landing parent (code layout at identical Ir; v1 rejected on rowid_lookups): the table seek cache keeps eight leaves, scanned in place (bd-w4pr1.12, read-loop round 8, lever SC8 v2)
+
+- Target: join_1M_to_pk_1000 after SL1 v3, 4,124 Ir per row against stock's 1,721. Callgrind:
+  CursorBackend::table_move_to 1,047.7M inclusive for the 405k probes that change leaf, about 2,590
+  Ir each (two load_page, the interior search, the landing). u is five leaves in the fsqlite-built
+  file and the keys step by -81, so the four-slot seek cache missed on every leaf change.
+- Ledger preflight: no entry changed the slot count; bd-w4pr1.13.13 (the bounds filter) and
+  bd-w4pr1.13.27 (the in-place hit rotation) keep a miss cheap; the SL1 v3 entry named this lever.
+- Touched (not landed; patch `scratchpad rl8/sc8v2.patch`, applied unchanged to a7c78382f and
+  5afb99152): `crates/fsqlite-btree/src/cursor.rs`: `TABLE_SEEK_CACHE_SLOTS` 4 -> 8;
+  `next_table_seek_slot` (a synchronous scan for the next slot whose landing admits the target, by
+  reference) drives `try_table_seek_cache`; `remember_table_seek` updates the array in place (the
+  slot naming the leaf, else the first empty one, else the last gives way; the slots before it
+  rotate down one). The two tests that pinned four slots are re-expressed over the constant.
+- Prediction (bd-w4pr1.12, 2026-11-18, before each build): v1 join -450 to -700M Ir, rowid_lookups
+  within +0.5%; v2 join -450 to -560M, CPU -50 to -90 ms, memory_script -180 to -240M,
+  rowid_lookups -10..+10M. Kill (predeclared): join under 300M or CPU not lower in each of two
+  runs; any read row +0.5% Ir or more; a row's cycles pair median above its A/A arm's highest pair
+  ratio in both runs; a rewritten test passing on a planted capacity-minus-one mutant.
+- v1 (the constant alone, sha256 d8082089078db55c): join -442.2M Ir, cycles 0.818, CPU x2.05 ->
+  x1.70 stock; rowid_lookups +44.2M (+1.64%) in both runs: REJECTED. Callgrind: remember_table_seek
+  rebuilt and copied back the doubled slot array (+123 Ir a probe) and the async slot loop copied
+  each slot out (+100 Ir a probe for four more slots).
+- v2 on a7c78382f (base sha256 28470d810fff20d9, v2 d44bf588e521b2b0, an A/A arm = the base ELF
+  again, and v1 in the same runs; stock sqlite3 3.46.1 live; thinkstation1, powersave, load about
+  3, io_uring refused, serial (0 extra threads observed); two runs of 7 interleaved reps; answers
+  equal everywhere): join 4,123.5M -> 3,661.1M Ir (x2.40 -> x2.13 stock), cycles 0.840 / 0.842,
+  CPU x2.05 -> x1.73 and x1.97 -> x1.68 stock; memory_script_200k -208.6M Ir (its :memory: join);
+  rowid_lookups_200k +0.4M (+0.02%); every other read row within 0.4M Ir. Cycles above the A/A
+  arm's highest pair ratio in one run only (window_sum_over, GROUP BY a with sum(c)); scan_filter_agg
+  0.982 / 1.014 and gb_id 1.004 / 1.012. All three kill lines passed on this binary.
+- v2 on its landing parent 5afb99152 (parent CLI sha256 f6491e56a20c5570, landing
+  34d5040b367cf11e, A/A = the parent ELF on its own copy; same host and method, load 4.6-6.8):
+  - Kill line 1 passes: join -462.4M / -462.5M Ir, cycles 0.863 / 0.838, CPU pair medians 0.868 /
+    0.823.
+  - Kill line 2 passes: memory_script -208.6M, rowid_lookups +0.4M, every read row under +0.08% Ir.
+  - Kill line 3 fires on two rows, at identical Ir, in both runs: scan_filter_agg cycles 1.056
+    against its A/A arm's highest pair ratio 1.036, and 1.066 against 1.039 (CPU 1.039 / 1.042);
+    gb_id 1.032 against 1.016, and 1.020 against 1.017.
+- Why (pure layout; scratchpad `rl8/c11_layout.md`, bead comment 2026-11-18): of 16,012 text symbols
+  95 changed size, all in the seek / insert / delete / bulk-load / cursor-open code, and the two rows
+  execute three of them once per statement (about 880 Ir). The 40 hottest functions of each row
+  (98.3% / 95.4% of Ir) and the 21 multi-instance hot symbols have identical instruction streams;
+  every one moved by +0x4b0 to +0xa20, 16-48 B mod 64 (run_hot_opcodes_sync 16 -> 48). Zen3 counters
+  (5 interleaved reps per group, no multiplexing, net of SELECT 1): instructions, retired ops and
+  taken branches equal; stalled-cycles-frontend x1.46 (+11.7M) on scan_filter_agg and x2.20
+  (+71.9M) on gb_id, gb_id instruction-cache misses x1.53; branch misses +1.3k / +43k. A v3 with
+  the fill and miss code out of line would change no code these rows run, so it was not built.
+- Planted mutants (rch): both rewritten tests fail (rc 101) on v1's capacity-minus-one rebuild and
+  on v2's (the last slot cleared after every landing): the LRU test sees seven slots where eight
+  were filled, the loads-only test reads root + leaf for a leaf that should be cached.
+- Gate (a7c78382f + v2): clippy on fsqlite-btree / -vdbe / -core clean; 52 test binaries, 6,219
+  passed, 1 failed (the known bd_8c68u compile-count red). The fsqlite-e2e oracle targets and the
+  fsqlite crate never returned results (infra: a link failure and an unconfirmed completion on
+  vmi1293453, RCH-E330 disk budget on hz3).
+- Retry condition: a landing binary that passes all three kill lines above, measured on the exact
+  parent and landing ELFs, with e2e and fsqlite results. Next attempt: the sc8v2 arm of SL2's
+  four-arm run (parent, A/A, sc8v2, sc8v2 + SL2) on the next parent, judged on its own lines.
+
+## 2026-11-18 - REJECTED on its kill lines: an inline test of the newest seek-cache slot's bounds before the same-leaf fast path's call (bd-w4pr1.12, read-loop round 8, lever DEC v1)
+
+- Target: rowid_lookups_200k's ~52 Ir a probe for SL1 v3's declined fast path (200k probes, none
+  on the current leaf).
+- Touched (reverted; patch `scratchpad rl8/dec_v1.patch`): `crates/fsqlite-btree/src/cursor.rs`
+  (`BtCursor::table_seek_within_leaf_admits`, which the fast path also uses as its first test; the
+  SL1 keeper asserts every answer was admitted, every decline in its walk was not, and the
+  moved-off-leaf case is admitted yet declined), `crates/fsqlite-vdbe/src/engine.rs`
+  (`CursorBackend::try_table_seek_within_leaf` tests admission inline and calls an
+  `#[inline(never)]` remainder).
+- Prediction (2026-11-18, before the build): rowid_lookups -6 to -9M Ir, join -10 to -20M. Kill:
+  rowid_lookups down by less than 4M, another row +0.5% Ir.
+- Result (on SC8 v1, against it, same invocation, 3 interleaved reps, stock live): rowid_lookups
+  -3.4M (-0.12%); join +24.4M (+0.66%), cycles 1.070. Both kill lines crossed.
+- Why: the CursorBackend match over three cursor types stays in the caller, so a decline saves
+  about 17 Ir; an admitted probe pays the bounds test twice and one more call layer (+40 Ir on the
+  join's 595k same-leaf hits).
+- Retry condition: a decline test that reads the newest slot's bounds without the per-backend match
+  (the bounds mirrored in the VDBE's StorageCursor when a seek lands, for instance) and adds
+  nothing to an admitted probe.
+
+## 2026-11-18 - WIN (structural, landed as dc795a9ba; the gain grows with the schema): an explicit transaction keeps a ROLLBACK copy of the catalog only when it changes it, -310k user instructions and -25 us per transaction over 20 tables with two indexes each (bd-w4pr1.7, round 5, lever L1)
+
+- Target: every explicit transaction, read or write. BEGIN called `snapshot()`, which deep-copied
+  the connection's catalog (every `TableSchema` with its indexes, views, triggers, the DDL text map,
+  the rowid-alias and AUTOINCREMENT maps, TEMP names and shadowed tables) into `txn_snapshot`, and
+  COMMIT dropped the copy. With one table that is 2.0k + ~1k instructions; over a schema of 20
+  tables with two indexes each it was 182k to copy and ~135k to drop, 85% of an empty transaction
+  (callgrind, main 1bad282e2). Stock keeps no such copy (a ROLLBACK that changed the schema reloads
+  it). Touched: `crates/fsqlite-core/src/connection.rs` (`TxnRestorableCell`, `SnapshotSchemaState`,
+  `transaction_snapshot`, `end_transaction_catalog_cells`, `restore_snapshot_state`, the eight
+  catalog fields of `Connection`).
+- Ledger preflight: bd-ry6x7 (1f724e542) did the statement-level half (a plain DML statement's
+  savepoint snapshot skips the schema copy). Nothing covered the transaction snapshot. Not in
+  bd-ih8ak's scope (committed-state refreshes).
+- Change: the eight fields became `TxnRestorableCell`s. BEGIN arms them; the first mutable access
+  while armed keeps a copy of the value as it was; ROLLBACK (and the commit-failure path that
+  restores the snapshot) writes the kept copies back, rebuilds the by-name indexes and stops the
+  cells keeping, so the reload that follows costs no copy; every end of the transaction drops the
+  copies. Every mutation goes through the cell's `borrow_mut`/`replace`, so the compiler, not a
+  statement classifier, covers paths such as an AUTOINCREMENT INSERT that creates
+  `sqlite_sequence`, CTE/view materialization and in-transaction schema reloads. The two scalars
+  (`temp_default_cache_size`, `next_master_rowid`) are still stored at BEGIN. Savepoint and
+  statement snapshots keep their full copies.
+- Result on the rebased tree (both arms built from origin/main d4ad26c40; 1954f46cb, where the full
+  gate ran, changes only tests after it; the lever landed as dc795a9ba on 77649f22f after rebases
+  over commits that touch neither the catalog fields nor the transaction snapshot. M = main, CLI sha256
+  0d74b1c0b1ca9885; L1 = M + L1, CLI 9e20b27b2a9a2285; release-perf, rch; stock sqlite3 3.46.1 and
+  the 3.54.1 driver live in the same invocation; thinkstation1, 64 threads, governor powersave,
+  load 2.4-4.5, scratch NVMe, synchronous=NORMAL). Native: perf stat, whole process, medians of 7
+  rotated reps (means are pulled by single outlier reps, e.g. one M txn10 rep at 88 us against
+  ~205). Exact: callgrind, statement execution only, (N1500 - N500)/1000. One callgrind run is not
+  exact on the write shapes on this host (the same binary moves by up to +-3k on autocommit and
+  +-3-6k on the one-row write between runs, from async-runtime polling while work waits), so the
+  kill lines were decided on means over repeated runs, under a rule written down before the extra
+  runs: 3 runs per arm, 7 for read-only, 23 for autocommit.
+
+  | row (per transaction) | stock 3.46.1 (native) | M: native CPU / perf user instr / callgrind | L1: same | L1 - M |
+  |---|---|---|---|---|
+  | empty BEGIN; COMMIT, 1 table | 1.0 us / 8.6k | 23.6 us / 61.2k / 53.1k | 23.2 us / 58.8k / 50.7k | -2.5k exact (perf -2.4k) |
+  | same over 20 more tables with 2 indexes each | 1.1 us | 45.7 us / 371.6k / 360.5k | 21.1 us / 58.8k / 50.1k | -310.4k exact, -24.6 us |
+  | read-only BEGIN; SELECT; COMMIT | 8.6 us / 27.5k | 52.7 us / 111.6k / 102.7k | 50.4 us / 108.9k / 98.8k | -3.9k exact (7 runs: 95% CI -3.4% to -4.2%) |
+  | one-row write, 1 table | 18.7 us / 30.4k | 140.8 us / 221.8k / 211.7k | 137.4 us / 217.5k / 206.6k | -5.1k exact (perf -4.3k) |
+  | one-row write over 20 tables | 17.9 us | 171.0 us / 548.5k | 140.4 us / 216.5k | -332.0k perf, -30.6 us |
+  | autocommit INSERT | 16.4 us / 22.2k | 118.1 us / 176.5k / 176.2k | 117.7 us / 177.0k / 176.7k | +0.4k (+0.25%; 23 runs: 95% CI -0.31% to +0.82%) |
+  | txn_1000x10_rows shape (per 10-row txn) | 36.2 us / 152.8k | 205.7 us / 519.7k / 494.8k | 199.4 us / 511.9k / 488.2k | -6.6k exact (perf -7.8k) |
+
+  Syscalls: the empty transaction's are identical (7.02 / 6.97 per transaction); the write's file
+  syscalls are identical (access 1.00, fcntl 8.00, pread64 4.10, statx 10.01), and only the wake-up
+  calls (epoll, futex, io_uring_enter, timerfd) move, by amounts that also come out negative across
+  the N difference. mt-mvcc-bench (--one-row-per-transaction, shared table, 500 rows x 5, 3
+  interleaved reps, scratch NVMe at NORMAL; mtbench 06ca94d12620a4a7 / bf1d941feef3e71e; each run
+  prints the bench's "benchmark evidence is non-comparable or invalid" line, as every run of the
+  earlier trees did): F wps L1/M 1.07 / 0.97 / 1.00 at 1 / 8 / 32 writers (per-rep pairs 1.02-1.10,
+  0.93-1.04, 0.98-1.02; stock's own wps moved by up to 14% between the arms' runs).
+- On origin/main 5d98aff3e (2026-11-18, one callgrind run per arm, tmpfs, load 7.7-9.3): empty
+  over 20 tables 364.0k -> 49.6k, -27.4 us; write over 20 tables -313.8k, -33.1 us; one table:
+  empty -2.4k, read-only -2.1k, one-row write -2.1k, autocommit -1.9k, txn10 -4.4k; syscalls
+  unchanged; mt-mvcc-bench 1/8/32 writers 1.04 / 0.97 / 0.99.
+- First measurement, on 1bad282e2 (2026-11-17, 5 reps, load 1.7-3.6): empty over 20 tables 367.3k
+  -> 57.8k user instructions, 50.3 -> 24.2 us; write over 20 tables 540.5k -> 214.1k, 150.9 ->
+  124.6 us; one table empty -2.6k, read-only -3.3k.
+- Prediction (posted before code): 20-table empty -280k..-320k instructions (landing tree
+  -310.4k: met), CPU -15..-22 us (-24.6: beyond); 20-table write -280k..-320k (-332.0k perf: just
+  beyond), CPU -15..-25 (-30.6: beyond); one table -2k..-4k (empty -2.5k, read-only -3.9k: met;
+  one-row write -5.1k, txn10 -6.6k: beyond). Kill (20-table empty under -200k, any one-table shape
+  above +1%, a keeper changing outcome): none crossed on any of the three trees; autocommit, the
+  only one-table shape that rose, is +0.25% over 23 runs.
+- Tests: `test_txn_rollback_restores_the_catalog_from_copies_kept_at_its_first_change` (every kind
+  of catalog change, a savepoint rolled back inside it, a TEMP table shadowing a main one, then
+  ROLLBACK: the catalog fingerprint, sqlite_master and the rolled-back names are as before BEGIN; a
+  DML-only transaction keeps no copy; a peer's DDL between two transactions survives the second's
+  ROLLBACK).
+- Gate: rch, on origin/main 1954f46cb + L1 (the full gate): clippy -D warnings on fsqlite-core,
+  all targets: clean. fsqlite-core --lib: 4,198 passed, 0 failed, 4 ignored (the t6741 trio and
+  test_schema_only_opens_racing_committing_peers_do_not_fail_busy among them). Core keepers
+  (bulk_import_upsert_text_pk_phantom_pk, gh534, bd_ih8ak flush floor, wal_fec_commit_pipeline 18,
+  bd_qyekq crash images, gh385): all green. Schema-change and prepared-statement keepers (31
+  targets): 131 passed, 1 failed, bd_8c68u's compile count (92 for 300 rows, as on main: bd-f8m1v).
+  fsqlite-e2e concurrent-writer / SSI / checkpoint / group-commit batch (16 targets): 120 passed,
+  0 failed; second batch (14 targets, the schema-cache races among them): 108 passed, 1 failed,
+  bd_e6zfc s5_schema_coherence_after_storm, red on main (bd-mc5pp; the same DDL Busy /
+  BusySnapshot with no pages). multiprocess_autocommit_busy_timeout_e2e --test-threads=1: 10/10.
+  The fsqlite crate, all 125 test binaries with the lib and doc tests: 1,100 passed, 0 failed, 34
+  ignored (its first run hit rch's 90-minute limit while still compiling; rerun on the same worker).
+  After the rebase onto origin/main 9c1183f44 (main moved during the gate; its connection.rs
+  changes are bd-s7gqh's row-value rewrite, bd-7b1wh's trigger rowid alias and bd-05xlf's prepared
+  read begin, none near the lever's code), on that exact tree: clippy clean; fsqlite-core --lib
+  4,198 passed, 0 failed; the six core keepers green; the 31 schema and prepared-statement keepers
+  179 passed, 1 failed (bd_8c68u, 92 compilations as on main). Main moved once more (bd-bwmol and
+  bd-s9i69 in connection.rs, not near the lever); on origin/main 5afb99152 + L1: clippy clean,
+  fsqlite-core --lib 4,198 passed, 0 failed. Main then took b6f81da87 (bd-fpr5g: 40 lines of
+  connection.rs that use none of the eight catalog fields) and its ledger entry; on the pushed tree,
+  origin/main 77649f22f + L1 (landed as dc795a9ba): clippy -D warnings on fsqlite-core, all
+  targets: clean.
+  NOT run: fsqlite-wal integration targets with --features fault-injection, and the fsqlite-mvcc /
+  pager / vfs --lib suites: those crates do not depend on fsqlite-core, the only crate changed.
+  Earlier trees: 1bad282e2 + L1 + L2 and 5d98aff3e + L1 + L2 (clippy clean on both; on
+  5d98aff3e the core --lib run hit a new intermittent hang in the VFS io_uring path, in a test
+  neither lever's code is on: a shared-ring Read/Write SQE consumed by the kernel with no CQE for
+  20 minutes while its connection held the WAL write lock; it passed on this tree).
+- Retry condition / next: none for this cost. SAVEPOINT still takes a full copy (`snapshot()` at
+  SAVEPOINT); the same cells would serve it if a savepoint-heavy shape profiles it.
+
+## 2026-11-18 - REJECTED (kill line crossed on the landing tree): a compiled program that survives the connection's explicit write COMMIT, -14.1k user instructions per one-row transaction but +1.0k (+1.03%) per read-only transaction against a +0.5% kill line (bd-w4pr1.7, round 5, lever L2)
+
+- Target: every explicit write transaction that runs a statement it ran before, the shell's
+  `BEGIN; INSERT ...; COMMIT` and the scorecard's txn_1000x10_rows in particular. The COMMIT's
+  `clear_compilation_reuse_caches_after_write_commit` clears `compiled_cache`, so the next
+  transaction recompiles its INSERT (`compile_table_insert` 11.2k plus allocations). Autocommit
+  write commits never clear it. Touched: `crates/fsqlite-core/src/connection.rs`
+  (`CompiledCacheEntry`, `lookup_compiled_cache`, `insert_compiled_cache`, `compile_with_cache`,
+  `sqlite_stat1_hints`, `btree_join_sample`, `clear_compilation_reuse_caches_after_write_commit`).
+- Ledger preflight: issue #72 (2026-04) added the clear because a prepared SELECT template bound
+  to a MemDatabase snapshot returned stale rows; e7db0ad3f (2026-05-10) narrowed the prepared
+  half to `can_survive_write_commit` and kept the compiled half. A read-only audit of the four
+  compile functions found no program input from rows, counts, commit sequences or page images
+  (the cache already survived autocommit write commits, peers' commits, read-only commits and
+  ROLLBACK) and two inputs that needed handling: a `NewRowid`'s p3 carries the concurrent mode,
+  and a plan can read row statistics (`sqlite_stat1_hints`, `btree_join_sample`).
+- Change (not landed): the write COMMIT advanced a per-connection epoch instead of clearing the
+  cache; an entry kept `concurrent_mode: Option<bool>` (set when its program holds a `NewRowid`;
+  missed in the other mode) and `plan_statistics_epoch: Option<u64>` (set when its compile read
+  statistics; expired at the next write COMMIT). Test
+  `test_compiled_program_survives_write_commit_and_follows_what_changes_it` (control hit after a
+  write COMMIT; the mode key; the statistics expiry; a peer's CREATE UNIQUE INDEX, a shadowing
+  TEMP table, PRAGMA foreign_keys=ON, a replaced function and collation, ATTACH/DETACH) passed on
+  every tree; it is not landed with the lever. Patch: session 1f77802a scratchpad
+  p6r5/l2_on_d4ad.patch.
+- Results. 1bad282e2 (2026-11-17, one callgrind run per arm): one-row 208.0k -> 193.0k, txn10
+  485.0k -> 470.4k. origin/main 5d98aff3e (2026-11-18, one run per arm): one-row -14.7k, txn10
+  -15.6k, autocommit -1.2k, read-only -0.1k, empty +0.08k. Landing tree origin/main 1954f46cb
+  (engine code identical to d4ad26c40, where the arms were built: the commits after it change only
+  tests; A = main + L1, CLI sha256 9e20b27b2a9a2285; B = A + L2, 2f8bc42be973dfaa; release-perf,
+  rch): one callgrind run per arm is NOT exact on the write shapes on this host. The same binary's
+  statement-execution count moves by up to +-3k (autocommit) and +-3-6k (one-row write) between
+  runs: the async runtime polls while work waits (over three runs of main's autocommit shape the
+  whole program's count per transaction was 1.30M, 1.91M and 4.73M, `three_lane::next_task` alone
+  80k-323k), and part of that polling lands inside statements. Decided on means over repeated runs
+  (rule written down before the extra runs):
+
+  | shape (per transaction, user instructions, callgrind, statement execution) | runs per arm | A | B | B - A, 95% CI |
+  |---|---|---|---|---|
+  | one-row write BEGIN; INSERT; COMMIT | 3 | 206.6k median | 192.5k median | -14.1k (all three B runs below all three A runs) |
+  | txn_1000x10_rows shape (per 10-row txn) | 3 | 488.2k | 472.9k | -15.3k |
+  | autocommit INSERT | 23 | 176,664 mean | 176,154 | -510 (-0.29%), [-0.80%, +0.23%] |
+  | empty BEGIN; COMMIT, 1 table / over 20 tables | 3 | 50.65k / 50.12k | 50.58k / 50.19k | -0.07k / +0.07k |
+  | read-only BEGIN; SELECT; COMMIT | 7 | 98,840 mean | 99,860 | +1,020 (+1.03%), [+0.65%, +1.42%]; every B run above every A run |
+
+  Native, same invocation as stock sqlite3 3.46.1 (perf stat, whole process, medians of 7 rotated
+  reps; thinkstation1, 64 threads, governor powersave, load 2.4-4.5, scratch NVMe,
+  synchronous=NORMAL; means are pulled by single outlier reps): one-row 137.4 -> 132.6 us, 217.5k
+  -> 202.6k user instructions (stock 18.7 us); txn10 199.4 -> 189.8 us, 511.9k -> 496.8k (stock
+  36.2 us); autocommit 117.7 -> 118.7 us, 177.0k -> 178.5k (stock 16.4 us); read-only 50.4 -> 48.5
+  us, 108.9k -> 109.2k (+0.3%; stock 8.6 us). The kill line was set on the callgrind count and the
+  decision rule was written before the extra runs, so the native read-only figure does not
+  overturn it.
+- Prediction (posted before code): -9k to -14k on the one-row transaction (landing tree -14.1k:
+  met), the same on txn10 (-15.3k: just beyond), every other shape within +-0.5% (read-only
+  +1.03%: NOT met). Kill line: "another shape above +0.5%": crossed by the read-only shape, so the
+  lever does not land.
+- Attribution of the read-only +1.0k (self cost, B - A, one run each): `lookup_compiled_cache` +7
+  (the two new checks); the rest is inside glibc's allocator (`_int_malloc` +482,
+  `_int_free_merge_chunk` +277, `unlink_chunk` +109, `_int_free_chunk` +107, `__libc_malloc2` +97,
+  `_int_free_maybe_trim` +95) while the malloc / calloc / free call counts move by under 30 a
+  transaction: longer allocator paths, not more allocations. The change grew `CompiledCacheEntry`
+  from 40 to 56 bytes (`Option<u64>` + `Option<bool>`), which moves its `Arc` allocation to
+  another size class; that this is the cause is a hypothesis, not shown.
+- Retry condition: keep `CompiledCacheEntry`'s size (the struct has 7 bytes of padding after
+  `reverse_unordered_selects`: a `u32` epoch with 0 for none and a `u8` mode fit there), then
+  re-measure read-only over at least 7 callgrind runs and autocommit over at least 20, both arms
+  built from the same base, and the native CPU beside them.
+
+## 2026-11-18 - WIN (landed as b6f81da87; inside its prediction): a trigger fired under a WITH scope reuses its body's compiled programs (bd-fpr5g, SQL lane round 5, lever 1)
+
+- Target: bd-fpr5g's script, an AFTER INSERT trigger (WHEN guard, INSERT and UPDATE in the body)
+  firing for 20,000 rows that arrive from a recursive CTE. Callgrind (release-perf, LTO off, 2,000
+  rows) put about 95k instructions per inserted row in recompiling the body: compile_with_cache,
+  compile_table_update / compile_table_insert and Vec<TableSchema>::clone. The same rows from a real
+  table hit the compiled-program cache.
+- Cause: execute_insert_with_ctes sets bypass_compiled_cache for its WITH scope (its CTE names
+  resolve to temporary roots), and the trigger scope (MaterializedBindingsVisibilityGuard::hide)
+  kept the caller's bypass and added its own whenever it hid a binding.
+- Ledger preflight: no entry on trigger bodies, the compile-cache bypass or trigger-definition
+  clones. The 2026-07-11 bd-5310l entry (planner-directive cache fronted by the program cache) is
+  the nearest, and does not touch the bypass.
+- Change (crates/fsqlite-core/src/connection.rs): `MaterializedBindingsVisibilityGuard::for_trigger_scope`
+  hides every materialized binding (as before) and sets the bypass to false until the scope ends.
+  `for_insert_target` keeps inheriting it. This is sound because every bypass site guards the
+  caller's own statement text, while a trigger body cannot see the caller's bindings and binds NEW
+  and OLD as parameters.
+- Prediction (posted on bd-fpr5g before code): trig_cte -1.5G to -1.9G; trig_src, trig_values and
+  notrig_cte within +-1%.
+- Kill line: trig_cte gains less than 10%; any other row worse by more than 1%; any answer differs.
+- Measured: release-perf CLIs as shipped (LTO, one codegen unit, stripped). Base 47a2d1ee6, sha256
+  8474709c216271aa; lever, sha256 43076f3b42109eac. Conditions: :memory:, instructions:u and
+  task-clock, medians of 5 interleaved reps, stock 3.54.1 live in the same runs, answers
+  byte-equal, thinkstation1, governor powersave, single-threaded CLI. A/A arm (base against
+  itself, 3 reps): every row within 0.46%.
+
+  | row | base | lever | lever / base | x stock, instructions | x stock, CPU |
+  |---|---|---|---|---|---|
+  | trig_cte (the bead's script) | 5,216.4M | 3,604.2M | 0.691 | 21.6 -> 14.9 | 46.7 -> 28.0 |
+  | trig_src | 3,654.7M | 3,655.1M | 1.000 | | |
+  | trig_values | 3,690.3M | 3,690.2M | 1.000 | | |
+  | notrig_cte | 293.6M | 293.9M | 1.001 | | |
+
+  Inside the prediction (-1.61G).
+- Landing binary (rebased onto 895ee627a, the same code as the pushed commit; sha256
+  07d8430d4c3df48d), against base 47a2d1ee6, 5 reps, same conditions: trig_cte 5,207.9M ->
+  3,618.4M (0.695). Against stock that is x21.6 -> x15.0 in instructions and x45.5 -> x27.6 in CPU.
+  trig_src +0.36%, trig_values +0.01%, notrig_cte -0.01%.
+- Keepers:
+  - crates/fsqlite-core/tests/bd_fpr5g_trigger_body_cache_under_cte.rs, stock live, :memory: and a
+    file. At most 40 compilations for a 300-row CTE-fed insert; it compiled 515 before the change
+    (red) and 3 after, on :memory: and on a file. Scope negatives: a CTE named like a body table,
+    cache warm in both orders, and a body naming only a caller's CTE.
+  - bd_8c68u's compile-count keeper (red on main as bd-f8m1v: 92 against its limit of 60) passes
+    at 44.
+- Gate (rch), on d2b048e09 (the lever on 47a2d1ee6):
+  - clippy -D warnings, fsqlite-core all targets: clean;
+  - 19 trigger / CTE keeper targets: 1,779 passed, 0 failed;
+  - 19 more trigger targets: 117 passed, 0 failed;
+  - 19 CTE / view / DML targets: 85 passed, 3 failed. Two are bd-jlbrk's known pair in
+    bd_i3csr_1_insert_select_one_program, red on main. The third is
+    bd_5haia_view_chain_at_nesting_limit_matches_stock_on_2mib_stack: there rusqlite 3.54.1 itself
+    refuses `SELECT * FROM v999` ("VIEWs and/or subqueries nested too deep") before fsqlite runs,
+    so it is red on any tree;
+  - fsqlite-core --lib: 4,198 passed, 0 failed;
+  - the fsqlite crate, --lib and its 123 default-feature targets: 1,099 passed, 0 failed;
+  - 6 e2e trigger / RETURNING / upsert targets: 57 passed, 0 failed.
+  After the rebase onto 895ee627a (bd-s9i69's binding order, a pager fix): clippy clean; 16
+  keeper targets 91 passed, 0 failed (with --nocapture, for the counts above); the fsqlite-core
+  lib tests matching "trigger" 142 passed, 0 failed. It was pushed onto 5afb99152 (bd-bwmol:
+  INSERT ... SELECT change counts, in other functions), with the same diff and a clean merge.
+- Left on the row: the trigger still costs about 165k instructions per inserted row (3,604M with
+  it, 294M without it, over 20,000 rows). Stock pays about 7.5k (241M against 91M). The planned
+  levers, in bd-fpr5g's order: the TriggerDef list cloned per row (about 15k), the body
+  bound per row (about 17k), the dispatcher around each body statement (about 30k of its 56k) and
+  the outer row-by-row replay (about 49k).
+- Retry condition: none for this lever.
+
+## 2026-11-18 - WIN (landed as f9c9e9965): a rowid seek that lands on the leaf the cursor already stands on is answered without a wait, from the main loop's SeekRowid arm (bd-w4pr1.12, read-loop round 7, lever SL1 v3)
+
+- Target: join_1M_to_pk_1000 (`SELECT count(*), sum(length(u.name)) FROM t JOIN u ON u.a = t.a`),
+  4,414 Ir per row against stock's 1,721 on main 0f7d6a289, 1,680 of them the SeekRowid into u.
+  About 60% of the probes land on the cursor's current leaf, which the seek cache answers without a
+  load. Such a hit still cost about 1,150 Ir, about 320 of it the leaf search, the witness and the
+  slot update; the rest was the async path (see the SL1 v2 entry below).
+- Touched: `crates/fsqlite-btree/src/cursor.rs` (`BtCursor::try_table_seek_within_leaf`, the
+  synchronous form of the seek-cache hit on the stack-top leaf, unchanged from v2, with its keeper),
+  `crates/fsqlite-vdbe/src/engine.rs` (`CursorBackend::try_table_seek_within_leaf`; the main loop's
+  `SeekRowid` arm tries it before `lean_future(table_move_to)` when no RowSet advance applies),
+  `crates/fsqlite-core/tests/join_aggregate_lookup_oracle.rs` (the end-to-end keeper).
+  `try_execute_hot_opcode_sync` is untouched: that is what separates v3 from the rejected v2.
+- Ledger preflight: the SL1 v2 entry below (its retry condition, option 3, is this change); the
+  2026-11-14 join / rowid-seek rounds (page load, interior search, eviction tracker, parked leaves)
+  left the async path of a hit alone.
+- Prediction (bd-w4pr1.12, 2026-11-17 22:17, restated 2026-11-18 before the build): join -200 to
+  -350M Ir, CPU -15 to -45 ms; memory_script_200k -40 to -80M; rowid_lookups_200k within +0.5% Ir;
+  other rows within 0.3% Ir. Kill: join under 150M or CPU not lower in each of two runs,
+  rowid_lookups +0.5% or more, another row +0.3% or more, an oracle red.
+- Result: base 0f7d6a289 (sha256 f15dfa085a9a3ac6) against base + SL1 v3 (7e52ed82d4170700), an
+  A/A arm (the base ELF again) in the same runs, stock sqlite3 3.46.1 live. thinkstation1,
+  powersave, load 11-15, io_uring refused, serial (0 extra threads observed); two runs, 7 reps with
+  the arms interleaved per rep; answers equal everywhere.
+  - join_1M_to_pk_1000: 4,414.1M -> 4,124.0M Ir (x2.56 -> x2.40 stock); cycles 0.907 / 0.903 in
+    the pairs (A/A 0.972 / 0.982); CPU x2.32 -> x2.18 and x2.33 -> x2.14 stock.
+  - memory_script_200k: -57.8M Ir (its join); CPU x2.05 -> x1.88 and x2.01 -> x1.94.
+  - rowid_lookups_200k: +10.4M (+0.39%), the decline on every probe (none lands on the current
+    leaf): about 52 Ir a probe against the ~20 predicted. CursorBackend's forwarder is an
+    out-of-line call returning `Result<Option<SeekResult>>`.
+  - Every other read row within 1M Ir (+0.07% at most). Cycles at that equal Ir moved inside about
+    two points of the A/A arm's, except GROUP BY id % 100000 (1.021 / 1.024 against 1.000 /
+    1.004) and GROUP BY 1000 groups the other way (0.958 / 0.947).
+  - On the landing binary (rebased onto 1954f46cb, sha256 049f1f407e62914b, against that parent
+    3c8325ba1e24939e, load 3-6, same method): join 4,413.7M -> 4,124.1M Ir, cycles 0.944 / 0.953, CPU
+    x2.29 -> x2.12 and x2.23 -> x2.11 stock; memory_script -57.7M, CPU x1.90 -> x1.90 and x2.00 ->
+    x1.95; rowid_lookups +10.8M (+0.40%); every other row within 1M Ir. At that equal Ir,
+    scan_filter_agg 1.034 / 1.064 and GROUP BY a % 10 1.024 / 1.029 in cycles (A/A 1.016 / 1.004,
+    0.999 / 0.998): the layout effect, here in the other direction from the 0f7d6a289 runs.
+- Gate (rch): clippy -D warnings btree / vdbe / core all targets clean; btree / vdbe / core lib,
+  goldens, hot_arm_stream_reachability and 46 core join / seek / rowid / UPDATE-FROM / trigger /
+  conformance targets 6,216 passed, 2 failed (bd_8c68u's known compile-count red, and this lever's
+  btree keeper, which compared page image tokens across two separate stores; fixed in the test to
+  compare the stamped position, then btree lib 563 / 0 and btree clippy clean); 15 e2e oracle targets
+  103 / 0; fsqlite crate suite 126 binaries, 1,098 / 0. After the rebase onto 1954f46cb (bd-hi7qg
+  changed engine.rs; no overlap), on the exact pushed tree: vdbe lib 1,257 / 0, core lib 4,197 / 0,
+  nine seek / rowid / join / UPDATE-FROM keepers 39 / 0.
+- Keepers: fsqlite-btree
+  `test_try_table_seek_within_leaf_matches_table_move_to_and_declines_off_its_leaf` (16 seeks over
+  a five-leaf tree against a cursor that only runs `table_move_to`, 10 answered and 6 declined, and
+  a cursor moved off the cached leaf must decline); fsqlite-core
+  `same_leaf_rowid_lookups_match_sqlite_across_leaves_and_after_writes` (6,012 outer keys striding
+  across a 3,000-row table with every 13th row missing; NULL / REAL / TEXT / BLOB keys; joins,
+  LEFT JOIN, scalar subqueries, a prepared bound; one transaction that dirties the table's leaves
+  and one UPDATE whose subquery reads the row it has just written; rusqlite live, file-backed and
+  :memory:).
+- Retry condition: none for the main-loop fast path. Left on the join row: the 405k probes that
+  change leaf (u is five leaves in our layout against stock's four, so the four-slot seek cache
+  cycles), the lane exit and re-entry around every SeekRowid, and the decline's ~52 Ir on lookups
+  that never hit (an inline precheck of the newest slot's bounds before the out-of-line call would
+  take most of it). The 405k leaf changes are lever SC8's target (the seek cache's four slots
+  against u's five leaves; prediction on bd-w4pr1.12 2026-11-18; its patch, with the slot-count
+  tests re-expressed over any slot count, is drafted but neither built nor tested). The hot-lane
+  retry (v4: v3's try moved into an out-of-line arm of try_execute_hot_opcode_sync) still needs the
+  no-op-arm A/A first.
+
+## 2026-11-18 - NOT ATTEMPTED (the effect is inside this host's layout band): moving TN1's top-N preflight out of line to give the GROUP BY rows back their cycles (bd-w4pr1.12, read-loop round 7, lever TN1-out)
+
+- Target: the cycles TN1 (landed 6c8033397) cost rows that run none of it, at equal instructions:
+  GROUP BY a 1.034, GROUP BY a % 10 1.047, join_1M_to_pk 1.018, rowid_lookups 1.016 (TN1 entry).
+- Ledger preflight: W5 (2026-11-16) moved the ResultRow body out of line and cut its cost on rows
+  that run none of it from +5.6 / +6.6% cycles to +1.3 / +1.8%; the 2026-11-15 VColumn / VNext
+  entry marked two helpers `#[inline(never)]` and gained nothing.
+- Why the planned change does not apply: in the landed binary execute_sorter_compare is already an
+  out-of-line function (0xb2b bytes, top_n_preflight_retains inlined into it), and
+  run_hot_opcodes_sync has the same size in the base and in an unrelated change (0x1806e); the
+  preflight is not in the hot loop. What moved is where the loop sits: the same function starts at
+  ...b10 in the base and ...440 in SL1 v3's build (a 6,448-byte shift from code placed before it).
+- Bands measured on this host (thinkstation1, powersave, load 11-15, stock 3.46.1 live, 7
+  interleaved reps, two runs):
+  - same ELF on two database copies (A/A): pair medians 0.974..1.017 on the GROUP BY rows;
+  - SL1 v3, a change in code the GROUP BY rows never run: GROUP BY 1000 groups 0.958 / 0.947,
+    GROUP BY a % 10 0.957 / 0.988, GROUP BY id % 100000 1.021 / 1.024, GROUP BY a sum(c) 1.003 /
+    1.012, at identical instructions;
+  - the same SL1 v3 change rebased onto 1954f46cb, against that parent: GROUP BY 1000 groups 1.027 /
+    1.011, GROUP BY a % 10 1.024 / 1.029, GROUP BY id % 100000 0.984 / 0.967, scan_filter_agg
+    1.034 / 1.064, again at identical instructions: the same change moved the same rows the other way
+    on another base;
+  - the do-nothing build this round planned (a SeekRowid arm in try_execute_hot_opcode_sync whose
+    #[inline(never)] helper always declines, scratchpad rl7/aa_noop.patch) was not built: rch
+    admission took the round.
+  TN1's +3.4% / +4.7% lies inside the -5.3%..+6.4% that one unrelated change moved these rows on
+  two bases. An out-of-line preflight would be judged against that band and could not be told from
+  it.
+- Retry condition: a build whose hot loop's placement does not move with unrelated code (a fixed
+  alignment for run_hot_opcodes_sync; this workspace avoids nightly features such as fn_align, so
+  that needs a decision), or a measurement that averages over several layouts of each arm.
+  Recovering a specific change's cycles before then is reading noise.
+
+## 2026-11-18 - WIN (landed as 04062b0c5; re-measured on main 0dd0e7102 with an A/A arm; inside its prediction, the write row gained a little more than predicted): a prepared read's begin is its staleness check, the reader recheck is stock's one-copy compare, and the read transaction's journal path and exit locks are taken once (bd-05xlf, read/seek round 7, lever 1)
+
+- Target: the per-execution read transaction of the prepared secondary-key lookup (bd-05xlf,
+  prepared-dml-probe select-index), about 27k of its 84k callgrind Ir on main b09bb8209: the
+  standalone staleness refresh before the begin (2.9k), the begin (18.2k) and the end (5.8k).
+  Ledger preflight: the 2026-11-14 lever B entry (its retry condition asks for one redesign of the
+  admission's round trips, not pieces), the 2026-11-14 lever D entry (the access(-journal) probe,
+  left alone here), and round 5's design on bd-05xlf. Plan, prediction and kill lines were posted
+  on bd-05xlf before code, with a review request to the cross-process lane.
+- Change, one set across the admission and its two ends:
+  - `crates/fsqlite-core/src/connection.rs` prepare_connection_for_prepared_read: with no
+    transaction open, the standalone refresh_memdb_if_stale is skipped. The ReadOnly begin that
+    follows binds the latest WAL-index header in its reader admission and reloads the memdb when
+    its bound commit sequence is past the mirror's, the decision the refresh made from a header
+    read of its own. When the begin reloaded, it publishes the committed schema cookie, as the
+    refresh's reload did. Inside an open transaction and on the memdb fast-path branches nothing
+    changes.
+  - `crates/fsqlite-wal/src/wal_index.rs` revalidate_shared_wal_index_reader: after the read-mark
+    lock the recheck is stock walTryBeginRead's (nBackfill, barrier, the read mark, one copy of the
+    live header against the captured one, which read_shared_wal_index_header checksummed at
+    capture), not a second validated two-copy read plus a checksum of the captured header.
+  - `crates/fsqlite-pager/src/pager.rs`: the rollback-journal path is built once at open
+    (SimplePager.rollback_journal_path) and shared by the begin's refresh and every
+    SimpleTransaction; coordinated_transaction_exit releases the reader claim and restores the
+    external snapshot under one database-file guard (release_wal_reader_slot gains the flag).
+- Result on origin/main 0dd0e7102 (both arms rebuilt there; the change's lines are those measured
+  on b09bb8209 below). thinkstation1, governor powersave, load 1.3, io_uring refused; main-0dd
+  (CLI 1dfecdc77ae384cc, probe 3977a3d88a7c6243), l1-0dd = main + this change (CLI
+  64333c2fa0b85820, probe 95c0d808e32149d1), an A/A arm (the main binaries on their own copies);
+  one database per row family, built by a main binary and copied per arm with every sidecar;
+  stock live (the 3.54.1 prepared-loop driver 9500dcc51bdca47c, sqlite3 3.46.1
+  5a910e452929c124); 5 reps interleaved; answers equal stock's everywhere.
+
+  | row | stock | main | A/A | l1 |
+  |---|---|---|---|---|
+  | prepared select-index (WAL), instructions per execution | 5,058 | 68,236 (13.49x) | 68,110 | 62,712 (12.40x), -5.5k |
+  | same, CPU per execution | 3.74 us | 23.68 us (6.32x) | 24.17 us | 21.47 us (5.73x) |
+  | select-index, checkpointed | 5,058 | 74,683 (14.76x) | 74,658 | 68,471 (13.54x), -6.2k |
+  | select-rowid (control) | 4,725 | 8,148 | 8,148 | 8,149 |
+  | autocommit INSERT (write row) | - | 141,315 | 141,623 | 139,140 (-1.5%) |
+  | point_rowid_2000 | 44.0M | 176.9M (4.02x) | 176.9M | 172.0M (3.91x), -2.8% |
+  | point_hot_2000 | 42.8M | 165.9M (3.87x) | 166.8M | 160.9M (3.76x), -3.0% |
+  | point_sec_key_2000 | 67.4M | 265.3M (3.94x) | 265.3M | 260.3M (3.86x), -1.9% |
+  | rowid_lookups_200k (one statement, control) | 554.4M | 2,688.9M | 2,689.0M | 2,689.1M |
+
+  The A/A arm is within 0.13k on the lookups and 0.54% (point_hot_2000) on the sweep.
+
+- The first measurement, on b09bb8209 (main CLI 0a112825795c109e / probe b374ab87fb745db1, l1 CLI
+  8103c1d6a2a45a70 / probe 334e9cff3795bccc; 7 lookup and 9 sweep reps, load 2.7 to 4.0):
+  select-index 68,767 -> 62,744 (13.6x -> 12.4x stock), CPU 25.27 -> 23.46 us, checkpointed
+  74,189 -> 68,542, select-rowid 8,129 -> 8,130, INSERT 141,379 -> 138,964, syscalls per
+  select-index execution 7 -> 6 (strace -c: one -shm statx fewer; stock makes 2),
+  point_rowid_2000 -2.7%, point_hot_2000 -3.1%, point_sec_key_2000 -1.8%, multicol_eq_1000
+  -0.7%, orderby_page_500x20 -0.4%, insert_literal_400 -1.5%, rowid_lookups_200k and
+  range_noncovering_200k 0.00%; the A/A arm within 0.56k / 0.18%.
+  Callgrind of the prepared loop there: 83.9k -> 78.1k Ir per execution; the standalone refresh
+  -2.9k, the begin -2.2k (the two journal PathBufs, the one-copy recheck), the end -0.3k (one
+  guard), the finish -0.5k.
+- Prediction (bd-05xlf, before code): select-index -4.0k to -6.5k (-6.0k, -5.5k against the A/A
+  arm: inside); checkpointed the same (-5.6k: inside); CPU -0.8 to -2.5 us (-1.8 us: inside);
+  syscalls 7 -> 6 (met); select-rowid within 0.15k (+1: inside); autocommit INSERT -0.4k to -2.0k
+  (-2.4k: just beyond, better); point rows -1.0% to -3.5% (-2.7%, -3.1%, -1.8%: inside);
+  multicol_eq_1000 -0.3% to -1.5% (-0.7%: inside); the one-statement miss rows within 0.1%
+  (0.00%: inside). Kill lines (select-index under 3.0k, checkpointed under 2.5k, a control outside
+  its band, the A/A arm outside a band, an answer, a keeper): none crossed. The A/A arm was 0.56k
+  under main on select-index and within 0.18% elsewhere.
+- Keepers: prepared_statement_cross_process_staleness_oracle gains
+  held_integer_key_lookups_see_every_commit_and_release_their_read_mark (held lookups of the
+  probe's shape across a stock child's commits, an in-process peer's, a stock RESTART and TRUNCATE,
+  an fsqlite child's, a bulk insert and an index build and drop, each compared with stock; a stock
+  TRUNCATE checkpoint between executions must answer 0|0|0 with an empty -wal; an explicit
+  transaction keeps its snapshot while the peer and stock commit) and
+  held_integer_key_lookup_reads_whole_commits_while_stock_commits_and_restarts (a stock writer
+  committing with a RESTART every 20th row while the lookup runs; every answer one commit's
+  state). fsqlite-wal's revalidation test covers the one-copy recheck (copy 2 alone accepted,
+  copy 1 moved refused).
+  The keeper's rowid probe (`SELECT b FROM k WHERE id = ?1`) was left out. On main 0dd0e7102 alone
+  it answers the pre-UPDATE row after the stock UPDATE until an fsqlite process commits, with the
+  same mismatch report with and without this change (a main bug in the prepared memdb fast path,
+  reported on bd-05xlf 2026-11-18).
+- Gate (rch, any worker, batches under 20 targets) on 0dd0e7102 + this change:
+  - clippy -D warnings on fsqlite-wal, fsqlite-pager and fsqlite-core, all targets: clean;
+  - wal, pager and core --lib with the prepared-statement keepers (19 targets): 6,664 passed,
+    5 failed: the t6741 pair and bd_2jpu6_2 (main reds), the keeper's rowid probe above, and an
+    uncommitted bound-key probe that reproduces a main divergence (reported on bd-5i14u). The
+    keeper file without the rowid probe: 4 passed;
+  - core join/seek and seek-key keepers (18 targets): 46 passed, 1 failed (the bd_8c68u compile
+    count, a main red);
+  - core savepoint/trigger/staleness keepers and the cross-process battery (14): 263 passed;
+  - fsqlite-e2e (stock_headerless_wal_e2e, split_claim, refused_commit, gh364, the
+    concurrent-writer set and mpbusy, 14 targets, --test-threads=1): 105 passed;
+  - the fsqlite crate (lib and 123 test targets in 7 batches): 1,097 passed.
+- Landing rerun. origin/main 25e3e883b's 5d98aff3e (bd-j2dtf, immutable=1) rewrote the read-only
+  journal check in refresh_runtime_committed_state; the one conflict was that call, resolved as
+  its immutable branch with this change's borrowed journal path. On that exact tree: clippy clean;
+  wal, pager and core --lib with the prepared-statement, staleness, path-identity and
+  cross-process keepers (13 targets) 6,809 passed, 1 failed (bd_2jpu6_2); fsqlite
+  gh528_readonly_truncated_shm 4 passed. Landed in 04062b0c5, on 1954f46cb (two test-only commits
+  in other files after 25e3e883b).
+- Not taken (each its own decision, unchanged): the access(-journal) probe (lever D's retry
+  condition), the admission's -shm fstat (bd-7do1d), merging try_bind_runtime_native_reader's
+  WAL-backend read and write guards (lock order against the db-file lock), and acquire_snapshot's
+  separate db-file lock (the journal probe needs SHARED before admission).
+- Retry / next: what is left of the read transaction is the reader admission's lock round trips
+  (WAL-backend and db-file locks about 1.3k), BeginAdmission (1.8k), the -wal path identity (one
+  statx, owner rule) and the access probe; the facade's statement-future move is the next large
+  piece outside it. The prepared lookup is 12.4x stock instructions, 5.7x CPU (0dd0e7102 run).
+
+## 2026-11-18 - FIX (landed as 3a76f8e09; a correctness fix measured like a lever, inside its kill line in v5 and v6): the rowid allocator's claim is taken where the Insert arm seeks, once per cursor and session, so the per-row append path is base's (bd-hi7qg v5, v6)
+
+- Target: bd-hi7qg's fix (an implicit rowid after a deleted maximum is `max(rowid)+1` again, as in stock, when no live
+  session holds a claim on the table and no write commit became visible since BEGIN) without the per-row cost that
+  rejected v1-v4 (the 2026-11-16 entry). Touched: `crates/fsqlite-mvcc/src/rowid_alloc.rs`,
+  `crates/fsqlite-vdbe/src/engine.rs`, `crates/fsqlite-core/src/connection.rs`.
+- v4's "about 12 a row outside the statement" was not outside it. It stayed whole on the main thread alone
+  (`perf stat -i`), with no commit (a rolled-back INSERT), and pinned to one CPU. Exact whole-process callgrind of that
+  rollback shape split v4's +23 a row into:
+  - +24 a row of code: the bump closure 13, the Insert arm carrying the session id 7, ensure_table_floor 3, malloc 1;
+  - -12 a row of `__memcpy_avx_unaligned_erms`, which callgrind counts per byte of rep movsb and perf barely sees (the
+    2026-11-15 bd-05xlf P1 trap).
+  Round 7's statement-only callgrind (+10.5) was the sum of the two.
+- v5:
+  - claims in their own map, so TableAllocatorState and ensure_table_floor stay base's code;
+  - an Insert that is not an append (the existence-seek path, which every cursor's first insert takes, and REPLACE)
+    claims before it writes, and an append rides on that claim;
+  - a retained cursor reopened under another session or schema epoch drops its append hint;
+  - the random-rowid fallback claims.
+- v6: v5 plus a per-cursor flag, so the seek path takes the claim's lock once per cursor and session.
+- Kill line (round 6, before code): bulk instructions up more than 10M, or task-clock min up more than 15 ms.
+- Result (base b3abcb66a sha256 c6b9d55dc0715266; v5 d3ad4cd3617cf0c7; v6 4eaa3bf7a740f6ad; stock sqlite3 3.46.1 live;
+  scratchpad `r8/ab_v5.txt`, `r8/ab_v6.txt`, `r8/bulkreps_a.txt`, `r8/bulkreps_b.txt`, `r8/seek_a.txt`, `r8/seek_b.txt`
+  of the bulk-write lane):
+  - bulk_insert_1M_one_txn instructions:u min:
+    - base 7,032.9M, v5 7,036.8M, v6 7,036.4M (+3.5M);
+    - both arms bimodal about 11M apart; mode against mode +4.4M / +6.0M;
+    - task-clock min 912.9 / 896.5 / 880.5 ms;
+    - stock 4,177.4M / 450.3 ms (x1.96 task-clock with v6).
+  - delete, update, memory_script: flat in v5 and v6 (within 0.1M, memory_script within base's own 2.6M spread);
+    stock 120.7M / 273.3M / 1,914.0M.
+  - Scattered explicit-rowid INSERT ... SELECT, 200k rows (every row seeks): base 4,003.3M, v5 4,025.6M (+108 a row,
+    the claim's lock on every row), v6 4,010.8M (+37 a row). Stock 1,242.1M.
+  - Re-check after the rebase onto main 768578346 (code-identical to 0dd0e7102; the commit after it touches .beads
+    only). Arms: main sha256 1dfecdc77ae384cc, built with the same release-perf flags in the perf5-shm clone; v6
+    rebased 26db8281e8cba0eb; stock 5a910e452929c124; load 1.7-2.4.
+    - r6_ab, 7 reps, `r8/ab_land.txt`: bulk instructions:u min 7,030.3M -> 7,035.7M (+5.4M; medians +5.0M);
+      task-clock min 865.9 -> 831.7 ms; stock 4,177.4M / 430.5 ms. Answers equal stock's.
+    - Every rep, 7 each, `r8/bulkreps_land.txt`: main 7,031.7-7,045.9M, v6 7,039.1-7,051.0M (min +7.5M);
+      task-clock min 873.5 -> 852.6 ms.
+    - Inside the kill line.
+  - Re-check on main 5ee2326ea + v6, both arms built in the bulk-write clone: main sha256 ad9c3e38225fb449, v6
+    e5575570e93cf70c; load 5.3-5.8.
+    - r6_ab, 7 reps, `r8/ab_land5ee2.txt`: bulk instructions:u min 7,032.4M -> 7,035.9M (+3.5M); task-clock min
+      839.7 -> 826.2 ms; stock 4,177.4M / 431.4 ms (x1.92 task-clock with v6).
+    - Every rep, `r8/bulkreps_land5ee2.txt`: min 7,030.3M -> 7,036.2M (+5.9M); task-clock min 844.9 -> 848.8 ms (+3.9).
+    - Inside the kill line.
+    - Main moved twice more before the push (5d98aff3e: immutable=1 open and the top-N preflight in engine.rs;
+      3e6cc4c0c: RETURNING bindings). Its tests were re-run on 3e6cc4c0c + v6; its cost was not re-measured there.
+  - Exact v6 cost (callgrind, rollback shapes):
+    - appends: ensure_table_floor +4 a row, from the grown allocator struct's field offsets;
+    - scattered rows: the out-of-line claim helper's call +19 and its argument setup in the Insert arm +14, on top of
+      the +4.
+- Retry condition: none for the claim's placement. The scattered shape's +33 a row goes to about 3 by testing
+  `rowid_claimed` at the call site with the claim out of line; take that with the next change to the Insert arm. Any
+  later change that adds work to the per-row append bump is measured on `bulk_insert_1M_one_txn` against this entry.
+  FB (bd-w4pr1.13), the per-claimant slot that replaces that bump, is where the remaining +4 a row comes back.
+
+## 2026-11-18 - WIN (disk; tmpfs unchanged as predicted): a checkpoint persists the certificate handoff only on the path that resets the WAL, so 8 writer processes on a disk stop losing rows (x70 -> x3.9 stock) (bd-1qmz4, multi-process lane round 1, lever 2)
+
+- Target: the scorecard's `multiproc` shape on a real disk (ext4, synchronous=NORMAL), 8 and 16
+  writer processes. Touched: `crates/fsqlite-core/src/wal_adapter.rs` (landed as 345016f91):
+  - `PathRefreshingWalBackend::checkpoint` builds a `CertificateHandoffFence` instead of writing
+    the handoff;
+  - `WalBackendAdapter::checkpoint_with_reset_fence`;
+  - `CheckpointResetTarget::prepare_wal_reset` persists the fence before it arms the reset;
+  - `persist_checkpoint_certificate_handoff` takes vfs and path.
+- Evidence before (LD_PRELOAD census in every writer, scratchpad `mp1/`):
+  - At N=8 on disk, 93% of the wall was an in-lock `fdatasync(-wal-cert-head)`, 0.41 per txn
+    at about 16 ms each.
+  - These are autocheckpoint attempts (Restart, zero busy budget). Each one persisted the handoff
+    at the checkpoint's entry, copied nothing because peers' read marks pinned the safe frame,
+    and could not reset (nBackfill frozen; `mp1/shm_sampler.py`).
+  - The writer lock was 97% busy. Waiters on 100 ms sleeps starved until busy_timeout, and rows
+    were lost.
+- Ledger preflight: the 2026-11-12 "certificate record lookup reads footer and record in one tail
+  read" entry and GH#294's unchanged-bytes skip both touched sidecar I/O. Neither covered the
+  handoff written by non-resetting checkpoints.
+- Prediction (bd-1qmz4, before code): in-lock handoff fdatasync 0.41 -> 0.01 or less per txn; disk
+  N=8 median under 2 s; 0 rows lost at N=8/16; tmpfs within noise; explicit-same within 5% of base.
+  Kill: any of these missed, or a handoff / checkpoint keeper changing outcome.
+- Result (stock sqlite3 3.46.1 live and interleaved in every probe):
+  - On main 05fe3c5b1, release-perf CLIs da793902bb33619e vs b3d549876f9f5a66 (scratchpad
+    `mp1/ab_L2.txt`):
+    - disk NORMAL census N=8: handoff fdatasync 0.42 -> 0 per txn; RESERVED 96% -> 52% busy, mean
+      hold 2,900 -> 127 us; wall 17.6 -> 1.06 s;
+    - disk N=8 (3 reps): 18.9 s (x70, rows lost) -> 1.04 s (x3.85, none). N=16: 24.1 s (x36, 19
+      rows lost) -> 1.19 s (x1.78, none);
+    - bd-73pfl stress, 8 x 300: explicit-same committed median 1,837 -> 1,821 (-0.9%);
+      explicit-sep refused 2 -> 0; auto-same 0 and 0; integrity ok everywhere;
+    - tmpfs: scorecard row 0.854 -> 0.807 s (inside the row's spread); scaled N=1 117.1 -> 114.6
+      us, N=8 216.6 -> 212.2 us.
+  - Landing tree: on b1526ddf1, release-perf CLIs f7a4dddb250cba04 (base) vs cf5aa2dc6d9ded8a (this
+    change), 2 reps (scratchpad `mp1/ab_L2land_disk.json`):
+    - disk N=8 12.3 / 6.6 s with 2 / 0 rows lost (x46 by median) -> 0.91 / 1.03 s with none (x4.74);
+    - N=16 27.5 / 22.1 s with 6 / 6 lost (x37) -> 1.36 / 1.35 s with none (x2.04);
+    - stock 0.18-0.23 s and 0.66-0.67 s;
+    - explicit-same (6 reps): committed median 1,762 -> 1,910 of 2,400 (stock 2,400); integrity ok.
+- Test: `checkpoint_handoff_is_written_only_by_a_checkpoint_that_resets_the_wal`. A PASSIVE
+  checkpoint writes and syncs no handoff (the old code fails). A TRUNCATE that resets leaves a
+  synced handoff with the old generation's latest certificate, and the clock survives the reset (a
+  never-write change fails).
+- Gate (rch, on b1526ddf1 plus the change):
+  - clippy -D warnings on fsqlite-core, all targets: clean.
+  - fsqlite-core lib 4195 / 2 (the known t6741 pair).
+  - Core keepers green: bulk_import_upsert_text_pk_phantom_pk, gh534, bd_7zs8a, bd_ih8ak, gh441,
+    wal_fec_commit_pipeline, bd_qyekq, gh385. wal_reset_with_foreign_reader 12 / 1 (the known gh19
+    native_full_commits hang).
+  - fsqlite-wal: lib alone 1183 / 0; fault-injection targets 1314 / 0 (16 targets).
+  - e2e: concurrent-writer / SSI / checkpoint / group-commit batch 132 / 0 (19 targets);
+    cross-process batch 56 / 0 (10); multiprocess_autocommit_busy_timeout_e2e --test-threads=1
+    8 / 0.
+  - mvcc lib 1685 / 0; pager lib 1114 / 1 (the known bd_2jpu6_2); vfs lib 531 / 0; gh519 10 / 0.
+  - fsqlite crate 1098 / 0 (126 binaries).
+  - Main later moved past b1526ddf1 without touching wal_adapter.rs; the rebased tree was not
+    re-gated.
+- Retry condition / next: none for this lever. Autocheckpoint attempts that copy nothing still take
+  the writer lock (CKPT, READ_LOCK(0), the reader-horizon probes). If disk rows show
+  checkpoint-attempt time again, the next step is an autocheckpoint that skips while the safe frame
+  equals nBackfill, the way stock's PASSIVE does nothing when there is nothing to copy.
+
+## 2026-11-17 - REJECTED (two versions; the negative case is explicit transactions refused at COMMIT): a contended main-file lock wait that keeps losing writers polling (v1: 50 us doubling to a 2 ms cap; v1b: 1 ms doubling to a 5 ms cap; main: 1 ms doubling to 100 ms) (bd-1qmz4, multi-process lane round 1, lever 1)
+
+- Target: the scorecard's `multiproc_8x500` (8 CLI processes x 500 autocommit INSERTs into one WAL
+  database) and its scaled variant (1-16 processes, 4,000 rows in all), tmpfs and disk.
+  - Touched, not kept: `crates/fsqlite-vfs/src/unix.rs`, `UnixFile::lock`'s native-contention
+    wait.
+  - Patches: scratchpad `mp1/L1_v1.patch` (diff sha256 b6b780ff9015ccb0) and `mp1/L1b.patch`
+    (cedd8a2daaea69c5), each with the keeper
+    `contended_reserved_wait_takes_the_lock_soon_after_the_holder_releases`.
+- Evidence before:
+  - Tools: an LD_PRELOAD census in every writer of both engines, with lock-hold intervals merged
+    across processes (scratchpad `mp1/mp1shim.c`, `mp1_census.py`).
+  - At N=8 on tmpfs, the commit's writer lock (main-file RESERVED, taken before WAL_WRITE) sat idle
+    127.5 of 215.7 us per txn while 3-6 writers slept. All 297 main-thread sleeps of 1 ms or more
+    were this wait.
+  - On disk (NORMAL), waiters on 100 ms sleeps starved behind a lock 97% busy until busy_timeout,
+    losing rows.
+- Ledger preflight: nothing earlier touches this wait.
+- v1 prediction (bd-1qmz4, before code): tmpfs scorecard shape -40%; disk unchanged. Kill: tmpfs
+  N=8 under -15%, N=1 +3%, CPU at N=8 +20%, any tmpfs error, disk NORMAL N=4/8 worse.
+- v1 result (stock sqlite3 3.46.1 live; release-perf CLIs b3abcb66a 4d27023cdc111870 vs
+  ff80c9be62a7f738, main 05fe3c5b1 da793902bb33619e vs 5981bc76792dd665):
+  - tmpfs scorecard row -7.5% to -18% across four runs, centred on the kill line. Scaled probe:
+    N=8 -3% to -13%, N=16 -20%, N=1 unchanged.
+  - Disk NORMAL: N=8 10.8-15.4 s with 1-3 rows lost per run -> about 1.0 s with none; N=16
+    18.7-26.7 s with 4-7 lost -> 1.3 s with none (stock 0.2-0.9 s).
+  - Disk FULL: wall unchanged, CPU at N=8 +28%.
+- v1 negative case, the bd-73pfl stress (`mw_conflict.py`, 8 x 300, busy_timeout 5000):
+  - explicit-same: commits fall 1670-2109 -> 871-953 of 2400 per run (refused 23% -> 62%; stock
+    refuses none);
+  - explicit-sep: 0 -> 2 refused;
+  - integrity ok everywhere.
+- v1b (prediction and kill posted before code; the kill included explicit-same within 5% of
+  base):
+  - explicit-same: commits 1752-1976 -> 1365-1526 (median -22%, refused 22% -> 40%). KILLED.
+  - Disk NORMAL: N=8 5.5-18.4 s -> 1.2-1.5 s, and N=16 19.9-23.9 s -> 2.1-2.3 s, both with no rows
+    lost.
+  - tmpfs scorecard row -6.4%. Disk FULL CPU +8%.
+- Why: base's long sleeps take losing writers out of the race. The writer that just committed
+  then runs several transactions in a row with no peer commit in its window. Any schedule that keeps
+  losers polling keeps more writers in the race, so more explicit transactions meet a peer's commit
+  to the shared leaf before their COMMIT validates. Under cross-process first-committer-wins
+  (bd-reality-check-1022-llk6g.5), that is a refusal the application sees.
+- Retry condition: not while cross-process explicit-transaction refusals depend on how many writers
+  are in the race. Retry once .5's conflict protocol stops refusing appends to a shared page (then
+  re-measure the idle share), or together with an admission rule that keeps the explicit-same
+  refusal rate at or under base's. The disk starvation is attacked at its cause instead: the
+  autocheckpoint handoff fsync inside the writer lock (lever 2, the entry above).
+
+## 2026-11-17 - REJECTED on its other-rows kill lines (join gain kept on record: join_1M_to_pk_1000 -339M Ir, x2.32 -> x2.05 stock CPU): a rowid seek that lands on the leaf a cursor is already on runs synchronously on the hot lane (bd-w4pr1.12, read-loop round 6, lever SL1 v2)
+
+- Target: the SeekRowid into u in join_1M_to_pk_1000, 1,680 of 4,414 Ir per row on main 05fe3c5b1
+  (stock's whole row: 1,721). u is five leaves in our layout (143/255/255/255/92 cells; stock packs
+  the same rows in four), and t.a steps by -81, so 595k of 1M probes land on the current leaf and
+  405k descend: the four-slot seek cache cycles through five leaves. A same-leaf hit costs about
+  1,150 Ir, about 320 of it the leaf search, the witness and the slot update; the rest is the
+  async path to them (main-loop arm, CursorBackend::table_move_to, with_btree_op and its
+  depth-gauge postlude, table_seek, table_seek_for_insert, try_table_seek_cache).
+- Touched (reverted, never committed; patch `scratchpad/rl6/sl1_v2.patch`):
+  `crates/fsqlite-btree/src/cursor.rs` (`BtCursor::try_table_seek_within_leaf`, the synchronous form
+  of the seek-cache hit on the stack-top leaf, with a keeper that compares 16 seeks against a cursor
+  that only runs `table_move_to` and the negative case of a cursor moved off the cached leaf) and
+  `crates/fsqlite-vdbe/src/engine.rs` (`CursorBackend::try_table_seek_within_leaf`, a `SeekRowid` arm
+  in `try_execute_hot_opcode_sync`).
+- Ledger preflight: the join / rowid-seek rounds of 2026-11-14 (page load, interior search,
+  eviction tracker, the parked-leaf pool) left the async path of a hit alone.
+- Prediction (bd-w4pr1.12, 2026-11-17, before the build): join -300 to -600M Ir, CPU -25 to -70 ms;
+  rowid_lookups_200k within +0.5% Ir; rows without SeekRowid within 0.3% Ir.
+- Result (thinkstation1, powersave, io_uring refused, serial, stock 3.46.1 live, par_probe with
+  cycles, reps 5; base fsqlite-rl6-base-05fe sha256 18bd46e290c9ce36, SL1 de278a0ea879268a; answers
+  equal): join 4,414.3M -> 4,075.1M Ir, cycles -12.6%, CPU 454.6 -> 400.5 ms (x2.32 -> x2.05
+  stock), inside the prediction. Rows that run no SeekRowid: GROUP BY a +0.90%, a with sum(c)
+  +0.62%, a % 10 +1.17%, id % 100000 +1.54%, id +1.13%, scan_filter_agg +1.45%, the two window rows
+  +0.25%; rowid_lookups_200k +0.75%. Both kill lines crossed: REJECTED and reverted.
+- Why (callgrind of scan_filter_agg, which runs none of it): the arm's body, with the btree fast
+  path, is inlined into run_hot_opcodes_sync (its self cost 482.1M -> 525.6M), and the loop's other
+  arms got heavier: +18.5 Ir per scanned row. The H1 entry's trap, larger than H1's +1.3%. The
+  0.3% line was set without the no-op-arm A/A the H1 entry asks for.
+- Retry condition: an A/A build whose SeekRowid arm calls an `#[inline(never)]` helper that always
+  declines, to set the other-rows band, then the fast path inside that helper judged against the
+  band; or the same btree fast path called from the main loop's SeekRowid arm before its
+  `lean_future`, which leaves `try_execute_hot_opcode_sync` alone and keeps most of the saving
+  (the async layers) at the cost of the lane exit.
+
+## 2026-11-17 - WIN (landed as 6c8033397; prediction missed, beyond its range): a top-N preflight judges the sort-key registers and builds no record for a row the bounded sorter turns away (bd-w4pr1.12, read-loop round 6, lever TN1)
+
+- Target: order_by_text_limit10 (`SELECT ... FROM (SELECT id FROM t ORDER BY b DESC LIMIT 10)`,
+  1M rows), 1,649 Ir per row against stock's 777 on main 05fe3c5b1. The heap is full after 10 rows,
+  so 999,990 rows reach the preflight and 499 are inserted. Each built a record of its key
+  (MakeRecord, 127 Ir) that SorterCompare re-parsed (compare_packed_sorter_key, 202 of its 306).
+  Stock's IdxLE compares its key registers with the heap's last entry.
+- Touched: `crates/fsqlite-vdbe/src/codegen.rs` (both preflight sites: the ordered SELECT and an
+  IN-subquery ORDER BY ... LIMIT emit `SorterCompare cursor, skip, first_key_reg,
+  P4::Int(key_count), PREFLIGHT` and no MakeRecord), `engine.rs` (`top_n_preflight_retains` hands
+  the registers to the sorter's own `would_retain_top_n`, materializing MakeRecord's sideband first
+  should a key register hold it; `compare_packed_sorter_key` and the packed-verdict path removed;
+  the ordinary GROUP BY SorterCompare unchanged), `lib.rs` (register spans: the preflight reads its
+  key registers, writes none), `crates/fsqlite-types/src/opcode.rs` (doc).
+- Ledger preflight: this replaces the 2026-11-12 WIN "a top-N preflight compares the packed key
+  with the heap's worst row without decoding it (bd-w4pr1.13)". No entry judged the registers.
+- Prediction (bd-w4pr1.12, 2026-11-17, before the build): -280 to -420M Ir, CPU -15 to -35 ms;
+  other read rows within 0.3% Ir. Kill: under 150M, CPU not lower in each of two runs, another row
+  +0.3% Ir, an oracle red.
+- Result, on the landing binary itself, the rebased tree's release-perf CLI (sha256
+  092110bcaf0e1efd), against its parent with bd-36aed (sha256 086225e73df4d526). Stock 3.46.1 was
+  live in the same invocations. thinkstation1, powersave, serial (0 extra threads observed),
+  io_uring refused; two par_probe runs with cycles, reps 5, then 10 interleaved pairs; answers
+  equal.
+  - order_by_text_limit10: 1,649.4M -> 1,196.2M Ir (-453M; 2.12x -> 1.54x stock instructions);
+    CPU x1.98 -> x1.59 and x2.07 -> x1.58 stock; cycles 0.800 in the pairs.
+  - Every other read row is identical in Ir.
+  - Missed and stated: at equal Ir the pairs put cycles up on GROUP BY a (1.034), GROUP BY
+    a % 10 (1.047), join_1M_to_pk (1.018) and rowid_lookups (1.016). execute_sorter_compare is
+    called from the hot lane: the layout trap again. Not a kill line.
+  - The pre-rebase run on 05fe3c5b1 agreed (-452M, cycles 0.828).
+- GOLDEN-CHANGE: fts5_title_match_with_limit. Its rows 13-14 (MakeRecord 7 1 4, SorterCompare 1 18
+  4) become row 13, SorterCompare 1 17 7 (int)1: the preflight reads key register 7 instead of a
+  temp record. Every later address and every jump past it moves down one.
+- Keepers: `top_n_limit_rows_match_stock_file_backed_and_in_memory`
+  (bd_orderby_nulls_limit_oracle_probe.rs: 21 bounded shapes, ties that must keep the earlier
+  row, NULLs, mixed storage classes, NOCASE, mixed-direction keys, OFFSET, DISTINCT, an
+  IN-subquery ORDER BY ... LIMIT; ad hoc and prepared; strict file-backed and :memory:, the
+  derived-table shape, which strict refuses, compared in :memory: only; stock live, rows built by a
+  recursive CTE since the bundled library has no generate_series); vdbe unit tests for BINARY /
+  NOCASE / two keys / a sideband-armed key register.
+- Gate: both changes gated together (rch):
+  - First pass on 05fe3c5b1. Reds: the lane brief's known ones; the pre-existing
+    without_rowid_secondary_suffix_order_matches_stock; four test-file reds of this round, all
+    fixed (three GROUP BY goldens, TN1's keeper, bd-36aed's strict-off list).
+  - On the fixed tree:
+    - clippy -D warnings types / vdbe / core, all targets: clean;
+    - fsqlite crate suite: 126 binaries, 1,098 passed, 0 failed;
+    - 18 fsqlite-e2e oracle targets: 117 passed, 2 failed, both outer_join_oracle_e2e reds
+      fixed on main by 49cadfad1;
+    - goldens: 8 / 8.
+  - After the rebase onto 0dd0e7102:
+    - clippy vdbe / core, all targets: clean;
+    - vdbe and core lib, goldens, both keepers, create_index_sorted_bulk_build_oracle,
+      bd_r39kx_eqp_access_path_wording_oracle: 5,465 passed, 3 failed (the known count(*)
+      IN-list test and the t6741 pair);
+    - outer_join_oracle_e2e: 13 / 13.
+  - After the rebase onto 5ee2326ea, whose codegen.rs change is in its tests:
+    - clippy types / vdbe: clean;
+    - vdbe lib: 1,256 / 0;
+    - goldens: 8 / 8.
+- Retry condition: none for the preflight. What is left on the row is Column b (record parse 91,
+  the text value 71, set_reg 85 per row) and the scan.
+
+## 2026-11-17 - FIX (landed as 08f77992c; measured like a lever): a GROUP BY key whose group mixes 3 and 3.0 prints the row stock's bare columns come from (bd-36aed v2)
+
+- Target: bd-36aed, a correctness bug. The VDBE sorted GROUP BY copied each row's keys into the
+  previous-key registers, so a group holding 3 and 3.0 (or -0.0 and 0) printed its last row's
+  spelling; stock prints the first row's, or the row the last builtin min()/max() picks.
+- Touched: `crates/fsqlite-vdbe/src/codegen.rs` only (codegen_select_group_by_aggregate pass 2: the
+  key copy at a group's first row; for a key whose spellings can differ beside a builtin,
+  non-DISTINCT min()/max(), OP_CollSeq tracking with the FILTER magnet in bytecode). Keeper
+  `mixed_integer_real_group_by_key_spelling_matches_stock_on_a_strict_file_database`. Goldens
+  select_grouped_aggregate, aggregate_group_by_filtered and aggregate_group_by_joined
+  hand-updated (GOLDEN-CHANGE: the same-group Goto lands one instruction later, after the
+  first-row Copy; round 5 had updated the first two without the disassembler's trailing pad and
+  missed the third, which the family test reaches only after the second passes).
+- v1 (engine half included) was REJECTED on 2026-11-16 (entry below). v2 is the codegen half.
+- Prediction (bd-36aed, 2026-11-16 04:25Z): the four repeating-group rows -90 to -130M Ir; GROUP BY
+  id within 0.3%; non-GROUP BY rows within 0.1%.
+- Result (base 05fe3c5b1 sha256 18bd46e290c9ce36, v2 e3b16dd912606561; two runs, 10 pairs):
+  GROUP BY a -123.5M (-5.0%, cycles 0.962; group_by_1000_groups CPU x0.96 -> x0.91 stock), a with
+  sum(c) -122.0M (0.975), a % 10 -122.1M (0.959), id % 100000 -109.9M (0.974); GROUP BY id and
+  every non-GROUP BY row identical in Ir. Inside the prediction.
+- Not covered, documented in the keeper and not asserted: a DISTINCT min()/max() beside the key,
+  and a max() beside the key in shapes strict mode refuses (HAVING on max(n), an expression of the
+  key, ORDER BY max(n)), which run on the connection's grouped evaluator and print a tied or later
+  extremum row's spelling with or without this fix. Round 5's keeper had asserted the latter; the
+  first gate pass showed they fail on base too.
+- Gate: both changes gated together (rch):
+  - First pass on 05fe3c5b1. Reds: the lane brief's known ones; the pre-existing
+    without_rowid_secondary_suffix_order_matches_stock; four test-file reds of this round, all
+    fixed (three GROUP BY goldens, TN1's keeper, bd-36aed's strict-off list).
+  - On the fixed tree:
+    - clippy -D warnings types / vdbe / core, all targets: clean;
+    - fsqlite crate suite: 126 binaries, 1,098 passed, 0 failed;
+    - 18 fsqlite-e2e oracle targets: 117 passed, 2 failed, both outer_join_oracle_e2e reds
+      fixed on main by 49cadfad1;
+    - goldens: 8 / 8.
+  - After the rebase onto 0dd0e7102:
+    - clippy vdbe / core, all targets: clean;
+    - vdbe and core lib, goldens, both keepers, create_index_sorted_bulk_build_oracle,
+      bd_r39kx_eqp_access_path_wording_oracle: 5,465 passed, 3 failed (the known count(*)
+      IN-list test and the t6741 pair);
+    - outer_join_oracle_e2e: 13 / 13.
+  - After the rebase onto 5ee2326ea, whose codegen.rs change is in its tests:
+    - clippy types / vdbe: clean;
+    - vdbe lib: 1,256 / 0;
+    - goldens: 8 / 8.
+- Retry condition: the DISTINCT min()/max() case left open in v1's entry; the grouped evaluator's
+  extremum-row spelling (needs its own bead).
+
+## 2026-11-16 - REJECTED on its kill line (a correctness fix's engine half): DISTINCT min()/max() key tracking in execute_agg_step cost rows that run none of it 0.35-0.51% instructions (bd-36aed v1)
+
+- Target: bd-36aed, a correctness bug in the VDBE sorted GROUP BY. A group mixing INTEGER and REAL
+  spellings of one key (3 and 3.0, -0.0 and 0) printed its last row's spelling. Stock prints the
+  row its bare columns come from: the first, or the row the last min()/max() picks. Touched (v1,
+  not landed): crates/fsqlite-vdbe/src/codegen.rs (codegen_select_group_by_aggregate pass 2) and
+  crates/fsqlite-vdbe/src/engine.rs (the CollSeq arm; execute_agg_step's tail; agg_step_with_args
+  returning whether it stepped; a NULL counted as a DISTINCT value for a tracked min/max).
+- Pre-registered on bd-36aed (2026-11-16, before the build): the repeating-group rows -15 to -40M
+  Ir (one Copy fewer per row continuing a group). KILL: any read row up more than 0.3% Ir, any
+  GROUP BY row up more than 2% cycles.
+- Result (thinkstation1, powersave, io_uring refused, serial, stock 3.46.1 live; W5 ceb111983534bd37
+  vs W5 + v1 86cf4f783645d109; answers equal): GROUP BY a -117M Ir (-4.8%, cycles -6.5%),
+  GROUP BY a with sum(c) -117M (-3.0%), a % 10 -118M (-4.6%), id % 100000 -104M (-3.6%), beyond the
+  predicted range. GROUP BY id (every row starts a group, so the same opcodes run) +27.1M (+0.51%).
+  scan_filter_agg (no GROUP BY) +4.5M (+0.35%). Both cross the 0.3% line. Those rows run none of
+  the new bytecode. The change that reaches them is the engine half: execute_agg_step and
+  agg_step_with_args, which the AggStep lane calls on every aggregate row, changed shape.
+- Correctness of v1: on the 20-row CLI probe, all 50 output lines where main differed from stock
+  matched stock 3.46.1 (avg's digit rendering aside).
+- Verdict: v1 REJECTED on its kill line. v2 keeps the codegen half alone (first-row copy; CollSeq
+  tracking for a builtin, non-DISTINCT min()/max(), with the FILTER magnet done in bytecode) and
+  leaves a DISTINCT min()/max() beside a mixed-spelling key on the first row. That remaining
+  divergence is documented in the keeper: `max(DISTINCT n)` over (5.0, 1), (5, 2) gives stock 5,
+  fsqlite 5.0.
+- Retry condition: SQLite's DISTINCT inherit rule (a repeated value jumps over OP_CollSeq and the
+  step, keeping the register) needs the DISTINCT test outside the AggStep (an OP_Found on an
+  ephemeral index before the CollSeq, as stock emits it). Retry it as a codegen change of that
+  shape, never inside execute_agg_step, and set its other-rows line from an A/A of the engine
+  change.
+
+## 2026-11-16 - WIN (small, maintenance-sized): a WAL-FEC repair job reads the -wal through one descriptor and keeps the sidecar's append descriptor between commits, -9.8 syscalls and ~-11 us kernel time per one-row FULL commit (bd-w4pr1.7, round 4, lever 4b)
+
+- Target: every commit at synchronous=FULL (or EXTRA) on a connection with a caller-owned runtime
+  (the CLI, async callers; `fsqlite::blocking` runs no WAL-FEC at all, see the H entry of this
+  round). Each commit's FEC job made 22 file system calls on a blocking-pool thread: the -wal opened
+  and closed four times (three generation checks, the frame read with an lseek), the sidecar opened
+  and closed for its append, two statx of the sidecar. Touched: `crates/fsqlite-wal/src/wal_fec.rs`
+  (`WalFecSourceWal`; `CommittedRangeSidecarCache::output`; `CommittedRangeSidecar::{appended,
+  loaded}`).
+- Ledger preflight: bd-sid3o (the group map this extends), bd-wqmil (periodic sidecar sync), GH#453
+  (the guard unlocks explicitly), round 3's lever 4a entry, which named this as next. Nothing
+  earlier on the worker's descriptors.
+- Per-call cost on this host (tmpfs, `p6r4/syscost/fec_syscost.c`): open+read32+close 4.08 us,
+  open+close 3.26, lseek+read 4 KiB 1.50, open(append)+close 3.18, statx(path) 1.83, fstat 0.77,
+  pread 32 B 0.79.
+- Change: one -wal descriptor per job, opened by path for the pre-guard check; the post-guard and
+  pre-append checks require statx of the path to name the descriptor's (device, inode) and re-read
+  the header through it (a missing path or another inode is a mismatch, as a reopen by path would
+  find); frames read positionally through it. The sidecar's append descriptor stays in the worker's
+  cache and is reused only after `extend_cached`'s statx under the guard shows the same inode; a
+  full load keeps it only if its fstat names the path's file. A cached range records its length as
+  the length read at load plus its appends. Every check, write and sync is unchanged; the lock file
+  is still opened per job.
+- Result (A = main 404d5a6b3, CLI d8bf2ee3f32b0599; B = A + this, CLI fafbe29d27fdbdff; scratch ext4
+  NVMe, distro sqlite3 3.46.1 live, 6 rotated reps):
+  - strace per FULL transaction: 52.22 -> 42.39 (openat 5.90 -> 2.01, close 5.90 -> 2.01, lseek 0.98
+    -> 0, statx 13.03 -> 15.04, futex 2.04 -> 1.48); stock 9.05. NORMAL 25.76 -> 25.03.
+  - CLI disk FULL per txn: CPU 514.4 -> 453.6 us (task-clock mean; paired -0.2 to -198.8, sync
+    noise), kernel instructions -43.1k and kernel cycles -46.4k with all six pairs between -41.6k
+    and -49.7k (~-11 us), wall 3,809 -> 3,850 us (+1.1%, inside the sync noise). Stock 86.4 us CPU,
+    3,354 us wall: CPU ratio 5.95x -> 5.25x.
+  - CLI disk NORMAL CPU 140.0 -> 135.6 (stock 18.0).
+  - mt-mvcc-bench disk FULL 1w 150 x 5 (old harness, 3 interleaved reps): F wps B/A 0.982 (predicted
+    +-3%), F/C 0.950 -> 0.921, F process CPU 787.9 -> 769.6 us per commit.
+  - Two more FULL batches, not used for the verdict: CPU -43.1 and -8.9 us, kernel cycles -47.3k and
+    -52.7k (every pair negative), wall +4.7% and +20% (the latter carried by reps where stock also
+    ran up to 2x slower: another lane on the same volume). In quiet reps B's 3,000-commit run was
+    0.1-1.0 s slower in 15 of 17 pairs; three direct A/B pairs of the same script without the probe:
+    mean -0.03 s. strace shows the same sync calls (2,096 vs 2,094 per 2,000 commits) and only the
+    intended open/close cuts. No mechanism found; a +1-3% FULL wall effect from the worker's changed
+    timing against the WAL's journal commits is not excluded.
+  - Prediction (FULL CPU -8 to -18 us, syscalls 22 -> 15 per job, bench within +-3%, NORMAL within
+    +-3%): met. Kill lines: cleared.
+  - bd-73pfl stress (`mw_conflict.py explicit-same 8 300 10 5000`, disk) on B and on main: stock
+    integrity_check ok 10/10 for both; every lost row is a refused commit (error lines = rows lost:
+    4,595 and 3,958).
+- Gate: on 404d5a6b3 + this: clippy -D warnings on fsqlite-wal all targets, default and
+  fault-injection, clean; fsqlite-wal lib 1,182/0; every fsqlite-wal integration target with
+  --features fault-injection green (wal_reopen 10/10); its lib under fault-injection had the
+  bd-alz8f metrics-lock cascade (24 reds from one counter race), fixed upstream by 05fe3c5b1; core
+  keepers green (bulk_import_upsert 13, gh385, gh534 2, bd_ih8ak flush floor, bd_qyekq crash images,
+  wal_fec_commit_pipeline 18); e2e concurrent-writer/SSI/checkpoint/group-commit batches green; libs
+  mvcc 1,685/0, vfs 531/0, pager 1,114 + bd_2jpu6_2 (known), core 4,193 + the t6741 pair (known) +
+  commit_repair's runtime-requeue timing test (passes alone on main and here);
+  multiprocess_autocommit_busy_timeout 7/1 (the durable-floor test, which fails the same way on
+  clean main 05fe3c5b1, bd-w4pr1.7 2026-11-17). Re-gate on the landing base 05fe3c5b1 + this: clippy
+  (fault-injection) clean, fsqlite-wal --features fault-injection --tests all green (lib 1,183/0),
+  wal lib 1,183/0, multiprocess 8/8 twice, commit_repair 6/6, wal_fec_commit_pipeline 18/18.
+- Tests: `test_committed_ranges_keep_one_sidecar_append_descriptor` (one append descriptor over
+  twelve ranges; a rename-replaced sidecar gets a new descriptor and the replaced inode no record;
+  the cached length equals the file's) and `test_wal_fec_source_wal_checks_follow_the_path` (a
+  byte-identical WAL renamed over the path fails the check through the kept descriptor, which a
+  header-only re-read would pass; an in-place header rewrite and a removed path fail too).
+- Retry condition / next: re-measure FULL wall on a quiet disk or tmpfs before building more on the
+  worker's timing. Then the lock file's descriptor (open(create)+flock+unlock+close 4.82 us against
+  1.37 us kept; needs a path identity check, ~1.6 us net). Larger, for the CLI: the worker's async
+  loop runs on the connection's own runtime, so each FULL commit also costs the committing thread
+  ~20-47 us in asupersync's scheduler, clock reads and FEC submission (perf: CLI tmpfs FULL vs
+  NORMAL +20 us; disk FULL with FEC vs `raptorq_repair_symbols=0`, one pair of 2,000-commit runs,
+  +47 us); moving the per-job orchestration off the connection's executor is the next FEC lever.
+
+## 2026-11-16 - NOT LANDED (mechanism measured, new A/A null passes, no verdict moves; held on a configuration difference: H's FrankenSQLite arm runs without WAL-FEC): mt-mvcc-bench's FrankenSQLite arm through fsqlite::blocking (bd-w4pr1.7, harness change H, round 4)
+
+- Target: the coordinator's two conditions for H (bd-w4pr1.7, 2026-11-16 18:25Z): the F-side
+  mechanism measured, and an A/A null that resolves +-3% with batch drift, plus the integrity table.
+  Touched (not landed): `crates/fsqlite-e2e/src/bin/mt_mvcc_bench.rs`, round 3's patch unchanged
+  (`p6r3_H3_bench.patch`, sha256 prefix fd3b1c721210b3e4; clone perf6 stash "p6r3: harness H ...").
+- Mechanism (mtbench-r4h = main 404d5a6b3 + H, 1w tmpfs NORMAL 2,000 x 11, 6 reps per mode): F
+  x1.499 [1.482, 1.517] is the writer's own CPU, 146.9 -> 96.8 us per transaction, not off-CPU time
+  (2.5 vs 0.1 us) or wakeups. 5.9 us is the stage profiler and its two engine diagnostics; 44.2 us
+  is the per-transaction `fsqlite_e2e::block_on` (callgrind +64.5k instructions: asupersync
+  scheduler +25.5k, root-future memcpy +23.9k, Cx budget clock reads ~6k, engine crates +1.6k; +4.6
+  syscalls: sched_yield 2.0, futex_wake 1.2, eventfd 1.4). io_uring refused: F 0.999 [0.988, 1.011].
+  The old harness's extra threads (1w peak 7: two runtimes' `asupersync-worker-0`, their blocking
+  pools, one `iou-wrk`; 64w peak 219) are the harness's runtimes; FrankenSQLite creates none.
+  `fsqlite-c-api` has the same driver (thread-local current-thread runtime, `block_on` per C call):
+  a product cost for C-ABI users, handed to its owner.
+- A/A (pre-registered, then amended before any batch ran to 8 batches on disk): r = stock arm
+  C_new/C_old, 8 x 6 interleaved pairs, disk NORMAL 1w, batch random effect, TOST +-3%: mu 1.0039,
+  90% CI [0.9906, 1.0174], PASS. The old single-batch rule fails 1 of these 8 batches. Re-scored:
+  rounds 2-3's five in-process batches FAIL together under the new rule ([0.978, 1.044]); old rule 2
+  pass / 3 fail; moves pass -> FAIL for hab2 and h2ab, none FAIL -> pass.
+- Integrity table (13 rows: disk NORMAL 1/8/32/64w separate and shared and disk FULL 1w, 3 reps;
+  tmpfs NORMAL 1/8/32/64w separate and 8w shared, 1 rep): 0 verdict moves, every row LOSE under both
+  harnesses; F/C rises everywhere (disk NORMAL 1w 0.265 -> 0.399, 8w sep 0.452 -> 0.645, 64w sep
+  0.421 -> 0.473, disk FULL 1w 0.947 -> 0.994).
+- Why held: `fsqlite::blocking` runs no WAL-FEC (`ensure_wal_fec_pipeline` needs a caller-owned
+  runtime; the blocking API has none). The F arm writes no `-wal-fec` under H and 1-6 MB of it under
+  the old harness. At disk FULL 1w F gains 6.5% where the runtime entry is ~0.5% of the commit.
+  Landing H would make every FULL F number FEC-free without a decision.
+- Retry condition: the owner's FEC decision for the blocking API. If the blocking API gets a repair
+  worker, H lands as is; if not, H lands with `wal_fec` named in the bench's configuration receipt
+  and FULL rows quoted with it. The null and the NORMAL rows above need not be rerun. Until then
+  every mt-mvcc-bench number stays at the old harness.
+
+## 2026-11-16 - WIN (landed; re-measured on main f818d8531, A/A arm in the run): a WAL frame-cache hit hands the transaction the cached image instead of two copies (bd-05xlf, read/seek round 6, lever P1 v6)
+
+- What: the round-5 entry below ("MEASURED WIN, NOT LANDED"), unchanged code. Its diff applied
+  at offsets only: first to origin/main bf8b3377b, then to f818d8531. Both arms were rebuilt on
+  each of those trees and the A/B repeated, with an A/A arm. It then rebased onto 404d5a6b3 to
+  land (see the landing rerun below). Touched files and keepers are as listed in that entry.
+- Method change from round 5 (see its measurement trap):
+  - one database per row family, built by a main binary;
+  - copied per arm with its WAL, shm, WAL certificate and migration state. A bare `cp` reruns the
+    migration pass on its first open and then takes the uncertified-WAL open path: 7.05M, then
+    4.17M open instructions, against 4.52M for a full copy;
+  - an A/A arm (the main binaries again, on their own copies) in the same invocation.
+- Result on f818d8531. thinkstation1, governor powersave, load 3.3 to 4.1, io_uring refused,
+  9 sweep reps and 7 lookup reps interleaved.
+  - main f818d8531: CLI ca0d03729bdb2317, probe 3a708fc9c55faf51.
+  - v6: CLI 5556e8ca264f7851, probe 83e7629d31634acc.
+  - Stock live: sqlite3 3.46.1 for the sweep; the 3.54.1 amalgamation driver (9500dcc51bdca47c)
+    for the prepared loop.
+  - Answers equal stock's.
+
+  | row | stock | main | A/A | v6 |
+  |---|---|---|---|---|
+  | prepared select-index (WAL), instructions per execution | 5,058 | 76,582 (15.1x) | 76,674 | 68,591 (13.6x) |
+  | same, CPU per execution | 4.13 us | 26.49 us (6.4x) | 26.47 us | 24.70 us (6.0x) |
+  | select-index, checkpointed (control) | 5,058 | 74,116 | 74,145 | 74,184 |
+  | select-rowid (control) | 4,725 | 8,139 | 8,139 | 8,129 |
+  | autocommit INSERT (write control) | - | 141,328 | 141,506 | 141,200 |
+  | point_rowid_2000 | 44.0M | 179.4M (4.08x) | 179.4M | 176.6M (4.01x) |
+  | point_hot_2000 | 42.8M | 168.5M | 168.2M | 165.6M |
+  | point_sec_key_2000 | 67.4M | 268.2M | 268.0M | 265.2M |
+  | rowid_lookups_200k | 554.4M | 2,684.9M | 2,684.9M | 2,689.1M (+0.16%) |
+  | range_noncovering_200k | 637.6M | 3,340.4M | 3,340.4M | 3,344.6M (+0.13%) |
+
+  On bf8b3377b (main CLI fb54c6904e89a5c1, v6 dc073c477fe09422), the same method gave:
+  select-index 76,585 -> 68,060; miss rows +0.16% / +0.12%; point_rowid_2000 -1.5%.
+- Prediction (bd-05xlf, round 6, before the candidate was built):
+  - select-index -7.5k to -10.0k (-8.0k: inside), CPU -1.5 to -3.5 us (-1.8 us: inside);
+  - checkpointed within 0.5k, select-rowid within 0.15k, INSERT within 1.0%: all inside;
+  - point_rowid_2000 -1.5% to -4.5% (-1.6%: inside); point_hot_2000 -6% to +0.3% (-1.7%: inside);
+  - miss rows +0.10% to +0.20%: inside.
+  - Kill lines, unchanged from round 5 (miss rows worse than 0.2%, select-index under -5.0k,
+    controls, the A/A arm outside a band): none crossed. The A/A arm sat within 0.18% everywhere.
+- Gate (rch) on f818d8531 + this change:
+  - clippy -D warnings on fsqlite-pager and fsqlite-core, all targets: clean;
+  - fsqlite-pager --lib: 1,113 passed, 1 failed (bd_2jpu6_2, bd-mcpbv);
+  - fsqlite-core --lib with the join/seek, seek-key, savepoint/trigger/peer/staleness and
+    prepared-statement keepers and the cross-process battery (48 targets): 4,584 passed, 5 failed.
+    Four are main reds (test_retained_autocommit_flush_propagates_nontransient_post_commit_
+    checkpoint_failure, the t6741 pair, bd_8c68u). The fifth, gh534
+    `sigkill_during_a_commit_loop_never_blocks_the_next_commit` (trial 1 read 2 rows where stock
+    read 3), passed in two reruns on the same tree, once on f818d8531 without the change, and
+    again on the landing tree;
+  - fsqlite-e2e: stock_headerless_wal_e2e, split_claim, refused_commit, gh364 and the
+    concurrent-writer set, 13 targets: 95 passed. multiprocess_autocommit_busy_timeout_e2e
+    --test-threads=1: 8 passed;
+  - the whole fsqlite crate, 124 targets: 1,098 passed.
+- Landing rerun. The rebase onto 404d5a6b3 brought other lanes' hunks into pager.rs, traits.rs,
+  wal_adapter.rs and connection.rs. On that exact tree:
+  - clippy: clean;
+  - pager --lib: 1,114 passed, 1 failed (bd_2jpu6_2);
+  - core --lib with P1's keeper, bd_7zs8a_stock_wal_lifetime_probe, the cross-process battery and
+    the prepared-statement staleness keepers (11 targets): 4,449 passed, 2 failed (the t6741
+    pair).
+- Landed in d93eda4b7, on b3abcb66a (a ledger-only commit after 404d5a6b3).
+- Retry / next: unchanged from round 5.
+  - (1) Keep the no-frame answer inlinable, to take back the miss rows' 15 Ir a lookup.
+  - (2) The main page cache's hit still copies twice (checkpointed lookup 74.2k). Sharing it
+    needs a probe that answers a miss without a PageData-sized value.
+
+## 2026-11-15 - REJECTED on its keeper kill line (measured gain kept: multicol_eq_1000 6.60x -> 4.92x stock): a literal SELECT of aggregates or columns over ANDed integer keys runs parameterized, with one-key shapes allocation-free (bd-w4pr1.13.18, read/seek round 6, lever L5 v2)
+
+- Target: multicol_eq_1000 of the read sweep (`SELECT count(*), sum(val) FROM s WHERE g = <int>
+  AND h = <int>`, 1,000 distinct literal pairs, each its own autocommit statement). This is the
+  retry of the L5 rejection below.
+- Touched (never committed; clone perf5-shm stash "rs6 L5 v2 ...", coordinator scratchpad
+  `rs6/l5v2_on_bf8b3377b_p1v6.patch` and `rs6/l5v2/`):
+  - `crates/fsqlite-core/src/connection/literal_params.rs`: v1's recognizer with
+    `key_columns: SmallVec<[String; 1]>` and a `SmallVec<[&str; 2]>` scan list in place of v1's
+    two Vecs;
+  - `crates/fsqlite-core/src/connection.rs`: `literal_statement_may_run_parameterized` over every
+    key;
+  - the keeper in `crates/fsqlite-core/tests/bd_5310l_literal_parameterization_oracle.rs`: v1's,
+    plus one-key aggregates over every affinity column and a one-key engagement count.
+- Ledger preflight: L5 (below) and its retry condition, followed here: one-key shapes
+  allocation-free, an A/A of the method before setting bands, per-arm copies of one file. Also L2's
+  entry and bd-5310l's.
+- A/A of the method: the main bf8b3377b CLI on two copies of one file, 9 reps, run twice.
+  point_hot_2000 -0.24% / 0.00%, point_sec_key_2000 -0.19% / -0.19%, point_rowid_2000 +0.06% /
+  0.00%, insert_literal_400 +0.27% / -0.14% (min). Bands set from it before the build: point_hot
+  0.5%, point_sec_key 0.4%, point_rowid 0.3%, rowid_lookups 0.2%, insert 0.6%.
+- Measurement trap found while sizing it: a bare `cp` of an fsqlite database without its
+  `-wal-cert`, `-wal-cert-head` and `.fsqlite-migration-state` sidecars takes another open path.
+  The first open reruns the migration pass and later opens take the uncertified-WAL path: 7.05M,
+  then 4.17M open instructions, against 4.52M for the original. Round 5's per-arm copies were bare
+  copies. Copy every sidecar except the `-fsqlite-ns-*` lock files.
+- Result. thinkstation1, governor powersave, load about 5, io_uring refused, stock sqlite3 3.46.1
+  live, 9 reps, answers equal on every sweep row. Base = bf8b3377b + P1 v6 (CLI
+  dc073c477fe09422); L5 v2 = that + this change (CLI be71f5d58122b0c3); the A/A arm is the base
+  CLI on its own copy.
+
+  | row | stock | base | A/A | L5 v2 (min / median) |
+  |---|---|---|---|---|
+  | multicol_eq_1000, instructions | 60.1M | 397.2M (6.60x) | 396.9M | 295.8M (4.92x), -101.4k a statement |
+  | multicol_eq_1000, CPU | 29.5 ms | 135.8 ms | 144.0 ms | 102.0 ms |
+  | point_rowid_2000 | 44.0M | 176.6M | 176.6M | 177.0M (+0.23% / +0.17%) |
+  | point_hot_2000 | 42.8M | 166.1M | 165.5M | 165.9M (-0.12% / -0.12%) |
+  | point_sec_key_2000 | 67.4M | 265.0M | 265.1M | 265.4M (+0.15% / +0.30%) |
+  | orderby_page_500x20 / rowid_lookups_200k | 60.7M / 554.4M | 291.6M / 2,689.1M | same | 291.6M / 2,689.0M |
+  | insert_literal_400 | 9.1M | 72.9M | 72.8M | 73.1M (+0.27% / -0.13%) |
+
+- Prediction (bd-w4pr1.13.18, round 6, before the build):
+  - multicol_eq_1000 -85k to -105k a statement (-101.4k: inside); CPU -25 to -40 ms (-33.8 ms:
+    inside).
+  - One-key controls +0.00% to +0.10%: MISSED on point_rowid_2000 (+0.23%) and
+    point_sec_key_2000 (+0.15%), inside their bands. Callgrind of point_rowid statements 100-300 on
+    both CLIs: `parameterize_literal_statement` 2,217 -> 2,337 Ir and
+    `literal_statement_may_run_parameterized` 858 -> 876. That is about 140 Ir a one-key statement
+    (the SmallVec collect, the result-column and AND peeks), against 30-80 predicted.
+  - Kill lines: every measurement line held. The keeper line, "a keeper failing that is not a
+    known main red", was CROSSED. REJECTED.
+- Why it is rejected. Gate on 983eff8c6 + P1 v6 + L5 v2: fsqlite-core --lib with the T1/T2/T3/PS/XP
+  keepers, 4,583 passed and 6 failed (the t6741 pair, bd_8c68u and gh528 are known reds).
+  - `bd_d4rbi_bare_column_aggregate_seeks::bare_column_aggregates_match_stock` showed 14
+    divergences, every one an aggregate beside a bare column over `a = 5 AND n = 2`.
+    `SELECT id, b, c, count(*) FROM t WHERE a = 5 AND n = 2` answers stock's 357|0|v14|7 on the
+    base CLI and on the `main.t` text path, and 27|2|v20|7 on the L5 CLI. With the keys bound,
+    fsqlite visits the rows in rowid order instead of from the t_ab seek. L2's premise, "without a
+    partial index the plan is the same for every integer", is false for this shape.
+  - Checked and not a problem: codegen's bd-2dgf5 comment says an aggregate's rowid-equality
+    seek takes only an INTEGER literal and that a bound key falls back to the scan. Yet 20
+    `SELECT count(*), sum(a) FROM t WHERE id = N` on the 1M-row t cost 8.1M instructions on the
+    L5 CLI against 9.4M on the base CLI, with answers equal to stock's. The bound form does not
+    scan, so that comment no longer describes the code.
+  - The new keeper's partial-index check failed on a main divergence, not on L5:
+    `SELECT count(*), sum(val) FROM pk3 WHERE g = 1 AND h = 0` with
+    `CREATE INDEX pk3_gh ON pk3(g, h) WHERE h > 10` answers 0|NULL on the main CLIs of bf8b3377b
+    and f818d8531 (text path, in memory and in a file; EQP SEARCH pk3 USING INDEX pk3_gh), against
+    stock's 4|-4.0. A partial index is used whose WHERE the query does not imply. Repro:
+    coordinator scratchpad `rs6/div/pk3.sql`.
+- Retry condition (v3, its own prediction):
+  - (a) admit only shapes whose bound form compiles to the same program as the literal form,
+    shown by an EXPLAIN bytecode comparison per admitted shape in the keeper. Otherwise keep the
+    shapes that differ on the text path until codegen takes bound keys as it takes literals:
+    bare columns beside aggregates, and possibly order-sensitive aggregates (sum or avg of REAL).
+  - (b) the partial-index engagement check uses a partial index the WHERE cannot select.
+  - (c) the ~140 Ir a one-key statement is taken back.
+  - The prize is unchanged: multicol_eq_1000 -101k a statement, 6.6x -> 4.9x stock.
+
+## 2026-11-16 - REJECTED on the bulk instruction kill line (four versions; a correctness fix, measured like a lever; not landed): the shared rowid allocator learns which sessions hold a claim on a table from the post-insert floor bump (bd-hi7qg v1-v4)
+
+- Target: the cost of bd-hi7qg's fix (an implicit rowid after a deleted maximum is `max(rowid)+1` again, as in stock,
+  when no live session holds a claim on the table and no write commit became visible since BEGIN). The fix needs every
+  live session that inserted into a table recorded as a claimant. v1 and v2 recorded it on every row's post-insert bump
+  (`ConcurrentRowIdAllocator::note_inserted_row`, called from `bump_concurrent_storage_rowid_floor`), and
+  `bulk_insert_1M_one_txn` takes that bump once per row (explicit rowids, `id = value`). Touched:
+  `crates/fsqlite-mvcc/src/rowid_alloc.rs`, `crates/fsqlite-vdbe/src/engine.rs`, `crates/fsqlite-core/src/connection.rs`.
+- Kill line (round 6, before code): bulk instructions up more than 10M, or task-clock min up more than 15 ms.
+- v1 (round 6's patch): the per-row path was restructured into a non-inlined `floor_state` that took a 64-byte
+  `TableAllocatorState` (with a `claimants: Vec<u64>`) by value, through the entry API, and still built the state with
+  its init-log callsite on every row.
+  - Result: base e996d32b9 (sha256 e0449205a40196ee) against v1 (f7a9bd1234ff6566); stock sqlite3 3.46.1 live; 5 reps
+    on bulk, 9 on the mutation rows; scratchpad `r7/ab_hi7qg.txt` of the bulk-write lane.
+  - Bulk 7,030.2M -> 7,077.6M user instructions (+47.4M); task-clock min 852.0 -> 876.0 ms (+24.0). Both lines crossed.
+  - Callgrind of the 200k-row bulk statement: the bump was 100 instructions a row on base (`ensure_table_floor`) and
+    137 on v1. The claim itself was about 5 of those 37; the rest was the restructure.
+- v2: the per-row path back on base's shape (a scalar `TableAllocatorState::tip`, a `get_mut` hit that raises in
+  place, a state built only for a new table); the claim still recorded on every row.
+  - Result: v2 sha256 184f38c7286b0896; scratchpad `r7/ab_hi7qg_v2.txt`.
+  - Bulk 7,034.7M -> 7,052.6M (+17.9M), task-clock min +12.6 ms. The instruction line is crossed.
+  - Callgrind: `note_inserted_row` 22.4M against base's 20.0M per 200k rows (about 12 a row), plus about 3 in the
+    engine call.
+- v3: the claim recorded once per cursor and session (a `(session, schema epoch)` marker on the storage cursor); every
+  later row called `ensure_table_floor`, which then delegated to v2's out-of-line `raise_floor(tables, key, max,
+  seq, mode, claimant)` helper.
+  - Result: v3 sha256 e1920f90e70142fd; scratchpad `r7/ab_hi7qg_v3.txt`.
+  - Bulk 7,032.1M -> 7,065.8M (+33.7M), task-clock min +15.6 ms. Both lines crossed.
+  - Callgrind: +20 a row in the statement. The marker compare is about 5; the out-of-line six-argument helper is about
+    17 above base's single inlined body.
+- v4: v3's per-cursor marker; `ensure_table_floor` and `note_inserted_row` each one body in base's shape (a scalar
+  tip, one `get_mut` hit, a state built only for an unknown table).
+  - Result: v4 sha256 3ea8c68c8bd1c0d5; scratchpad `r7/ab_hi7qg_v4.txt`.
+  - Bulk min 7,031.9M -> 7,055.3M (+23.4M; medians +10.7M); task-clock min 867.4 -> 841.6 ms (medians 896.3 ->
+    868.2). The instruction line is crossed; the time line is not.
+  - Scale check, interleaved, scratchpad `r7_scale.py`: +4.6M at 200k rows, +22.8M at 1M. So it is about 23 a row,
+    per-row work. Statement callgrind (200k): +10.5 a row. The engine's bump closure is about 13 of it (the marker
+    compare and the session / epoch plumbing in the async closure), `ensure_table_floor` 3.
+  - The other about 12 a row scales with rows but is outside the toggled main-thread program. Not attributed.
+  - The CPU instrument does not see a cost: v4 task-clock is lower in the A/B. In the scale check the min is +20 ms and
+    the median -20 ms (noise).
+- Delete, update and memory_script were flat in all four (within 1.2M instructions). Answers equal stock's, and stock
+  integrity_check was ok on every file.
+- The fix is correct and kept for the next version, not landed:
+  - v4 code: scratchpad `r7/hi7qg_r7_v4_code.diff` of the bulk-write lane;
+  - its keeper: `bd_hi7qg_rowid_after_deleted_max_oracle` (stock-compared on four lanes; red on main on the
+    allocator lane, 4 against stock's 3);
+  - green: the keeper and bd_nn29x 19/19 (`review_omitted_rowid_alias_ignores_defaults` included);
+  - a mutation run of fsqlite-mvcc's lib (generation check disabled, old rewind rule restored) fails exactly the two
+    new allocator unit tests (1,682 pass).
+- Retry condition: none for a per-row claim, and none for routing the per-row bump through a helper. A next version
+  must:
+  - record the claim once per INSERT statement and table, at a point outside the per-row bump (for example where an
+    INSERT program opens its table cursor), leaving the per-row bump exactly base's `ensure_table_floor` call. Not at
+    every write-cursor open: a DELETE's or UPDATE's cursor would then claim, and the in-transaction "delete the max,
+    then insert" case the keeper pins would lose its lowering;
+  - first attribute v4's about 12 instructions a row outside the statement's main thread (a frame-pointer CLI, perf
+    record -e instructions:u per thread), which has to be gone too before the 10M line can be met.
+  Any later change that adds work to the per-row post-insert bump is measured on `bulk_insert_1M_one_txn`, where
+  even 12 instructions a row is 12M.
+
+## 2026-11-16 - WIN (small): the publication epoch notifies its condvar only while a validator waits on it, one FUTEX_WAKE fewer per concurrent commit (bd-w4pr1.7, round 3 item 5a)
+
+- Target: every concurrent commit. Its publication lease's drop moved a process-wide epoch and
+  called `Condvar::notify_all`, and std's futex condvar makes a FUTEX_WAKE system call on every
+  notify, waiter or not. At one writer nobody ever waits. Touched:
+  `crates/fsqlite-mvcc/src/begin_concurrent.rs` (`PublicationEpochCell`: the epoch and a count of
+  registered waiters under one mutex; `advance` notifies only when the count is non-zero).
+- Ledger preflight: "Lock, wakeup and counter micro-levers on the commit path" (INDEX; 2026-05-06,
+  2026-05-12, 2026-08-17 bd-8euyp) were rejected on measured time. This one is judged on the
+  system call it removes, with time as a secondary reading; the publication epoch itself
+  (bd-i0tn6) is newer than those entries.
+- Why no wakeup is lost: a waiter registers under the mutex before `wait_timeout_while` releases
+  it, and unregisters after the wait returns, timeout included; the epoch moves under the same
+  mutex, so a withdrawal either sees the waiter registered and notifies it, or comes before the
+  waiter locked and is seen by the wait's predicate. `publication_epoch()`, the capture-before-test
+  rule and the process-wide scope are unchanged.
+- Result. A = the tree with item 2, bd-i0tn6 lever 4 v2 and lever 4a (mtbench-fec sha256
+  17531a9c69ab2262); B = A + this (mtbench-fut 75f1679ddafbb2c0). Old harness; stock live.
+  - strace -ff -k, 300 one-row transactions, wakes attributed by resolved stack: the 1.000 per
+    transaction under `Connection::execute_commit_with_attached_participants` (the lease drop) is
+    0 in B; every other wake site is unchanged (2.01 per transaction from spawn_blocking for the
+    io_uring driver, 1.00 from the old harness's worker loan). Whole F writer thread, 2,000
+    transactions: futex 2.755 -> 1.270 per transaction (wakes 2.683 -> 1.223). Predicted 1.0 ->
+    about 0 for the epoch notify: met. (The kill line's "futex per 1w transaction below 0.1" means
+    that notify; under the old harness the writer has other futex users, as the prediction said.)
+  - 1w CPU, 12 interleaved pairs of 2,000 x 11, disk NORMAL: F writer 157.37 -> 156.26 us per
+    transaction, pooled B/A 0.9930 [0.9881, 0.9994]; predicted -0.5 to -1.0 us, measured -1.1, just
+    beyond. F wps B/A 1.009 [1.002, 1.016]; F/C 0.269 -> 0.274.
+  - Separate tables, 500 x 5, 4 interleaved reps, disk NORMAL: 8w 1.036 [0.978, 1.090], 32w 1.020
+    [0.997, 1.046], 64w 0.993 [0.954, 1.032]; predicted ±3%, 8w just above; kill line (any row
+    below -5%) not hit. F/C 0.464 -> 0.466, 0.659 -> 0.656, 0.411 -> 0.443.
+  - bd-73pfl repro (`mw_conflict.py explicit-same 8 300 10 5000`, disk) on a CLI of the full
+    stack (item 2 + lever 4 v2 + lever 4a + this) against main: stock integrity_check ok 10/10 on
+    both; every lost row is a refused commit (error lines 4,390 = rows lost; main 3,821 = 3,821);
+    wall median 6,243 -> 3,139 ms.
+- Tests: `test_publication_epoch_notifies_only_registered_waiters` on a private cell: an advance
+  with no waiter does not notify; a registered waiter on another thread is woken well inside its
+  30 s timeout; woken and timed-out waits both unregister. A cell that always notifies, never
+  notifies, or forgets to unregister on timeout fails it.
+  `test_withdrawn_publication_wakes_a_waiter_and_an_unrelated_one_does_not` unchanged.
+- Retry condition: none for this notify. The two spawn_blocking wakes per transaction for the
+  io_uring driver (`IoUringRuntime::ensure_driver`) are the larger futex source under an
+  asupersync runtime; whether `fsqlite::blocking` users pay them is not measured here.
+
+## 2026-11-16 - WIN (prediction missed low on size): synchronous=FULL's WAL-FEC worker reuses the repair coefficients of a group shape instead of building a RaptorQ encoder per commit, -44 us CPU per one-row FULL commit (bd-w4pr1.7, round 3 item 4, lever 4a)
+
+- Target: every commit at synchronous=FULL (or EXTRA). Each one hands its frames to the WAL-FEC
+  repair worker, which re-read them and, per group, built a `SystematicEncoder` over K unit
+  vectors to get K x r coefficient bytes. FEC stays on by default (owner freeze bd-w4pr1.17
+  untouched); what it writes and when it syncs are unchanged. Touched:
+  `crates/fsqlite-wal/src/wal_fec.rs` (`cached_wal_fec_repair_coefficients`, a process-wide map
+  keyed by (K, first ESI, end ESI) for K <= 64, at most 512 entries).
+- Ledger preflight: bd-wqmil (the coefficient path itself, K-byte rows instead of page-width
+  ones) is the change this one caches. Nothing earlier on the FEC worker's per-commit cost.
+- Evidence before (main d4e3d189c, CLI, tmpfs, 1,000 one-row transactions):
+  - FULL 338 us CPU per transaction against NORMAL 194 and FULL with
+    `raptorq_repair_symbols=0` 188 (5 reps, /usr/bin/time): the FEC pipeline was about 150 us
+    of CPU per commit (user +94, sys +56).
+  - callgrind of `process_committed_wal_range`, 300 FULL commits: 121.5k instructions per
+    commit, `SystematicEncoder::new` 102.7k (84.5%).
+  - strace: 25.6 syscalls per commit on the two FEC threads (openat 6.0, close 6.0, read 4.0,
+    statx 2.0, flock 2.0, futex 2.0, write 1.3, io_uring_enter 1.1, lseek 1.0).
+- Why reuse is exact: RFC 6330's constraint matrix and each repair symbol's tuple depend on K
+  and the ESI only. asupersync 0.6.2's `SystematicEncoder::new` takes a seed and ignores it
+  (`build_ldpc_rows`, `build_hdpc_rows`, `build_lt_rows` all take `_seed`); the decoder builds
+  the same matrix. `test_cached_repair_coefficients_serve_groups_with_other_seeds` pins it:
+  coefficient rows equal for two seeds at K = 1/2/3/7, and twelve groups of six (K, r) shapes over
+  two seeds each compared byte for byte with a fresh page-width encoder built with the group's
+  own seed. A cache keyed without K or without r, or an encoder that starts using its seed, fails.
+- Result. A = mtbench/CLI l4 (d4e3d189c + item 2 + bd-i0tn6 lever 4 v2; CLI sha256
+  e0d3f31c6f4aa61d), B = A + this (fsqlite-fec dd251e0934b11445, mtbench-fec
+  17531a9c69ab2262). thinkstation1, governor powersave, load 2-4.
+  - Exact: FEC worker 143.4k -> 15.3k instructions per FULL commit (callgrind, 300 commits; a
+    second A capture, on main, read 121.5k: how many commits one job covers varies run to run).
+    Predicted 15k-25k: met.
+  - CLI tmpfs, 1,000 one-row transactions, 5 interleaved reps (bash `time`, ms resolution),
+    distro sqlite3 live: FULL user 186.4 -> 146.4 us, sys 107.2 -> 102.8, CPU 293.6 -> 249.2
+    (-44.4; paired -62 / -21 / -51 / +7 / -95), wall 186.4 -> 176.4. NORMAL CPU 170.0 -> 164.2
+    (within noise). Stock: 20.8 us CPU per FULL transaction. A second batch of 5 reps, run after
+    the verdict and not used for it: FULL CPU 328.8 -> 262.4 (-66.4), user 209.6 -> 150.2, wall
+    211.8 -> 185.2; NORMAL 203.6 -> 184.2. Per-rep FULL CPU spans 247-294 (B) and 268-376 (A).
+  - Prediction: user 218 -> 125-145 and CPU 338 -> 245-270, from a baseline taken with
+    /usr/bin/time (10 ms resolution) on main. The A arm measured 294, not 338, so the absolute
+    B (249) is in range but the drop (-44) missed the predicted -68 to -93 low. Kill line (CPU
+    down by at least 40 us, mean of 5 reps): cleared, by 4 us, with one of five pairs going the
+    other way.
+  - mt-mvcc-bench disk FULL, 1 writer, 150 x 5, 3 interleaved reps (old harness): F wps B/A 0.988
+    [0.983, 0.992] (predicted within ±3%: met), F process CPU 838.8 -> 778.9 us per commit
+    (predicted -60 to -100: met), F/C 0.933 -> 0.932.
+- Tests: the new one above; `test_coefficient_repair_symbols_match_systematic_encoder` unchanged.
+- Retry condition / next (lever 4b, not done): the six opens per FEC job. One `-wal` descriptor
+  per job for the post-lock generation check and the frame read; the `.lock` file's descriptor
+  kept across jobs with flock still taken and released per job (other connections, checkpoint
+  reclaim and recovery take it); the sidecar's append descriptor kept with the (dev, inode)
+  check the sidecar cache already does. Worth up to the 56 us of sys time per FULL commit;
+  needs the cross-process lock and replacement rules (main's 04d6fd0c9 and 7e16b363f on locks)
+  read first.
+
+## 2026-11-16 - WIN (retry of the 2026-11-15 rejection, version 2): active-peer SSI candidates by a direct scan that tests the cheap peer filter first, +67% at 64 separate-table writers and +18% at 32 shared-table writers, 1 writer unchanged (bd-i0tn6 scaling lever 4 v2)
+
+- Target: the registry-guard holds of concurrent commits at 16-64 writers (`mt-mvcc-bench
+  --one-row-per-transaction`). Touched: `crates/fsqlite-mvcc/src/begin_concurrent.rs`:
+  `HandleView::may_have_read`, `may_have_written` and `is_edge_peer_of`;
+  `overlaps_pages_or_cells`, `active_incoming_candidates` and `active_outgoing_candidates`;
+  `pending_publication_blocks` scans with early exit; `ActiveEdgeDiscoveryIndex` becomes
+  `cfg(test)`, the oracle. Version 2 is round 1's patch with one change: both candidate filters
+  test `is_edge_peer_of` (not the committer, active, begun before the commit) before the overlap
+  rules, so the committer's own view and finished peers are never searched.
+- Ledger preflight: the 2026-11-15 REJECTED entry below (version 1: 8-64 writers far above its
+  prediction, killed by its 1-writer line at -4.7% pooled, which the entry's own analysis read as
+  noise plus a self-view search); its retry condition (cheap filter first; a 1w measurement that
+  resolves 2%, with the exact count) is what this version and its pre-registration (bd-i0tn6,
+  2026-11-15 13:49Z) met. Lever 3 (WIN) and lever 2 (WIN small) are the base it builds on.
+- Pre-registered 1w verdict, both met:
+  - exact (callgrind of the F worker closure, which inlines the whole one-row loop; old harness;
+    (N=2,000 minus N=500)/1,500; tmpfs NORMAL; io_uring refused): 217,873 -> 216,937
+    instructions per transaction, -0.43%. Kill: worse than +0.5%. Predicted -0.1% to +0.1%,
+    missed low (B did less work than predicted).
+  - CPU (F writer `writer_on_cpu_us`, 24 interleaved pairs of 2,000 x 11, disk NORMAL): 156.71
+    -> 156.30 us per transaction, pooled B/A 0.9973 (per-pair mean 0.9974 [0.9899, 1.0047]).
+    Kill: worse than +2%. Predicted within ±1%: met. F wps B/A 1.004 [0.995, 1.012].
+- Multi-writer (6 interleaved reps, 500 rows per writer x 5 rounds, disk NORMAL, amended from
+  tmpfs before any run because of the /dev/shm budget; old harness; stock live in every run; F
+  p50 wps B/A with its bootstrap CI, F/C A -> B, registry hold A -> B):
+  - separate tables: 8w 1.025 [0.989, 1.062] (0.422 -> 0.458, hold 12.4 -> 7.4 us); 16w 1.198
+    [1.172, 1.222] (0.567 -> 0.651, 19.8 -> 10.4); 32w 1.525 [1.492, 1.558] (0.421 -> 0.676,
+    30.7 -> 15.4); 64w 1.667 [1.657, 1.678] (0.273 -> 0.444, 46.7 -> 21.4);
+  - shared table: 8w 1.101 [1.039, 1.145] (0.275 -> 0.294); 16w 1.074 [1.022, 1.125] (0.410 ->
+    0.477); 32w 1.184 [1.146, 1.223] (0.345 -> 0.382, 26.7 -> 17.4);
+  - against the prediction: separate 8w 0..+8% met, 16w +8..+20% met, 32w +30..+55% met, 64w
+    +50..+85% met, 64w hold -45..-60% met (-54%); shared 8w 0..+8% missed high (+10.1%), 16w
+    +5..+15% met, 32w +10..+25% met;
+  - kill lines: no 8-64 writer row below -3%; no worker failure.
+- Binaries: A = mtbench-fds (origin/main d4e3d189c + the stock-arm HAVE_FDATASYNC change, sha256
+  71fc188ef22c0148), B = A + this (mtbench-l4, 923075e6257fda01). thinkstation1, 64 hardware
+  threads, governor powersave, load 2.4-7.7 from other lanes, 259 observed OS threads at 64
+  writers. Harness: main's mt-mvcc-bench (H did not land).
+- Tests (fsqlite-mvcc lib): `test_active_candidate_scan_matches_the_candidate_index` (2,000 random
+  cases, the same tokens in the same order as the old index) and
+  `test_pending_publication_blocks_on_an_exact_cell_overlap_alone`; with the exact-cell rule
+  dropped both fail.
+- Retry condition for what is left of the holds: the next item in the hold split is the peer view
+  construction itself (16.8 and 19.7 us of the 64w validate and publish holds before this lever);
+  re-split the holds on a tree with this lever before choosing.
+
+## 2026-11-16 - HARNESS (fairness, not a lever): mt-mvcc-bench's stock arm syncs with fdatasync like distro sqlite3; FULL rows that restart the WAL had flattered FrankenSQLite 2.1x (bd-w4pr1.7, coordinator decision 3)
+
+- Target: every C SQLite baseline built from the bundled rusqlite (mt-mvcc-bench's stock arm, the
+  harness, the conformance oracles) at synchronous=FULL on a real disk. Touched:
+  `.cargo/config.toml` (`LIBSQLITE3_FLAGS` gains `-DHAVE_FDATASYNC`).
+- Why: libsqlite3-sys 0.39.1 compiles its bundled 3.54.1 without HAVE_FDATASYNC, so sqlite3.c:44392
+  `#define`s fdatasync to fsync. The distro's configure build calls fdatasync, and since lever S
+  (the 2026-11-15 WIN entry below) so does FrankenSQLite. fsync also commits the journal for the
+  mtime change of a frame overwrite (9.2-10.6 ms against 3.0-3.2 ms per sync on this disk), so
+  once a checkpoint had restarted the WAL the bench compared FrankenSQLite's fdatasync with
+  stock's fsync.
+- Scope: rusqlite is a dependency of fsqlite-e2e and fsqlite-harness and a dev-dependency
+  elsewhere; no release artifact links it. libsqlite3-sys passes `-D` flags through and reruns
+  on a change (build.rs:340-351); HAVE_FDATASYNC has one use in sqlite3.c.
+- Evidence (A = mtbench-m4, origin/main d4e3d189c, sha256 24fd1bf653375b72; B = A + the flag,
+  mtbench-fds 71fc188ef22c0148; thinkstation1, ext4 NVMe, load 1.5-3.4; old harness; 3
+  interleaved reps; FrankenSQLite live in the same runs):
+  - strace -f -y, disk FULL, 1 writer, 100 one-row transactions: stock arm per commit
+    fsync(-wal) 1.05 -> fdatasync(-wal) 1.05, fsync 0; its db, journal and directory syncs become
+    fdatasync too. FrankenSQLite's calls unchanged (fdatasync(-wal) 1.04 per commit).
+  - Growth shape (150 x 5, the WAL never restarts): stock C p50 wps B/A 1.016 [0.974, 1.044];
+    F 1.015; F/C 0.929 -> 0.929. Unchanged, as predicted (both calls journal a size change).
+  - Restart shape (`FSQLITE_BENCH_WAL_AUTOCHECKPOINT=50` for both engines, 300 x 5): stock C p50
+    104 -> 221 wps, B/A 2.132 [2.082, 2.219] (predicted x1.8 to x2.6); F 1.007; F/C 1.653 ->
+    0.789. The bench had reported FrankenSQLite 1.65x ahead in this shape; like for like it is
+    0.79x.
+  - Prediction (bead comment 2026-11-15, before building): met on every line.
+- Retry condition: none. Every FULL-mode bench F/C before this commit compared fdatasync against
+  fsync once the WAL restarted and is not a win (coordinator decision 3, 2026-11-15).
+
+## 2026-11-16 - NOT LANDED (its candidate mechanism refuted; the A/A null fails as often with the stock arm in another process): what the harness before H leaves beside mt-mvcc-bench's stock arm (bd-w4pr1.7, harness change H, round 3)
+
+- Target: the coordinator's condition for landing H (bd-w4pr1.7, 2026-11-15): explain round 2's
+  stock-arm A/A miss (1w pooled 1.027 [1.008, 1.047]) by a measured mechanism. Candidate: the old
+  harness's asupersync runtime threads take CPU or scheduler time while the stock arm runs.
+  Touched (not landed): `crates/fsqlite-e2e/src/bin/mt_mvcc_bench.rs`, on top of H: an
+  `arm_isolation` line per invocation of either arm (the writers' schedstat from just before the
+  start gate to their last commit, all non-writer process CPU inside the timed window, and the
+  threads alive across the invocation with their names and schedstat), read only at an
+  invocation's edges; `--csqlite-process=child`, which runs every stock invocation in a fresh
+  process of the same binary and returns its result as JSON. Patch: scratchpad
+  `p6r3_H3_bench.patch` (session 1f77802a), sha256 prefix fd3b1c721210b3e4.
+- Rules (registered before the probe was built): land H only if (a) the isolated A/A (child vs
+  child) includes 1.0, (b) new in-process vs new isolated includes 1.0, and (c) old in-process is
+  below old isolated with a CI excluding 1.0 AND the census shows the old harness's residents
+  taking CPU or timeslices during the stock arm.
+- Result (mtbench-h2, sha256 d1a1151c513e1793 = f38d2403d + H + probe; thinkstation1, governor
+  powersave, tmpfs NORMAL, load 2.1-3.3; 1 writer, 2,000 rows x 11 rounds; four modes rotated per
+  rep, 16 reps each):
+  - (a) child/child 0.993 [0.969, 1.016], met; (b) 1.009 [0.985, 1.033], met;
+  - (c) old in-process / old child 1.029 [1.000, 1.056]: not below 1.0. Not met;
+  - in-process A/A new/old 0.975 [0.950, 0.999]: a miss in the other direction from round 2's.
+  - Census during the stock arm: at 1w the old harness's 1.82 residents (both `asupersync-work`:
+    the main thread's block_on runtime) take 0.0 us on-CPU and 0.0 timeslices over 528 stock
+    invocations; the stock writer's runqueue wait and timeslices per transaction are equal under
+    both harnesses (0.018 us, 0.001). At 8 / 32 / 64 writers the residents take 9-125 us (old)
+    and 5-70 us (new) per stock invocation, under 0.02% of the writers' CPU; the old harness's
+    274-293 OS threads exist only during F invocations.
+  - A second 16-rep batch, run after the verdict and not used for it: in-process 0.993 [0.965,
+    1.021] (pass), child/child 1.019 [1.001, 1.037] (FAIL). Across five batches on the same ELF the
+    in-process A/A read 1.068 / 1.008 / 1.014 / 0.975 / 0.993, and the isolated one failed once in
+    two. Per-rep stock ratios spread 0.87-1.13 in every mode.
+- Reading: the candidate mechanism does not exist. The miss is this null's run-to-run variance,
+  which a bootstrap over one batch's per-rep ratios understates: an A/A whose two arms cannot be
+  affected by the harness (stock in separate processes) fails at about the same rate. H's F-side
+  effect stands: F new/old 1.493 [1.481, 1.505] at 1w (F/C 0.088 -> 0.136), 1.235 / 1.022 / 1.046
+  at 8 / 32 / 64 separate writers (2 reps); the old harness spends 19.6-20.3 ms of non-writer CPU
+  per 305 ms 1w F invocation (the F worker's runtime thread), the new one none.
+- Side finding for the concurrency lane: under the new harness (`fsqlite::blocking`) at 32 and 64
+  writers, the `asupersync-fall` resident runs 141 and 292 ms on-CPU per F invocation with 19k and
+  37k timeslices: engine work fsqlite::blocking routes to its fallback thread.
+- Retry condition: a coordinator decision on this evidence, or an A/A design that resolves 2% at
+  1 writer (for example many short batches with the order randomized, or a variance estimate that
+  includes batch-to-batch drift). Until then every mt-mvcc-bench number is under the old harness.
+
+## 2026-11-16 - FIX (regression from lever L1): a WAL refresh reads one frame header ahead of its batch only while a stale tail is known for its generation (bd-2qo7z, bd-w4pr1.7)
+
+- Target: lever L1 (a4ff2c4ca, the 2026-11-15 WIN entry below) read the 24-byte header of the first
+  frame past the prefix before every refresh's batch. On a valid continuation (a peer's frames, a
+  fresh reader catching up) that re-read offset 32 and turned the first read into a probe, which
+  broke two fsqlite-wal `wal_reopen` I/O-contract tests
+  (`replay_batches_io_but_reads_every_frame_byte`,
+  `append_during_batched_replay_waits_for_the_next_sampled_horizon`). L1's gate ran `fsqlite-wal
+  --lib` only; `wal_reopen` needs `--features fault-injection`. Touched:
+  `crates/fsqlite-wal/src/wal.rs` (`StaleTail`, `WalFile::stale_tail`, `stale_tail_ahead`,
+  `note_stale_tail`).
+- Change: a scan of the current generation that stops on another generation's frame (refresh's
+  batch, `rebuild_state_from_file`, `open`) records the generation's salts and the file's frame
+  count. `refresh` probes only while that tail is ahead of its prefix; otherwise it batches from
+  the first read, as before L1. A reset or a peer's restart changes the salts; a prefix past the
+  old end retires it. After a restart in place the first refresh pays one batch, then every
+  refresh in that generation reads one header, as under L1.
+- Result (A = origin/main 2fc4fb383, CLI sha256 898c53b5b934e8ef; B = A + this,
+  65c2b73bb5705ee6; stock live; 6 rotated reps):
+  - `cargo test -p fsqlite-wal --features fault-injection --tests`: `wal_reopen` 10/10 (main 8/2);
+    every integration target green; the lib 1,174 + 2 reds in `telemetry::tests`, a race on the
+    process-global WAL metrics (`frames_written_total` 3, expected 1) and the lock poisoning that
+    follows it; the lib re-run whole was 1,176 / 0 and `telemetry::tests` alone 32 / 0.
+  - clippy `--all-targets --features fault-injection` clean; the core WAL keepers and the e2e
+    checkpoint / recovery batch (11 targets) pass.
+  - CLI tmpfs NORMAL: CPU 125.9 -> 123.8 us per transaction, user instructions -0.2%; disk NORMAL
+    CPU 146.7 -> 142.7; pread bytes per transaction 4,530-4,537 -> 4,548-4,622 over three runs
+    (one 61,800-byte batch per WAL restart). L1's win stands.
+  - Prediction (bd-2qo7z, before building): met on every line.
+- Tests: `test_refresh_over_a_peers_frames_batches_from_the_first_read` (new: no stale tail known,
+  a peer's frames are read in one batch from the first frame) and L1's
+  `test_refresh_over_a_restarted_wal_reads_one_frame_header_of_its_stale_tail` (the probe still
+  runs over a known stale tail). Main's unconditional probe fails the first; a version that never
+  probes fails the second. The two `wal_reopen` tests are unchanged.
+- Retry condition: none. A lever that changes WAL read patterns gates on fsqlite-wal's
+  integration targets with `--features fault-injection`, not only its lib.
+
+## 2026-11-16 - WIN (landed as 797ddd090; one early-stop test assertion replaced under the coordinator's decision): the checkpoint read-back reads its pages and their WAL sources in runs (bd-w4pr1.13.20, lever N2)
+
+- Target, change, prediction and kill lines: the round-5 entry below ("MEASURED WIN, NOT LANDED ... lever N2"). The
+  code is that entry's N2 v1, unchanged (`scratchpad/r5_N2_v1.patch` of the bulk-write lane, sha256 5b6158601e368bdc),
+  plus the replaced assertion; landed as 797ddd090.
+- Why it was held, and the decision: `test_all_checkpoint_modes_refuse_backfill_publication_on_mismatch` asserted
+  `read_pages == [2]` and `read_after_syncs == [sync_count]`, i.e. that the read-back stops at the first bad page;
+  N2 reads the run [2, 3] before it reports page 2. Coordinator decision on bd-w4pr1.13.20 (2026-11-15 19:51Z): every
+  safety assertion of the test still holds and the early stop is over-specified; replace that one assertion with the
+  strictest equivalent. On the complete-window path it now asserts that the corrupt page is read back, only pages the
+  pass backfilled are read, each once in ascending order, and every read follows the pass's last sync. The
+  partial-window sibling keeps the old lines unchanged. No other assertion changed.
+- Result, re-measured on the landing base (both arms built on main d4e3d189c, which carries levers M and S: base
+  620b9e52a7dafdbe, N2 803daba4995aae82; thinkstation1, governor powersave, load 4.3-5.0, stock sqlite3 3.46.1 live
+  in the same invocation, 9 interleaved reps, bulk 3, memory_script 5, io_uring refused; `scratchpad/r6_ab.py` of the
+  bulk-write lane, output `r6/abN2d4.txt`): `delete_14pct_300k` pread64 WAL 9,382 -> 7,274 and db 4,552 -> 2,445
+  (-4,215, met), instructions 364.1M -> 358.7M (-5.4M, met; 3.02x -> 2.97x stock's 120.7M), kernel cycles -23.2M
+  (met), task-clock min 106.2 -> 102.1 ms (-4.1, 0.9 ms below the predicted -5 to -11) and median 112.3 -> 104.1 ms
+  (CPU 2.49x -> 2.39x stock's 42.7 ms); `update_10pct_300k` -5.5M (2.06x -> 2.04x), task-clock min -2.2 ms (met);
+  `bulk_insert_1M_one_txn` -17.6M (1.69x -> 1.68x; below the predicted -20M to -35M), task-clock min -63.6 ms (3 reps,
+  noisy); `memory_script_200k` unchanged. The same pair built on 94573de28 the day before (`r6/abN2.txt`): delete
+  -4,216 preads, -5.4M, task-clock min -8.0 ms; update -5.3M, -10.7 ms; bulk -18.5M, -15.8 ms. Kill lines (preads
+  down at least 3,500, instructions down at least 2M, task-clock min not up) cleared on both bases. Answers equal
+  stock's; stock integrity_check ok; bd-73pfl stress (`mw_conflict.py explicit-same 8 300 10 5000`) 0/10 integrity
+  failures in every arm, every lost row a refused COMMIT with its error line (base 5,588, N2 5,408).
+- Gate (rch; d4e3d189c + the N2 diff, sha256 6b720e3a461273a2, every red also red on main without N2): clippy
+  -D warnings wal + pager + core all targets clean; fsqlite-wal lib 1,179 / 0; wal integration targets
+  (fault-injection) 127 / 2 (wal_reopen x2, red since lever L1 a4ff2c4ca, bd-2qo7z); pager lib + integration
+  1,124 / 1 (bd_2jpu6_2); core lib 4,194 / 3 (t6741 pair; bd-drufq); core crash + cross-process checkpoint battery
+  230 / 1 (gh19 native_full_commits); 78 core keeper / EXPLAIN targets 410 / 8 (gh516 trio, bd-d8s37, bd-jlbrk x2,
+  bd-hi7qg, indexed_group_by_predicates); e2e checkpoint / crash / concurrent-writer batch 133 / 0; vdbe goldens
+  8 / 0; fsqlite crate lib 748 + 123 integration targets 349 + doc 1, all pass. Landed by the coordinator on main
+  past 84989ece6 / 2fc4fb383 (connection.rs window and aggregate paths only), with clippy wal + pager + core all
+  targets re-run on that exact tree.
+- Retry condition: none for the read-back. Widen: the backfill's per-frame re-read and its pwrite64 calls stay one a
+  frame (`checkpoint_integrity_copy_pass_is_bound_to_validated_source_bytes`); the checkpoint's next pieces are the
+  three XXH3-128 passes and the chain checksum (guarantee costs, the round-5 attribution on bd-w4pr1.13.20) and its
+  extra database / certificate-head / directory syncs (reported by the single-writer lane on bd-w4pr1.7). The commit's
+  three whole-transaction page copies are the single-writer lane's (attribution on bd-w4pr1.7, 2026-11-15).
+
+## 2026-11-16 - WIN (landed; cycles lost on rows it does not run): a window function's arguments are read from their slots in the scanned row (bd-w4pr1.12, lever W5)
+
+- Target and change: the 2026-11-15 "MEASURED WIN, NOT LANDED" entry for W5 below. That diff,
+  rebased unchanged onto origin/main d4e3d189c, landed as 84989ece6. Touched:
+  crates/fsqlite-core/src/connection.rs (execute_window_select's step sites, `WindowArgValues`).
+- Pre-registered: round 4's prediction and kill lines, unchanged (bd-w4pr1.12, 2026-11-15 19:38Z),
+  restated before the rebuild (2026-11-16): sum(c) OVER Ir -300 to -550M, CPU -20 to -60 ms; other
+  rows within 0.3% Ir. Added: cycles for every read row, and a window row up more than 2% cycles in
+  the pairs reported as a miss.
+- Result (thinkstation1, powersave, io_uring refused, serial on every arm, stock 3.46.1 live; base
+  f328c069d sha256 a31638df6cf3ecf0, W5 ceb111983534bd37; two par_probe runs with cycles, reps 5,
+  plus 10 interleaved pairs; answers equal): sum(c) OVER (PARTITION BY a) 4,049.4M -> 3,684.4M Ir,
+  CPU x1.05 -> x0.99 and x1.06 -> x1.01 stock, cycles 1,424.7 -> 1,320.2M (pairs 0.924). Other
+  window rows +0.04..+0.11% Ir, pairs cycles 0.999..1.013. Every non-window row identical in Ir;
+  at that equal Ir the pairs put cycles up on GROUP BY a (1.041), GROUP BY id (1.016),
+  scan_filter_agg (1.040) and order_by_text_limit10 (1.051, min 1.030). That is the layout effect
+  of the ledger's trap line. It came from a change outside the VDBE crate, so the trap is not
+  confined to try_execute_hot_opcode_sync.
+- Gate:
+  - On the measured tree (f328c069d + W5): clippy fsqlite-core all targets clean; core lib + 62
+    GROUP BY / aggregate / min/max / join / conformance / EXPLAIN-pinning keepers 6,381 pass / 4 fail
+    (t6741 pair, indexed_group_by_predicates, without_rowid_secondary_suffix_order_matches_stock,
+    the last also red on the base CLI); window batch 178 / 0; e2e 126 / 2 (bd-4qvcr); fsqlite crate
+    1,097 / 1 (bd-qxdk4, fixed upstream since).
+  - Re-gated by the coordinator on the exact pushed tree (d4e3d189c + W5, rch hz3/hz4): clippy
+    fsqlite-core all targets clean; core lib + 13 window + 9 derived/join keepers 4,273 / 3 (t6741
+    pair, plus test_retained_autocommit_flush_propagates_nontransient_post_commit_checkpoint_failure,
+    which fails identically on d4e3d189c without W5); 5 e2e targets 43 / 0.
+- Verdict: WIN against stock live (sum(c) OVER x1.05 -> x0.99-1.01 CPU, -365M Ir), landed. Missed
+  and stated: 1.6-5.1% cycles on four rows that run none of it, at equal instructions.
+- Retry condition: none for W5. The window rows left above stock CPU are the computed keys
+  (`PARTITION BY a % 7 ORDER BY c * 2`, x1.05-1.09): their keys still go through the evaluator per
+  row (lever W6 in the read-loop lane's list).
+
+## 2026-11-15 - WIN (probe partly met): an indexed equality seeks with a folded uncorrelated scalar subquery's value (bd-wp9s1 part 1)
+
+- Target: `SELECT id FROM t WHERE a = (SELECT w FROM p WHERE pid > 10 LIMIT 1)` (606x stock):
+  the fold leaves a BoundOuterValue with the result column's affinity, and is_simple_constant
+  refuses every BoundOuterValue as a seek key, so the outer equality scanned. Touched:
+  crates/fsqlite-vdbe/src/codegen.rs (is_exact_equality_seek_value: the value is an exact key when
+  the comparison converts only it; the equality walk reads its storage class like a literal's).
+- Result (c1c715a48; scratchpad wp_ab.py, stock live, answers equal; ELF before
+  ea1aec8d7519ec2a, after 3ae0fcb4a04033b8; thinkstation1): 606x -> 3.8x, its count 1653x ->
+  2.8x, TEXT 2563x -> 5.3x; the no-LIMIT row 2656x -> 568x (its fold still runs the whole
+  subquery).
+- Retry condition: part 2 gives the scalar fold LIMIT 1 (fsq-sfl); a TEXT value on a numeric
+  column and a NULL value stay on the exact zero-match scan fallback until the equality walk
+  coerces its probe. Part 2 landed b6dd1e303: limit_probe_to_its_first_row at all five scalar
+  first-row sites; the no-LIMIT row 568.5x -> 2.8x (ELF 3ae0fcb4a04033b8 -> a91b28ed23803ca2).
+  The id rows stay 3.8x on per-row output cost (~4.6k instructions per emitted row vs ~1.2k).
+
+## 2026-11-15 - MEASURED WIN, NOT LANDED (gate incomplete): a window function's arguments are read from their slots in the scanned row (bd-w4pr1.12, lever W5)
+
+- Target: `SELECT sum(s) FROM (SELECT sum(c) OVER (PARTITION BY a) s FROM t)` (x1.02-1.05 stock
+  CPU). Round 3's callgrind of the landed tree (4,046.7M Ir): build_window_args 436.0M over 1M
+  calls (eval_join_expr 320.0M, find_col_in_map per row) and one Vec per row for the arguments
+  (malloc 181.7M over 1,000,001 calls, plus the frees). Touched (not landed):
+  crates/fsqlite-core/src/connection.rs (execute_window_select's step sites, a `WindowArgValues`
+  alias beside build_window_args).
+- Ledger preflight: W1 (one-column window keys read through window_key_row_column; kept), W2, W3,
+  A1 (kept). No entry on window arguments.
+- Pre-registered on bd-w4pr1.12 (19:38Z, before the code): sum(c) OVER Ir -300 to -550M, CPU -20 to
+  -60 ms; the other window rows and the non-window rows within 0.3% Ir. Kill: Ir down by less than
+  250M or CPU not lower in each of two runs, another read row up more than 0.3% Ir, or a window /
+  derived / join oracle change.
+- Change: per window function, its arguments resolve once through window_key_row_column (the
+  resolver W1 uses: an unqualified USING column's coalesced projection left to the evaluator, every
+  row holding the column); when all resolve, a row's arguments are its slots' values in a two-value
+  inline vector, otherwise build_window_args as before. The eight step sites use it; the sites that
+  store arguments (application functions' rows, nth_value's frame rows) keep build_window_args.
+- Result (thinkstation1, powersave, io_uring refused, serial on every arm, stock 3.46.1 live; base
+  origin/main fd6bf353e sha256 b43aac3d8a4419fa, W5 = fd6bf353e + this diff 8595e26351945d04; two
+  par_probe runs, reps 5, load ~3, answers equal; 10 interleaved pairs): sum(c) OVER 4,049.4M ->
+  3,684.4M Ir (-365M), CPU 510.2 -> 491.1 and 533.3 -> 520.6 ms (x1.02 -> x0.98, x1.05 -> x1.02
+  stock), cycles:u 1,400.4M -> 1,318.5M (pairs median 0.939), task-clock 530.4 -> 510.5 ms;
+  row_number +4.0M (+0.11%), the a % 7 window +2.0M (+0.04%, pairs 1.0095), rank() +4.0M (+0.10%,
+  pairs 1.0029); every non-window row identical in Ir. Prediction: Ir inside (-365M in
+  -300..-550M), CPU at the low end and just under it (-13 to -19 ms against -20..-60 ms). Kill
+  lines not crossed.
+- Gate (rch, on the measured tree): clippy -D warnings fsqlite-core --lib clean; eight window /
+  derived targets (window_function_oracle, bd_window_fn_oracle_probe,
+  bd_window_range_frames_oracle_probe, bd_named_window_exclude_oracle_probe,
+  bd_derived_table_column_alias_oracle_probe, bd_ffwsd_json_window_aggregates,
+  window_multi_scalar_bkc4f_oracle, window_order_nulls_gh248_oracle) 30 passed, 0 failed. Not run:
+  fsqlite-core lib, W1's other window-using targets, the GROUP BY / join keeper batches, the
+  fsqlite crate suite, the fsqlite-e2e targets.
+- Verdict: MEASURED WIN against stock live (sum(c) OVER x1.02-1.05 -> x0.98-1.02 CPU), NOT LANDED:
+  the round ended before the gate. The diff is kept in the round-4 lane scratchpad
+  (`rl4/w5_v1_full.patch`; local branch `rl4-w5-wip` in clone perf2-wt2).
+- Retry condition: land it after the full gate (the runs listed as not run above) on a tree rebased
+  onto current main, with the two-run A/B repeated there; no new prediction is needed unless the
+  code changes.
+
+## 2026-11-15 - WIN: on Linux every file sync is fdatasync, as stock SQLite's, and a WAL the open creates syncs its directory (bd-w4pr1.7, lever S)
+
+- Target: every synchronous=FULL commit on Linux, and every checkpoint's file syncs at any level.
+  Touched:
+  - `crates/fsqlite-vfs/src/unix.rs`: `sync_writes_data_only`, used by `UnixFile::sync` and `durable_sync`;
+  - `crates/fsqlite-core/src/connection.rs`: `install_wal_backend_with_vfs` syncs the directory of a WAL it creates;
+  - docs in `crates/fsqlite-vfs/src/traits.rs` (`SyncKind`) and `crates/fsqlite-wal/src/recovery_fence.rs`.
+- Ledger preflight:
+  - nothing earlier on the sync call itself;
+  - round 1's handoff sized it at "0.7 ms of a 10 ms disk FULL commit". That was the wrong shape (below).
+- Evidence before:
+  - strace -f -y of the CLI, split into phases by `.read` markers (scratchpad `p6r2_synctrace.py`):
+    - distro sqlite3 3.46.1 issues fdatasync for every sync, directories included;
+    - the bench's stock arm issues fsync. It is libsqlite3-sys 0.39.1's bundled 3.54.1, compiled without HAVE_FDATASYNC, so sqlite3.c `#define`s fdatasync to fsync;
+    - fsqlite issued fsync for every WAL, database, cert-head and directory sync.
+  - What the call costs on this disk (C microbenchmark `p6r2_synccost.c`, a 4,120-byte write then a sync, ext4 on NVMe):
+    - a write that grows the file: fsync 8.9-9.6 ms, fdatasync 9.1-10.0 ms;
+    - a write inside the file: fsync 9.2-10.6 ms, fdatasync 3.0-3.2 ms. fsync commits the journal for the mtime alone.
+  - Once a checkpoint has restarted the WAL in place, every commit overwrites frames, so that steady state is the lever. Round 1's CLI shape only grew a fresh WAL, where both calls cost the same.
+- Why fdatasync is enough for files (sqlite3.c `full_fsync`: "as far as SQLite is concerned, an fdatasync() is always adequate"):
+  - fdatasync(2) also flushes a changed size and the block map, and skips timestamps;
+  - no fsqlite recovery path reads a timestamp; file identity is device + inode (checked by grep).
+- Directories stay fsync, which is stronger than stock's fdatasync:
+  - fsqlite syncs directories after renames (sidecar publication, snapshot transfer, the checkpoint handoff);
+  - on ext4 a rename that leaves a directory's size unchanged is not metadata fdatasync must flush;
+  - stock syncs a directory only after creating a journal or WAL, whose own sync already covers the new entry.
+  - The measured binary (fsqlite-s1) used fdatasync for directories too. The landed tree's directory fsyncs come once per WAL creation and once or twice per checkpoint, at most one per 400 measured commits.
+- Sync parity after the change, FULL. NORMAL makes the same checkpoint calls and none per commit.
+
+  | phase | distro stock 3.46.1 | fsqlite before | fsqlite after |
+  |---|---|---|---|
+  | WAL creation and first commit | fdatasync(-wal) x2, fdatasync(dir) x1 | fsync(-wal) x2; no directory sync ordered before the commit (the FEC worker's, on another thread, raced it) | fdatasync(-wal) x2, fsync(dir) x1 |
+  | each commit | fdatasync(-wal) x1 | fsync(-wal) x1 | fdatasync(-wal) x1 |
+  | PASSIVE checkpoint | fdatasync wal x1, db x1 | fsync wal x1, db x2, -wal-cert-head x1, dir x1 | the same counts, fdatasync except the directory |
+  | RESTART / TRUNCATE | fdatasync wal x1, db x1 | fsync wal x2, db x3, cert-head x1, dir x1-2, -wal-fec tmp x1 | the same counts, fdatasync except the FEC tmp and the directories |
+
+  Left as they are, with the reason for each:
+  - The checkpoint's extra database syncs: `checkpoint_executor_impl.rs` syncs at :325, truncates at :332 and syncs at :333, where stock truncates and then syncs once. A further "defensive" sync at :500 precedes a RESTART / TRUNCATE reset. They are the bulk lane's code, and each needs its recovery keeper (bd_yfdb6 / GH#193) named before one goes. This is the next sync item, worth 1-2 fdatasyncs (3-10 ms each on disk) per checkpoint.
+  - The cert-head sync: it records the certificate chain's head, which recovery reads, before the WAL generation moves.
+  - The FEC sidecar's tmp fsync, rename and directory fsync: they publish the repair sidecar atomically, the repair path reads it, and they run at WAL restart on the FEC worker, not on the commit thread.
+  - The migration-state tmp fsync: once per open. The namespace record was already fdatasync.
+- Result:
+  - Arms: A = main dbac12d40 (fsqlite-h1, sha256 58448b854b8e1ccf; the H diff in that build touches only the bench). B = A + this change, with fdatasync directories (fsqlite-s1, cde08ccceedb17a7).
+  - Setup: thinkstation1, governor powersave, ext4 NVMe, load about 5.8 from other lanes; distro sqlite3 3.46.1 live in every rep; 6 interleaved reps, arms rotated.
+  - Steady state (`disk-fullss`, (N=1,500 minus N=1,100)/400; every commit comes after the first autocheckpoint restarted the WAL):
+    - wall per commit 10.31 -> 3.67 ms (paired -5.6 / -6.2 / -11.0 / -5.1 / -2.5 / -9.4 ms), against stock 4.19 (median 3.64);
+    - that takes fsqlite from 2.5x to 0.9x stock wall;
+    - the disk is shared, so per-rep spread is ±1.3-2.0 ms.
+  - Growth (`disk-full`, (N=300 minus N=100)/200, a fresh WAL that only grows): 10.60 -> 10.76 ms (paired -1.1 to +2.2), stock 10.74. Unchanged, as predicted.
+  - mt-mvcc-bench disk FULL, 1 writer, 150 x 5. Its WAL never restarts, and both arms run against the same fsync-calling C arm. 3 interleaved reps per harness:
+    - new harness: F wps B/A 1.005 (0.97 / 1.01 / 1.03), F/C 0.990 -> 0.993;
+    - old harness: B/A 0.996 (1.00 / 1.01 / 0.98), F/C 0.938 -> 0.933.
+  - Prediction (bead comment, before code): steady state 10.9 -> 3.4-4.2 ms, met (3.67); growth within ±0.3 ms, met (+0.17); bench 150 x 5 within noise, met.
+  - Kill line (steady state not down by at least 3.0 ms): cleared (-6.6 ms).
+- Tests:
+  - `test_unix_vfs_sync_calls_match_stock_sqlite_on_linux`: the policy, plus every flag and kind and a directory sync succeeding on a grown file whose size a reopen reads back.
+  - `test_install_wal_backend_syncs_the_directory_of_a_wal_it_creates`. Creating the WAL must sync its directory exactly once, which fails without the new line. Adopting the existing WAL must sync none, which fails for a version that syncs on every install.
+- Gate: on the exact landing tree (26950fa4c plus this change, rch):
+  - clippy -D warnings --all-targets on fsqlite-vfs, fsqlite-wal, fsqlite-core and fsqlite-e2e: clean.
+  - fsqlite-vfs lib: 530 pass, 1 red: `uring::tests::test_local_cx_cancellation_submits_async_cancel_within_five_ms`, at 5.66 ms against its 5 ms bound on a loaded worker. That is io_uring cancellation latency, not a sync path; the s1 tree's run passed 531 of 531.
+  - fsqlite-core install_wal_backend tests: 7 pass, including the new one.
+  - fsqlite-core keepers, 6 targets, all pass: gh534_sigkill_unpublished_wal_tail, bulk_import_upsert_text_pk_phantom_pk, bd_ih8ak_flush_floor_after_peer_growth, bd_ih8ak_certificate_append_tail, bd_qyekq_unsynced_certificate_crash_images, self_connection_read_your_own_write_peer_races.
+  - fsqlite-e2e, 13 targets: 73 pass, 0 fail. Among them stock_headerless_wal_e2e (the .5.6 keeper), split_claim_cross_process_e2e, refused_commit_ends_transaction_e2e, gh364, the four recovery_* targets, bd_3wop3_1_4_wal_recovery_checkpoint, bd_yfdb6_wal_recovery_race, bd_2yqp6_6_3_crash_recovery_corruption_matrix, group-commit durability and the concurrent checkpoint oracle.
+  - multiprocess_autocommit_busy_timeout_e2e with --test-threads=1: 8 pass.
+  - fsqlite-wal lib: 1,175 pass (on the tree rebased onto 65377e134).
+  - bd-73pfl stress (`mw_conflict.py explicit-same 8 300 10 5000`): stock integrity_check ok 10/10 on main and on s1. Every lost row is a refused commit, as on main.
+  - Not run: fsqlite-pager lib (S does not touch it), the full fsqlite-core lib, the e2e concurrent-writer / SSI batches.
+- Caveat for every bench ratio at synchronous=FULL on a real disk: the bench's stock arm calls fsync, the distro's calls fdatasync. A bench FULL row whose WAL restarts now compares fdatasync against fsync and flatters fsqlite; the CLI rows above are like for like. Building the bench's rusqlite with `LIBSQLITE3_FLAGS=-DHAVE_FDATASYNC` would make the bench like for like. That is a harness decision, posted on bd-w4pr1.7.
+- Retry condition: none for the call. Next are the checkpoint's extra database syncs (above), each with its recovery keeper named first.
+
+## 2026-11-15 - HELD (its A/A null missed 1.0 by 0.8 points): mt-mvcc-bench's FrankenSQLite arm drives the engine as `fsqlite::blocking` does, and the stage profiler is opt-in (bd-w4pr1.7, harness change H)
+
+- Target: every mt-mvcc-bench F/C row. The fsqlite arm entered an asupersync current-thread runtime once per transaction attempt (`fsqlite_e2e::block_on`). It also read the thread CPU clock six times per one-row transaction (stage profiler) and switched on two engine diagnostics that default to off for users (`set_commit_phase_timing_enabled`, `set_vdbe_metrics_enabled`). The stock arm calls rusqlite and pays none of this.
+  Touched: `crates/fsqlite-e2e/src/bin/mt_mvcc_bench.rs` only. Patch: scratchpad `p6r2_H_harness.patch` (session 1f77802a), sha256 prefix 399c7e69e0ce5411. Not committed.
+- Change:
+  - `--fsqlite-driver=poll` (default) opens through `fsqlite::blocking::Connection::open` and polls each engine future on the worker thread, as `fsqlite::blocking` does. `=runtime` is the old harness, kept for side-by-side runs.
+  - `--stage-profile` (default off) turns on the profiler and the diagnostics.
+  - Both are recorded in a new `fsqlite_harness` field of every configuration receipt, so a pre-H report never compares as history.
+  - Engine calls, SQL, retry classifier and receipts are unchanged.
+- Evidence of the defect (exact, writer thread, callgrind, (N=2,000 minus N=500)/1,500, mtbench-h1 sha256 3b6f47202a539d20):
+  - old 216,846 instructions per transaction; runtime entry only 215,742; poll driver + profiler 156,779; new 155,034; stock arm 16,120.
+  - The runtime entry is 60.7k:
+    - `CurrentThreadDriver::drive` 48.9k;
+    - `block_on` outside it 3.8k;
+    - 10.3k of engine work that runs only when an asupersync context is current (the polled block is 163.1k inside a runtime, 152.8k outside).
+  - `fsqlite::blocking` (prepared-dml-probe under callgrind) runs no runtime function. Its driver costs about 70 instructions per call.
+  - Peak OS threads: old 7-8 at 1 writer and 274-293 at 64; new 2 and 66-68.
+- A/A null on the stock arm, same binary, C wps new/old:
+  - 1 writer, three batches: 1.068 [1.045, 1.092] (6 pairs), 1.008 [0.982, 1.035] (10 pairs), 1.014 (4 pairs). Pooled 20 pairs: 1.027 [1.008, 1.047].
+  - Multi-writer, 7 pairs: 8w 0.975 [0.83, 1.13], 32w 1.080 [1.01, 1.15], 64w 0.994 [0.91, 1.08]. The multi-writer stock arm spreads ±15% per run, with signs flipping between batches.
+  - The pre-registered condition was "1.0 within its CI". The pooled 1w CI misses it, so H is held for the coordinator.
+  - The direction it misses in, the stock arm slower under the old harness, lowers F/C under the new one. It cannot flatter fsqlite.
+- F/C, both harnesses, same binary:
+
+  | writers | reps | F new/old | F/C old -> new |
+  |---|---|---|---|
+  | 1 | 16 | 1.504 | 0.089 -> 0.131 |
+  | 8 separate | 7 | 1.289 | 0.270 -> 0.357 |
+  | 32 separate | 7 | 1.051 | 0.271 -> 0.264 |
+  | 64 separate | 7 | 1.021 | 0.172 -> 0.180 |
+
+- Prediction against the result:
+  - exact -45k to -60k: -61.8k, just above the range;
+  - 1w +17% to +27%: +50%, far above the range;
+  - 8w +2% to +8%: +29%, above the range;
+  - 32/64w 0% to +6%: met.
+- Tests (65 pass, clippy --all-targets clean): driver and flag parsing; the poll driver parks until a waker on another thread fires; the profiler off reads no clock and counts nothing; the receipt records the harness and a pre-H receipt has none.
+- Retry condition: the coordinator's decision on the A/A miss. If H lands, every lane's F/C baseline moves, and reports before it are not comparable (the receipt enforces that).
+
+## 2026-11-15 - REJECTED on its kill lines (four versions): a GROUP BY over a table scan aggregates each row into its group through a hash table and sorts the groups, not the rows (bd-w4pr1.13.8, lever H1)
+
+- Target: the GROUP BY rows that sort every input row. `GROUP BY a` with sum(c) (x1.55-1.62 stock
+  CPU) and `GROUP BY id % 100000` (x1.80-1.86) have distinct records, which G3 declines;
+  group_by_1000_groups and GROUP BY a % 10 collect G3 runs (x0.88-0.97). Callgrind of the first
+  (serial): 3,876.2M Ir, SorterCursor::sort 422.7M (the pair quicksort 338.3M), pass 2's sorter
+  Column reads 490.0M inclusive, SorterInsert 125.0M self plus its record decode; perf (round 3):
+  the permutation 30.5% and its quicksort 5.5-7.6% of the cycles; peak RSS ~140 MB against
+  stock's 8.4 MB. Touched (not landed): crates/fsqlite-types/src/opcode.rs (HashAggOpen /
+  HashAggGroup / HashAggSort / HashAggNext / HashAggAdopt, 202-206),
+  crates/fsqlite-func/src/{aggregate.rs,agg_builtins.rs} (`AggregateFunction::step_is_pure`, true
+  for the built-in count, sum, total, avg, min, max), crates/fsqlite-vdbe/src/{lib.rs,engine.rs,
+  codegen.rs} (HashGroupTable, codegen_select_group_by_aggregate), and a stock-oracle keeper in
+  crates/fsqlite-core/tests/bd_w4pr1_13_1_sync_lane_boundary_oracle.rs.
+- Ledger preflight: INDEX "Narrow aggregate lanes" (names hash aggregation as a different
+  change); G3 and G4 (kept); S1 (REJECTED; its retry condition names this lever); 2026-11-10
+  bd-w4pr1.13.3 (pair sort; kept). No entry on hash grouping.
+- Design common to all versions: for a plain table scan with no HAVING, no bare column, and only
+  those six aggregates (one argument, DISTINCT allowed, no FILTER), HashAggGroup runs after the
+  WHERE and the key / argument registers. It finds or creates the row's group (keys hashed so that
+  1 = 1.0 and -0.0 = 0.0 hash alike, equal as the sorter's comparator finds them) and swaps that
+  group's accumulator contexts into the AggStep slots, so the unchanged AggStep steps them in scan
+  order. HashAggSort orders the groups with compare_sorter_rows and the existing AggFinal / Copy /
+  OFFSET / ResultRow / LIMIT code emits them. A REAL key keeps its group's latest row's spelling,
+  as the sorted plan's previous-key registers do. HashAggOpen hashes only when every resolved
+  aggregate's step is pure: steps run during the scan instead of after the sort, and sum reports
+  its overflow at finalize, in output order. The sorted plan stays in the program as the fallback.
+- Pre-registered on bd-w4pr1.13.8 before each version's code (15:59Z, 18:03Z, 18:28Z, 19:03Z), each
+  version with its own kill lines; all versions: GROUP BY a with sum(c) CPU at least 100 ms lower
+  in each of two runs, group_by_1000_groups (v2 on) at least 30 ms lower, a unique-key guard
+  (GROUP BY id) and GROUP BY id % 100000 within a few percent, other read rows within 0.3% Ir.
+- Method: thinkstation1, 64 CPUs, governor powersave, io_uring refused, serial parallel_workers=1
+  on every arm, stock sqlite3 3.46.1 live in the same par_probe run, reps 5, answers equal
+  everywhere. v1 and v2 against base feac15bd3 (5bbc8a36c34eebfb); v3 and v4 against origin/main
+  72b5ee69e (7a8fee4aaab39f19), both arms built there.
+- v1 (sha256 0c29361d3deacd08): past the sorter's 100 MiB budget the table froze (kept its groups,
+  sent new keys to the sorter, inserted its groups as records at the end). Repeating-group rows
+  x0.58-0.61 stock; GROUP BY id % 100000 2,852.0M -> 1,640.8M Ir but cache-bound (perf: the index
+  probe's key compare 22.6% and the context swap 9.4% of the cycles); GROUP BY id (1M distinct keys)
+  5,292.0M -> 7,315.4M Ir (+38%), 1,049.6 -> 1,441.9 ms, ~325 MB RSS: the frozen groups entered
+  the sorter after every later row, turning the integer-key permutation, the identity for
+  rowid-ordered input, into a rotation (22% of the cycles). Killed on the guard.
+- v2: a check at 4,096 rows and every doubling (groups * 2 > rows stops the table); a stop hands
+  every group to the sorter as a record before any later row, every later row of any key follows,
+  and pass 2 adopts a group's contexts at its first row (the sort is stable, so the record comes
+  first); AggregateContext's DISTINCT set behind a Box (72 -> 32 bytes). Repeating-group rows
+  x0.56-0.61; GROUP BY id % 100000 +11.9% Ir, GROUP BY id +16.6%: the sorted fallback paid per row
+  for the record's extra NULL group column (MakeRecord, the sorter insert, pass 2's sorter Column
+  decode 69M -> 109M), a Null and HashAggGroup's test (+341M on id % 100000 under callgrind).
+- v3: rows' records at their own width (pass 2 reads the group column, NULL past a shorter record);
+  the first 4,096 rows go to the sorter as well (HashAggSkip), so a stop at that check drops the
+  groups instead of handing them over; a hand-off register makes pass 2's group-start check one
+  test. Repeating-group rows x0.57-0.60; id % 100000 +3.96%, GROUP BY id +3.27%; scan_filter_agg,
+  which runs no H1 code, 1,271.2M -> 1,276.7M (+0.43%). Killed on the other-rows line.
+- v4 (sha256 268dbc5466a43a84): v3 with the first rows' records inserted by HashAggGroup itself (no
+  HashAggSkip arm). group_by_1000_groups 2,454.3M -> 1,401.9M Ir, CPU 200.3 -> 118.2 ms (x0.96 ->
+  x0.57 stock); GROUP BY a with sum(c) 3,872.9M -> 1,777.0M, 406.9 -> 153.8 ms (x1.55 -> x0.59);
+  GROUP BY a % 10 2,559.1M -> 1,513.2M, 208.0 -> 119.4 ms (x0.97 -> x0.56); GROUP BY id % 100000
+  2,852.1M -> 2,973.7M (+4.26%); GROUP BY id 5,292.0M -> 5,466.8M (+3.30%); scan_filter_agg
+  -0.39%; order_by_text_limit10 1,649.2M -> 1,671.2M (+1.33%); window rows -0.2 to -0.3%. Killed
+  on id % 100000 (+4.26% against 4%) and on order_by_text_limit10 (+1.33% against 0.3%).
+- Measurement trap (an addition to W3's): adding or reshaping one arm of
+  try_execute_hot_opcode_sync moved the instruction counts of read rows that run none of the
+  change by -0.4% to +1.3% across these versions (v1: one arm, scan_filter_agg +0.08%; v3: two
+  arms, +0.43%; v4: one arm with a different callee signature, scan_filter_agg -0.39% and
+  order_by_text_limit10 +1.33%). A 0.3% other-rows Ir line cannot be met by a lever that touches
+  that match without measuring a no-op arm first.
+- Correctness evidence (rch): clippy -D warnings fsqlite-types / func / vdbe --all-targets clean on
+  v1 and v4 (v3 needed an allow on the boxed DISTINCT set, box_collection); fsqlite-vdbe lib
+  1,256 passed / 1 failed on v1 (bd-bhalc's known red), goldens 8/8 unchanged (their GROUP BYs have
+  a HAVING or stream from an index); fsqlite-func lib 534/0, fsqlite-types lib 592/0; the keeper
+  file 4/4 on v1 with `hash_grouped_aggregates_match_sqlite_on_a_strict_file_database` (30,000
+  rows on a strict file database, 17 statements against stock: output order with no ORDER BY,
+  REAL / TEXT / BLOB / mixed-type / NULL keys, REAL sums and avg in scan order, DISTINCT, LIMIT /
+  OFFSET, an empty input, collated min / max, an integer sum that overflows in one group failing
+  as stock does and a LIMIT before that group returning its rows; 8 shapes on other routes compared
+  with strict off); the vdbe unit tests of each version (the hash plan against the sorted plan
+  under test-only memory budgets and first-check sizes, a hand-off after the first rows with keys
+  spelled 3 / 3.0 on both sides, a stop at the first check, an application aggregate named sum
+  that must decline) passed on v2 and v3. The full gate was not run on any version.
+- Found on the way (pre-existing, not filed): the VDBE sorted GROUP BY prints the latest row's
+  spelling of a key whose group mixes 3 and 3.0 (or 0 / -0.0, 5.0 / 5); stock 3.46.1 prints the
+  first row's (VALUES (3),(3.0) -> stock 3, fsqlite 3.0). The connection's grouped evaluator
+  matches stock. H1 kept the sorted plan's behaviour.
+- Verdict: REJECTED, all four versions, on their kill lines; nothing landed. The few-group gain is
+  large and measured (x0.56-0.60 stock CPU from x0.94-1.58, -41 to -54% Ir, RSS ~140 -> ~32 MB on
+  GROUP BY a with sum(c)); what killed it is the per-row cost of the sorted fallback for unique and
+  many-group keys (3-4% from v3 on) and the synchronous lane's layout on other rows.
+- Retry condition: a version whose fallback costs nothing per row: the hash plan and the sorted plan
+  as two program regions, HashAggGroup leaving the hash region for the sorted one with one jump
+  when the table stops instead of a test on every later row, or a plan chosen before the scan from
+  a distinct-count statistic; with its other-rows Ir and cycles line set after measuring a no-op
+  arm in try_execute_hot_opcode_sync. The v4 diff is kept in the round-4 lane scratchpad
+  (`rl4/h1_v4_full.patch`; local branch `rl4-h1-wip` in clone perf2-wt2). For many-group keys
+  (id % 100000: v1 took 42% of its instructions but kept most of its cycles), the table also needs
+  INTEGER keys inside the index entry and contexts stepped in place rather than swapped.
+
+## 2026-11-15 - WIN (probe not met; also a correctness fix): an EXISTS probe without a LIMIT stops at its first row (bd-b887p)
+
+- Target: `count(*) FROM t WHERE a = 5 AND EXISTS (SELECT 1 FROM p WHERE w = 3)` (201x stock):
+  the fold of an uncorrelated EXISTS ran its subquery to the end, and evaluated rows stock never
+  reaches (a later row raising an error failed the statement). Touched:
+  crates/fsqlite-core/src/connection.rs (Connection::limit_exists_probe_to_its_first_row, the
+  bd-8c68u rule, used by the per-row probe, the join evaluator's probe and both folds).
+- Result (2a3f8563c; scratchpad exo_ab.py, stock live, answers equal; ELF before
+  ea1aec8d7519ec2a, after 4b3b5f58113e4925; thinkstation1): 201.4x -> 21.4x; other rows
+  unchanged. The 3x probe is missed by the folded `a = 5 AND 1`: the constant conjunct counts as a
+  residual and moves the COUNT(*) off its index (2,803k against 130k for `a = 5`).
+- Retry condition: drop constant TRUE conjuncts after the fold (follow-up on bd-b887p). Done in
+  19c186739: rewrite_subqueries drops non-zero integer literal WHERE conjuncts after folding;
+  the row went 21.3x -> 2.6x stock (ELF 4b3b5f58113e4925 -> 6b73b23b3b8c6892, exo_ab.py, stock
+  live), meeting the probe; bd-b887p closed.
+
+## 2026-11-15 - MEASURED WIN, NOT LANDED (an existing test pins the read-back's per-page reads): the checkpoint read-back reads its pages and their WAL sources in runs (bd-w4pr1.13.20, lever N2)
+
+- Target: the autocheckpoint after a large commit (`delete_14pct_300k`, `update_10pct_300k`,
+  `bulk_insert_1M_one_txn`). Touched (not landed): `crates/fsqlite-wal/src/checkpoint_executor_impl.rs`
+  (`verify_checkpoint_pages_via_target`, `checkpoint_read_back_run`, `read_checkpoint_frame_run`, and
+  `CheckpointTarget::read_pages_if_supported` with a page-by-page default), `crates/fsqlite-pager/src/traits.rs`
+  (`CheckpointPageWriter::read_pages_if_supported`, the same default), `crates/fsqlite-pager/src/pager.rs`
+  (`SimplePagerCheckpointWriter::read_pages_if_supported`, one read), `crates/fsqlite-core/src/wal_adapter.rs` (the
+  method forwarded in `CheckpointTargetAdapterRef` and `CheckpointResetTarget`, nothing else).
+- Evidence before (bd-w4pr1.13.20, 2026-11-15 10:3xZ): commit + autocheckpoint of the DELETE is 53.8 ms task-clock
+  against stock's 13.6 ms, three quarters of it kernel time, and the checkpoint makes six page-sized I/Os a frame
+  against stock's two (a 4 KiB pread64 from the page cache costs 1.1-2.3 us of CPU on this VM). The read-back that
+  guards publication and reset (bd-yfdb6, once since E1) read each database page and its WAL frame on their own:
+  4,520 pread64 calls for the DELETE, 1.4k user instructions a db read and 0.83k a WAL read before the kernel.
+- Ledger preflight: E1 (one read-back per publication path; this keeps it), lever B (rejected on CPU: retaining the
+  window; this keeps no window), lever D (the certificate re-hash; untouched), the 2026-11-12 batched-header rejection
+  (bd-w4pr1.8 lever 1: batching only pays when the bytes are not read again).
+- Change: the read-back walks the expected pages in runs whose pages and frames are both consecutive, at most 64 KiB
+  of WAL bytes a run (as validation reads; within the VFS's inline-I/O bound, so no blocking-pool hop): one database
+  read and one WAL read a run. Every check stays per page and in the same order: a short database read, the frame's
+  page number, salts and validated XXH3-128 digest (WalCorrupt when the source changed after its write), the page-1
+  patch receipt, the byte compare (DatabaseCorrupt with the first bad page). A target without read-back still skips
+  verification. The backfill's per-frame re-read right before each write is not batched:
+  `checkpoint_integrity_copy_pass_is_bound_to_validated_source_bytes` pins that a source changed after the previous
+  page's write is refused before its own write.
+- Prediction (on bd-w4pr1.13.20 before code, against base + N1): delete pread64 -4,200 +-100, instructions -3M to
+  -6M, task-clock min -2 to -4 ms; update the same; bulk about -14,000 preads, -10M to -18M instructions, -6 to -12 ms;
+  memory_script unchanged. Kill: preads down by fewer than 3,500, instructions down by less than 2M, or task-clock min
+  up.
+- Result, stock sqlite3 3.46.1 live in the same runs (binaries on 593e3aca1: main + lever M b7a19401..., + N2
+  c169540b...; thinkstation1, governor powersave, load 5.3-5.4, io_uring refused, `scratchpad/r5_ab.sh` of the
+  bulk-write lane, 9 reps interleaved): `delete_14pct_300k` pread64 WAL 9,382 -> 7,274 and db 4,549 -> 2,444 (-4,213,
+  met), instructions 364.2M -> 358.8M (-5.4M, met; 3.02x -> 2.97x stock 120.7M), task-clock min 110.2 -> 99.8 ms and
+  median 112.6 -> 105.6 ms (stock 45.1 / 47.0; missed high, beyond the range; kernel cycles -19.1M, user cycles
+  -6.8M); `update_10pct_300k` -5.4M (563.5M -> 558.1M, 2.06x -> 2.04x), task-clock min -4.7 ms, preads -4,208;
+  `bulk_insert_1M_one_txn` 7,062.2M -> 7,032.8M (-29.4M, beyond; 1.69x -> 1.68x), task-clock min -1.1 ms and median
+  -5.9 ms (the min missed low), kernel cycles -43.5M; `memory_script_200k` 3,550.0M -> 3,549.9M (unchanged, as
+  predicted). Callgrind of the DELETE's commit + autocheckpoint 96,755,389 -> 91,876,740 (-4.88M; measured on top of
+  the rejected N1 it was -4.87M, so the two do not interact; that first measurement, task-clock min -9.6 ms, is on
+  bd-w4pr1.13.20). Answers equal stock's; stock integrity_check ok; bd-73pfl stress (`mw_conflict.py explicit-same 8
+  300 10 5000`) 0/10 integrity failures, every lost row a refused COMMIT with its error line, as on main.
+- Tests: fsqlite-wal `test_checkpoint_readback_runs_follow_consecutive_pages_and_frames` (40 frames read back in runs
+  of 15, 15 and 10; a page rewritten by a later frame splits the runs; consecutive frames of non-consecutive pages are
+  two runs, each read where it lies), `test_checkpoint_readback_refuses_a_source_changed_inside_a_run` (the middle
+  frame of a three-frame run changed after its write: WalCorrupt),
+  `test_checkpoint_readback_reports_the_first_bad_page_inside_a_run` (a database page corrupted inside a run, and a
+  file that ends inside a run, each report their own page); fsqlite-pager
+  `test_checkpoint_read_pages_reads_a_run_in_one_read` (one read for three pages, a run past the end returns the bytes
+  that exist, a buffer that is not whole pages is refused).
+- Gate (rch, on origin/main 5cf0db4d5 + M + N2): clippy -D warnings on fsqlite-vdbe, fsqlite-pager and fsqlite-wal
+  with all targets and on fsqlite-core --lib clean; fsqlite-wal lib 1,177 pass and 1 fail:
+  `test_all_checkpoint_modes_refuse_backfill_publication_on_mismatch` asserts `read_pages == [2]` and gets [2, 3]. Its
+  window is pages 2 and 3 from consecutive frames with page 2 corrupted at the last sync; N2 reads the whole run
+  before it compares, so it reads page 3 before it reports page 2. Publication and reset were still refused and the
+  WAL left intact, but the test pins that the read-back reads only up to the first bad page, and changing that line
+  is not the lane's call. Not landed; the code is clone stash "bulk-write r5 lever N2 v1" of the bulk-write lane,
+  patch `scratchpad/r5_N2_v1.patch` (sha256 5b6158601e368bdc). The rest of the gate was not run.
+- Retry condition: (a) N2', the WAL source reads batched alone (one WAL read a run, taken after the run's first
+  database page is read; the database reads stay page by page in order, so that test holds as written; fsqlite-wal
+  only, no trait method), predicted at about half of N2's syscall saving (-2,108 WAL preads on the delete row); or
+  (b) N2 as measured once the owner decides the read-back may read a run of at most 64 KiB before it reports its
+  first bad page.
+- Widen: the checkpoint still reads each frame three times (validation, the backfill's re-read, the read-back) and
+  each database page once, against stock's one WAL read: what is left is the price of the 128-bit binding of the
+  written bytes to the validated ones and of the post-sync read-back (bd-yfdb6). Batching the backfill's re-reads or
+  its pwrite64 calls the same way is not open as is: either one re-reads frame k+1 before page k is written, which
+  `checkpoint_integrity_copy_pass_is_bound_to_validated_source_bytes` refuses. The larger CPU piece of the commit +
+  autocheckpoint is now the commit's: per-page copies in build_group_commit_batch and the cache drain, and a 9.3 MB
+  coalesced WAL write buffer handed to a fresh blocking thread (the single-writer lane's code; ~5,000 page faults,
+  ~13 ms on the delete row).
+
+## 2026-11-15 - REJECTED on its CPU kill line (syscall and instruction arms met): a checkpoint pass reads a page's old bytes before writing it only until its first real write (bd-w4pr1.13.20, lever N1)
+
+- Target: the autocheckpoint after a large commit (`delete_14pct_300k`, `update_10pct_300k`,
+  `bulk_insert_1M_one_txn`). Touched (not landed; it was in the tree of lever N2's first measurement and removed before
+  N2's gate): `crates/fsqlite-pager/src/pager.rs` (`SimplePagerCheckpointWriter::write_page`, a test VFS that logs
+  main-file read and write offsets, and `test_checkpoint_compare_before_write_stops_at_the_first_changed_page`).
+- Evidence before: the N2 entry's; one of the checkpoint's six page I/Os a frame is GH#294's compare-before-write
+  pread64 of the old page (2,260 for the DELETE, each with a zeroed 4 KiB buffer).
+- Ledger preflight: E2 (2026-11-12: skipping that read for frames past the backfilled prefix is not sound, recovery
+  zeroes nBackfill so such frames can be revisits); the GH#294 compat keepers; lever B.
+- Change: the compare ran until the pass's first real write (`dirty`) and always for page 1. A pass that finds every
+  frame already backfilled still wrote nothing, which is what GH#294 needs; a pass that has written a changed page has
+  moved the file's timestamps and re-stamps the header anyway. Its one cost: a pass mixing already-backfilled frames
+  with new ones rewrites the identical pages after its first changed page.
+- Prediction (on bd-w4pr1.13.20 before code): delete db pread64 -2,259, instructions -1.5M to -2.5M, task-clock min
+  -3 to -5 ms; update the same; bulk about -7,500 preads, -5M to -8M, -10 to -15 ms. Kill: preads down by fewer than
+  2,200, or the delete row's task-clock min (9 interleaved reps) down by less than 1.5 ms, or instructions up.
+- Result, stock live in the same runs (binaries on 593e3aca1: main + lever M b7a19401..., + N1 98ff3332...;
+  thinkstation1, governor powersave, io_uring refused, `scratchpad/r5_ab.sh`): delete db pread64 4,550 -> 2,293
+  (-2,257, met), instructions 364.2M -> 360.9M (-3.3M, beyond the range), kernel cycles min -7.1M, task-clock min
+  109.5 -> 109.8 ms (+0.3) at load 5.8: killed. An earlier 9-rep run at load 3.4 gave 112.2 -> 109.9 ms (-2.3); the
+  18 reps pooled still give +0.3 on the min. update -3.5M and -3.6 ms; bulk -24.0M and -1.5 ms; callgrind of the
+  DELETE's commit + autocheckpoint 96,755,389 -> 84,877,971 (most of it calloc's rep stosb). Answers equal stock's;
+  stock integrity_check ok; bd-73pfl stress 0/10 integrity failures. A removed pread is real kernel work (-7 to -10M
+  kernel cycles), but at this host's load about 2 ms on 110 ms is not resolvable by a 9-rep min.
+- Gate (partial, before it was rejected): fsqlite-pager lib `checkpoint` filter 36 pass with the new test; clippy -D
+  warnings on fsqlite-vdbe, fsqlite-pager and fsqlite-wal with all targets clean on origin/main 5cf0db4d5 + M + N1 +
+  N2. The code is not kept: in `write_page`, `let compare = !self.dirty || page_no == PageNumber::ONE;` and the
+  compare read and its zeroed buffer only when `compare` holds; the test is described above.
+- Retry condition: with a CPU protocol that resolves 1.5 ms on this row (a quiet host, or 21+ interleaved reps with a
+  pre-registered paired statistic), or folded into a change that removes the checkpoint's other own-commit page reads
+  (the backfill re-read with a cheap retained window, or the certificate re-hash of lever D) under one joint kill line.
+
+## 2026-11-15 - SMALL WIN (prediction missed, cost model refuted): an EXISTS opens its subquery table only where it reads a row (bd-tx55u)
+
+- Target: `SELECT id FROM t WHERE EXISTS (SELECT 1 FROM p WHERE p.tid = t.id) AND t.a = 5` (7.8x
+  stock, 28.5k instructions per outer row). emit_exists_subquery opened (and closed) the subquery
+  table's cursor on every evaluation, though a residual-free index probe reads only the index and
+  the once-materialized path never closed it. Touched: crates/fsqlite-vdbe/src/codegen.rs.
+- Result (f9b601677; scratchpad exo_ab.py, stock live, answers equal; ELF before
+  ea1aec8d7519ec2a, after d717a5598182c86b; thinkstation1): 8.2x -> 7.9x; NOT EXISTS count
+  12.6x -> 12.3x. Predicted about 21k per outer row (-7k); measured about -0.9k. Refuted: an
+  OpenRead/Close pair is not ~7k here; that figure came from the rowid-probe difference, which
+  the SeekRowid dominates.
+- Retry condition: opening the index cursor once per statement (Once) buys at most another ~1k
+  per row; not as a standalone patch. The cost is the per-row index seek (bd-05xlf's lane).
+
+## 2026-11-15 - MEASURED WIN, NOT LANDED (gated on its base; the landing base moved under it): a WAL frame-cache hit hands the transaction the cached image instead of two copies (bd-05xlf, read/seek round 5, lever P1 v6)
+
+- Target: every first read of a page in a transaction that the WAL frame cache answers. Measured
+  on the prepared secondary-key lookup of bd-05xlf (`SELECT id FROM t WHERE a = ?1`,
+  prepared-dml-probe select-index, its four fetches per execution all frame-cache hits on the WAL
+  the load leaves), with the CLI read sweep for the miss-heavy and point rows. Such a fetch copied
+  the page twice: `WalFramePageCache::get` returned `bytes.to_vec()`, and the transaction read
+  cache's clone of that Owned page built an Arc copy; it also went through two boxed futures.
+- Touched: `crates/fsqlite-pager/src/traits.rs` (`WalPageImage`; `read_page_pinned` and
+  `read_page_pinned_without_io` answer it), `crates/fsqlite-pager/src/pager.rs` (`WalPageLookup`
+  carries it; the WAL-hit arm of `get_nonresident_page` keeps a shared image),
+  `crates/fsqlite-core/src/wal_adapter.rs` (the frame cache hands out its `Arc<[u8]>`; a committed
+  frame read from the file is cached and returned as that Arc; the without-I/O answer covers a
+  kept committed frame), three pager and two core test doubles, the adapter unit test and two
+  keepers in `crates/fsqlite-core/tests/cache_staleness_cross_txn_regression.rs`.
+- Ledger preflight: the 2026-11-15 P1 entry (rejected after four versions on rowid_lookups_200k
+  and range_noncovering_200k) and its retry condition: share on a hit without widening what a miss
+  moves. This version is the frame-cache-only variant that entry listed as untested, with the
+  lookup's answer kept at its old width: `Option<WalPageImage>` (Owned(Vec) or Shared(Arc<[u8]>))
+  is 24 bytes, as `Option<Vec<u8>>` was, where P1 v2-v5 moved a 48-byte `PageData`. The main page
+  cache's hit (`get_copy`) and every miss path are unchanged.
+- Result. thinkstation1, governor powersave, load 2.5 to 2.7, io_uring refused. main = origin/main
+  dbac12d40 (code-identical to 5cf0db4d5), CLI 7cfef3adb7de9a85 / probe 11421d122f9c03f8; v6 = the
+  same tree plus this change, CLI ba6d36a87c33f349 / probe 226bbbd5f523d511, both built from that
+  tree. Stock live in the same runs: sqlite3 3.46.1 (5a910e452929c124) for the sweep, the 3.54.1
+  amalgamation driver of the same prepared loop (9500dcc51bdca47c) for the probe. Every arm reads
+  files its own binary built; answers equal.
+
+  | row | stock | main | v6 |
+  |---|---|---|---|
+  | prepared select-index (WAL), instructions per execution | 5,058 | 78,001 (15.4x) | 69,269 (13.7x) |
+  | same, user cycles / CPU per execution | 3.8k / 3.82 us | 69.3k / 27.61 us | 61.9k / 24.79 us |
+  | select-index, checkpointed (control) | 5,058 | 75,452 | 75,619 |
+  | select-rowid (control) | 4,725 | 8,139 | 8,129 |
+  | autocommit INSERT (write control) | - | 141,424 | 141,435 |
+  | point_rowid_2000 | 44.0M | 181.8M (4.13x) | 178.5M (4.06x) |
+  | point_hot_2000 (2,000 cache-hit point SELECTs) | 42.8M | 171.6M (4.01x) | 167.8M (3.92x) |
+  | point_sec_key_2000 | 67.4M | 269.4M | 266.7M |
+  | orderby_page_500x20 / multicol_eq_1000 | 60.7M / 60.2M | 304.5M / 398.2M | 304.0M / 396.5M |
+  | rowid_lookups_200k | 554.4M | 2,684.9M | 2,689.2M (+0.16%) |
+  | range_noncovering_200k | 637.6M | 3,340.4M | 3,344.9M (+0.13%) |
+
+  The two miss rows again over 9 interleaved reps at load 8.6: the same instruction counts; user
+  cycles +1.2% and -0.8%, CPU +0.2% and -6.8%, inside run-to-run noise.
+- Prediction (bd-05xlf, before code): select-index 68.5k to 71.0k (inside), cycles -4% to -10%
+  (-10.7%, just beyond), CPU -0.5 to -2.5 us (-2.8 us, just beyond); checkpointed within 0.5k,
+  select-rowid within 0.15k, INSERT within 1.0% (all inside); point_rowid_2000 -1.5% to -4.5%
+  (-1.8%, inside); point_hot_2000 -6% to +0.3% (-2.2%, inside); the miss rows within 0.1%: MISSED
+  (+0.16%, +0.13%). Kill (miss rows worse than 0.2%, select-index under -5.0k, and the controls):
+  not crossed.
+- Why the miss rows still pay (callgrind of rowid_lookups_200k on both binaries, 188,566 WAL
+  lookups that find no frame): `read_page_pinned_without_io` costs 75.7 Ir a call against 60.7. On
+  main the adapter's answer was inlined into the path-refreshing wrapper; with its frame-cache arm
+  it is a call of its own. `get_nonresident_page`'s own code adds about 8 Ir a call; the file read
+  (`read_page_copy_outside_wal`) is unchanged.
+- Keeper: two stock-oracle tests in cache_staleness_cross_txn_regression (WAL file, checkpointed
+  file): a reader keeps the images it fetched while a peer commits newer frames and sees them at
+  its next begin; a write through a shared image rolls back to the committed bytes; after the
+  peer's wal_checkpoint(TRUNCATE), commits reuse the frame indexes of images the reader's frame
+  cache holds and the reader sees the new images. The adapter unit test checks that a kept
+  committed frame is answered as the cache's own image (`Arc::ptr_eq`) and that a newer frame of
+  the same page is not answered until it is kept.
+- Gate (rch, the measured tree 5cf0db4d5 + this change): clippy -D warnings on fsqlite-pager and
+  fsqlite-core, all targets: clean. fsqlite-pager --lib 1,113 passed, 1 failed
+  (`bd_2jpu6_2_dirty_eviction_runs_in_parent_asupersync_region`, red on main, bd-mcpbv; this run
+  was on the tree that also carried L5, below, which touches no pager file). fsqlite-core --lib
+  with the savepoint / trigger / peer / staleness and prepared-statement / schema-change keepers
+  (the new keepers included): 4,340 passed, 3 failed: the t6741 pair (bd-nouem) and
+  `gh528_truncated_shm_first_attacher::explicit_read_only_recovery_handles_a_truncated_shm_beside_a_frameless_wal`
+  ("empty WAL: BusyRecovery", the bd-j2dtf read-only-open family; it fails the same way, at the
+  same line, on 5cf0db4d5 without this change, rch hz2). The join / seek and seek-key keepers with
+  the cross-process battery (`bulk_import_upsert_text_pk_phantom_pk`, gh534,
+  `bd_ih8ak_flush_floor_after_peer_growth`, gh524, strict_multi_process): 243 passed, 1 failed
+  (bd_8c68u's compile count, bd-f8m1v). fsqlite-e2e `split_claim_cross_process_e2e`,
+  `refused_commit_ends_transaction_e2e`, gh364 and nine concurrent-writer targets: 90 passed.
+  `multiprocess_autocommit_busy_timeout_e2e --test-threads=1`: 8 passed. The fsqlite
+  aggregate / min / max / range oracles (43 targets) and WAL-reader keepers: 78 passed, 1 failed
+  (`gh528_readonly_truncated_shm::compat_read_only_open_rebuilds_a_three_byte_shm`, red on main,
+  bd-j2dtf). Not run: btree and vdbe --lib (not touched).
+- Not landed. While the gate ran, origin/main moved to e1343d313, which changes
+  `wal_adapter.rs` and `connection.rs` (bd-reality-check-1022-llk6g.5.6's header-less WAL binding,
+  other hunks than this change's) and the VDBE row path. To land: rebase the patch (coordinator
+  scratchpad `rs5/p1v6_final_on_5cf0db4d5.patch`, measured diff e0f1ac6ecfec6148) onto the
+  landing tree, rebuild both arms there and repeat the A/B rows above, and re-run the core
+  keepers, the cross-process battery, the e2e set and the WAL-reader keepers on that exact tree.
+- Retry / next: (1) keep the no-frame answer inlinable (the frame-cache arm in a function of its
+  own) to take back the miss rows' 15 Ir a lookup; a new version with its own prediction. (2) The
+  main page cache's hit still copies twice (checkpointed lookup 75.6k); sharing it is what v2-v5
+  lost on, so it needs a probe that answers a miss without a PageData-sized value, not another
+  variant of that patch.
+
+## 2026-11-15 - REJECTED on its control kill line: a literal SELECT of aggregates or columns over ANDed integer keys runs parameterized (bd-w4pr1.13.18, read/seek round 5, lever L5)
+
+- Target: multicol_eq_1000 of the read sweep (`SELECT count(*), sum(val) FROM s WHERE g = <int>
+  AND h = <int>`, 1,000 distinct literal pairs, each its own autocommit statement through the CLI;
+  index s_gh(g, h) on the 500k-row table s): 398M user instructions against stock's 60.2M (6.6x).
+  Callgrind on main d8f44c18f, (300 minus 100 statements) / 200: 400.6k Ir a statement, of which
+  the parse 33.0k and the compile 52.9k. L2's entry named this widening.
+- Touched (never committed; coordinator scratchpad `rs5/l5/` and
+  `rs5/p1v6_plus_l5v1_combined.patch`): `crates/fsqlite-core/src/connection/literal_params.rs` (a
+  result column may be `count(*)` or count / sum / total / avg / min / max of one column;
+  `AND k = int` terms; `key_columns: Vec<String>` for `key_column: Option<String>`; the lexer
+  reference matcher, the agreement test and the refusal list),
+  `crates/fsqlite-core/src/connection.rs` (`literal_statement_may_run_parameterized` over every
+  key), the keeper in `crates/fsqlite-core/tests/bd_5310l_literal_parameterization_oracle.rs`.
+- Ledger preflight: L2 (2026-11-15) and bd-5310l's entries. EXPLAIN QUERY PLAN of the literal and
+  `?1`/`?2` forms is the same on fsqlite and stock (SEARCH s USING INDEX s_gh (g=? AND h=?)).
+- Result. thinkstation1, governor powersave, load about 4, io_uring refused, stock sqlite3 3.46.1
+  live, answers equal. Base = 5cf0db4d5 + P1 v6 (CLI ba6d36a87c33f349); L5 = that + this change
+  (CLI aec75fb51f978c22).
+
+  | row | stock | base | L5 |
+  |---|---|---|---|
+  | multicol_eq_1000, instructions | 60.2M | 396.7M (6.59x) | 297.6M (4.95x), -99k a statement |
+  | multicol_eq_1000, CPU | 27.0 ms | 144.8 ms | 109.1 ms |
+  | point_hot_2000, own databases, 9 reps (min / median) | 42.8M | 167.7M / 167.8M | 168.6M / 168.9M (+0.54% / +0.66%) |
+  | point_hot_2000, per-arm copies of one file, 9 reps | 42.8M | 165.9M / 166.1M | 165.9M / 166.4M |
+  | point_sec_key_2000, per-arm copies of one file, 9 reps | 67.4M | 263.5M / 264.5M | 264.6M / 265.1M (+0.42% / +0.23%) |
+  | point_rowid_2000, per-arm copies, 9 reps | 44.0M | 175.8M | 176.2M (+0.23%) |
+  | rowid_lookups_200k / autocommit INSERT | 554.4M / - | 2,689.2M / 141,386 | 2,689.2M / 141,392 |
+
+- Prediction (bd-w4pr1.13.18, before code): multicol_eq_1000 -60k to -95k a statement (-99k:
+  beyond the range, better), CPU -20 to -40 ms (-35.7 ms, inside); point_hot_2000,
+  point_rowid_2000 and point_sec_key_2000 within 0.3%: point_hot_2000 crossed on the prescribed
+  method (+0.54% min), and on the cleaner per-arm copies point_sec_key_2000 crossed by min
+  (+0.42%); rowid_lookups_200k and INSERT inside. Kill (a control outside its band): crossed.
+  REJECTED.
+- Measurement trap: fsqlite builds of the sweep database are not byte-identical, and one binary
+  reads two builds (or a build and its copy) up to 1.5% apart on point_hot_2000. For a control band
+  under about 0.5%, measure the arms on per-arm copies of one source file, and set the band from an
+  A/A of that method.
+- Why the controls pay: for the shapes the recognizer already took (one key), `key_columns` is a
+  Vec (one more allocation a statement), plus the result-column peek and the AND check after the
+  last key: about 100-200 Ir on statements of 83k-133k.
+- Retry condition: single-key shapes allocation-free (an inline key list, or the one-key Option
+  kept and a list only past the first AND), the controls predicted with a band the method
+  resolves (A/A first), measured on per-arm copies of one file. The gain to keep:
+  multicol_eq_1000 -99k a statement, 6.6x -> 4.95x stock.
+
+## 2026-11-15 - WIN: a composite IN probe takes a second IN list or a range on the next key term (bd-5i6zm)
+
+- Target: `a IN (3, 77, 500) AND b IN (3, 4)` (36.6x stock) and `a IN (..) AND b BETWEEN ..`
+  (37.0x) fell from bd-hyoms's composite probe (one IN term) to the one-field IN walk over t_a with
+  a row lookup per entry; `a IN (3, 77) AND b > 50` (11.0x) also returned another row order.
+  Touched: crates/fsqlite-vdbe/src/codegen.rs (KeyPin::In cross product capped at 64 combinations,
+  a k-field probe sorter in key order and direction with field-wise dedup; ProbeRange bounding each
+  run in emit_index_prefix_rows; covered outputs in codegen_select_index_in_const_scan).
+- Result (241704b25; scratchpad inr_ab.py, stock live, rows compared in order; ELF before
+  ea1aec8d7519ec2a, after 54681a63331e9f21; thinkstation1): 35.6x -> 1.8x, 37.2x -> 1.7x,
+  36.1x -> 2.0x, 10.8x -> 3.1x, with stock's row order; bd-hyoms rows 2.0x -> 1.5x and 1.8x ->
+  1.3x (answered from the index), the rest unchanged.
+- Retry condition: none (kept). Not taken here: a range on a DESC or non-BINARY key term, and a
+  cross product past 64 combinations, which keep the one-field probe.
+
+## 2026-11-15 - WIN (probe not met): COUNT(*) WHERE col IN (<integer literals>) counts each member's run from the b-tree (bd-qyd3s)
+
+- Target: `SELECT count(*) FROM t WHERE a IN (3, 77, 500)` (3.2x stock): the aggregate integer IN
+  seek stepped every entry of each member's run with an AggStep. Touched:
+  crates/fsqlite-vdbe/src/codegen.rs (CountIndexRange::Members from index_integer_in_list_target;
+  codegen_select_count_star_index_range counts a list of runs, SeekGE + IdxCountBefore + Add per
+  member; one run emits the old program).
+- Result (65377e134; scratchpad cin_ab.py, stock live, answers equal; ELF before
+  ea1aec8d7519ec2a, after a8b8daf523a61f74; thinkstation1, two runs): 3.5x / 3.2x -> 0.5x / 0.4x
+  stock. The 0.3x probe is missed by the statement's fixed cost. Every other row moved by one
+  constant per run, the difference of the two arms' SELECT 1 baselines (+-100k per process here).
+- Retry condition: none for counting; the rest is per-statement cost. EQP for this count needed
+  explain::aggregate_index_seek_facts to accept IdxCountBefore (bd-zgbhb follow-up).
+
+## 2026-11-15 - WIN (CPU beyond its range, Ir missed low): an aggregate with no GROUP BY over a derived table or a join keeps its rows as one group instead of sorting them by an empty key (bd-w4pr1.12, lever A1)
+
+- Target: execute_group_by_join_select_inner (the outer SELECT of every window scorecard row, and
+  `SELECT agg(...) FROM (subquery)` / joins on the fallback path) built one (empty key, row) tuple
+  per input row with no GROUP BY, stable-sorted them by the empty key and walked them comparing
+  keys to rebuild the one group. On sum(c) OVER (PARTITION BY a) (callgrind, base b081f59ea):
+  Vec::with_capacity 20.0M x 1,000,000, the empty keys' drops 23.0M, sort_by 28.0M,
+  group_keys_equal_collated 31.0M x 999,999, plus the loops' own work: 645.8M inclusive outside
+  the join select, of which the rows' drop (229.4M) and compute_aggregate (72.0M) stay; perf put
+  the function's own code at 3.5% (5.7% on the a % 7 window). Touched:
+  `crates/fsqlite-core/src/connection.rs` (the grouping step),
+  `crates/fsqlite-core/tests/bd_derived_table_column_alias_oracle_probe.rs`
+  (`ungrouped_aggregates_and_streamed_rows_match_rusqlite_oracle`).
+- Ledger preflight: W2 below (named this as the next item on these rows); 2026-11-13 bd-w4pr1.12
+  steps 6+7 (kept). No entry on the ungrouped fold.
+- Pre-registered on bd-w4pr1.12 (08:32Z, before the code): sum(c) OVER Ir -250 to -350M, CPU -10
+  to -30 ms; the other window rows the same; GROUP BY id % 100000 -20 to -40M. Kill: under -150M
+  Ir or CPU not lower in each of two runs, another read row up more than 0.3% Ir, or an
+  aggregate / bare-column / derived / join / window oracle change.
+- Change: no GROUP BY expression -> the group list is one group holding the input rows' values in
+  input order (the empty group for no input, as before), which is the group the sort built.
+- Result: in the run table of W3's entry below (arm a1 against arm w3): sum(c) OVER 4,243.9M ->
+  4,049.2M Ir, CPU 590.9 -> 536.0 / 609.4 -> 517.7 ms (x1.16 -> x1.05, x1.22 -> x1.04 stock);
+  window_row_number 3,830.9M -> 3,637.8M, 540.6 -> 509.8 / 549.3 -> 501.5 ms; a % 7 window
+  5,357.3M -> 5,164.3M, 761.4 -> 720.6 / 757.0 -> 730.7 ms; rank() 4,217.1M -> 4,022.4M, 519.7
+  -> 481.5 / 535.9 -> 472.4 ms; GROUP BY id % 100000 2,871.5M -> 2,852.1M (-19.4M); other rows
+  equal in Ir. Interleaved perf stat (8-10 pairs, W3v1 arms): sum(c) OVER 1,538.3M -> 1,424.5M
+  cycles:u (-7.4%). Prediction: Ir missed low (-193 to -195M against -250..-350M: the rows' drop
+  and the reference vectors compute_aggregate builds stay), CPU beyond its range (-26 to -92 ms
+  against -10..-30). Kill lines not crossed.
+- Gate: in W3's entry below. Landed as 3d1d07e97.
+- Verdict: WIN against stock live: sum(c) OVER (PARTITION BY a) x1.16-1.22 -> x1.04-1.05,
+  PARTITION BY a % 7 x1.09-1.10 -> x1.04-1.05, window_row_number x0.82-0.83 -> x0.75-0.77.
+- Retry condition: none (kept). What is left of the outer select on these rows is the 1M rows'
+  own drop (229M) and compute_aggregate's per-row reference vectors; streaming the window values
+  into the outer aggregate without materializing a row per value is the next step there.
+
+## 2026-11-15 - WIN: a result row reaches its row sink in one reused buffer instead of as a 16-value inline vector moved by value (bd-w4pr1.12, lever W3)
+
+- Target: ResultRowCallback took `SmallVec<[SqliteValue; 16]>` (~400 bytes) by value: five
+  400-byte memcpys a row on its way to TableRowSink (two in take_reg_range, one at the dyn call,
+  two in accept; FlatRows::push_row then extended from the SmallVec's IntoIter). sum(c) OVER
+  (PARTITION BY a), base b081f59ea: take_reg_range 404.0M + the bridge 385.1M of 4,792.1M Ir
+  (callgrind); perf memmove 8.7%, take_reg_range 3.0%, extend_desugared 2.5%, accept 1.0%.
+  Touched: `crates/fsqlite-vdbe/src/engine.rs` (ResultRowCallback, `result_row_buf`,
+  `take_reg_range_into`, `hand_result_row`, `emit_register_result_row`, execute_result_row_hot,
+  FusedLiteralResultRow, emit_compiled_result_row, retained_result_row, two tests),
+  `crates/fsqlite-core/src/connection.rs` (the bridge, TableRowSink::accept, FlatRows::push_row,
+  the sink unit test), a comment in codegen.rs.
+- Ledger preflight: 2026-11-13 bd-w4pr1.12 "a table window SELECT scans into one flat buffer"
+  (FlatRows; kept); W2 below (its retry note named this). INDEX "Removing or adding single arms of
+  try_execute_hot_opcode": no arm added or removed, but see the layout finding below.
+- Pre-registered on bd-w4pr1.12 (08:28Z, before the code): sum(c) OVER Ir -450 to -650M, CPU -25
+  to -60 ms; the other window rows the same; rows with few sink rows within 0.3% Ir. Kill: under
+  -300M Ir or CPU not lower by 10 ms in each of two runs, another read row up more than 0.3% Ir,
+  or a window / join / derived-table / prepared-query oracle change.
+- Change: the callback takes `&mut Vec<SqliteValue>`; the engine keeps one buffer, fills it with
+  take_reg as before and clears it after the call, also when the callback fails; the flat sink
+  appends the values, the handler sink takes the Vec as the Row's values; a retained row is
+  drained into a Vec of its exact width and boxed in place. The ResultRow arm's body is out of
+  line (`#[inline(never)]`).
+- Layout finding (measured before landing): the first build inlined the new body into
+  run_hot_opcodes_sync as the old one was (sha256 9703e95425efa8f0, with A1 ed5fad4a8f6a7709).
+  It met every kill line (window rows -600M Ir, -47 to -90 ms), but rows that emit few rows paid
+  in cycles at lower instruction counts: 10 interleaved pairs against the base, group_by_1000_groups
+  +5.6% cycles:u (750.9M -> 793.0M), GROUP BY a % 10 +6.6% (761.2M -> 811.7M), scan_filter_agg
+  +3.0%; perf showed the same work in other functions costing more cycles (set_reg 2.5% -> 5.3%,
+  RecordColumnTable::parse 1.5% -> 3.8%), no change in branch, icache or dcache misses. Out of
+  line (landed, 003ce511a13c5353 alone, 66d4d84a6b3e57c8 with A1): +1.3%, +1.8% and -0.6% against
+  the base; the window rows keep the gain (+51M Ir against the inlined build, CPU within the
+  runs' spread). A cost remains on rows that never run the changed code, at equal instructions
+  (10 interleaved pairs against the base): order_by_text_limit10 497.5M -> 527.1M cycles:u
+  (+6.0%; +3.4% with A1, 514.6M), GROUP BY a with sum(c) 1,478.6M -> 1,505.8M (+1.8%; +1.3% with
+  A1).
+- Result (thinkstation1, 64 CPUs, governor powersave, io_uring refused, serial
+  `parallel_workers=1` on every arm; stock sqlite3 3.46.1 live in the same par_probe runs, reps 5
+  and 7, load 2.3 and 3.3, answers equal everywhere; base b081f59ea sha256 a5b9785bfb7440a7, W3
+  and W3 + A1 built at ba8d3f295, which differs from b081f59ea only by a #[cfg(test)] loop in
+  wal_adapter.rs and a `Self` spelling in fsqlite-ext-json, neither in a measured statement):
+  sum(c) OVER (PARTITION BY a) 4,793.0M -> 4,243.9M Ir, CPU 659.0 -> 590.9 / 655.0 -> 609.4 ms
+  (x1.29 -> x1.16, x1.32 -> x1.22 stock); window_row_number 4,380.0M -> 3,830.9M, 607.9 -> 540.6
+  / 605.9 -> 549.3 ms (x0.92 -> x0.82, x0.91 -> x0.83); PARTITION BY a % 7 ORDER BY c * 2
+  5,906.4M -> 5,357.3M, 813.8 -> 761.4 / 815.5 -> 757.0 ms (x1.17 -> x1.10 / x1.09); rank() OVER
+  (ORDER BY b) 4,743.2M -> 4,217.1M, 561.2 -> 519.7 / 565.3 -> 535.9 ms; GROUP BY id % 100000
+  2,956.1M -> 2,871.5M (100,000 retained inner rows); the other read rows within 0.1% Ir, CPU
+  within the runs' spread. Interleaved perf stat: sum(c) OVER 1,846.3M -> 1,538.3M cycles:u
+  (-16.7%, inlined build). Peak RSS of the window rows unchanged within 3 MB. Prediction: Ir
+  inside (-526 to -549M against -450..-650M), CPU inside but for one run of sum(c) OVER (-68 ms
+  against -25..-60). Kill lines not crossed.
+- Gate (rch; W3 + A1 on ba8d3f295 + both diffs, the tree measured): clippy -D warnings
+  fsqlite-vdbe and fsqlite-core --all-targets clean (without --no-deps, main clean again since
+  ba8d3f295); fsqlite-vdbe lib 1,254 passed, 1 failed (bd-bhalc's
+  `test_codegen_select_count_star_indexed_in_list_uses_index_probe_expansion`, red on main),
+  golden_bytecode_snapshots 8/8; 30 GROUP BY / ORDER BY / DISTINCT / aggregate / index-build /
+  join / derived / UTF-16 keepers with the G3, W2 and new A1 keepers and the parallel scan oracle
+  (13/13) and budget: 71 passed, 1 failed (`indexed_group_by_predicates_match_sqlite_without_table_scans`,
+  red on main); W1's 30 window-using core targets (round 2's batch that timed out, pinned to hz3):
+  186 passed, 0 failed; the 15 conformance targets (conformance_oracle_* and
+  core_sql_rusqlite_conformance) with the 10 EXPLAIN-pinning targets: 2,097 passed, 0 failed; 19
+  fsqlite-e2e derived / join / window / swarm-harness / concurrent-default targets: 126 passed, 2
+  failed in outer_join_oracle_e2e (`outer_join_using_errors_match_stock`,
+  `table_star_coalesces_using_columns_left_of_outer_join`: the base CLI b081f59ea gives the same
+  answers against bundled 3.54.1, so not these levers; not on the known-red list); every fsqlite
+  crate test (126 binaries): 1,090 passed, 3 failed (`compat_read_only_open_rebuilds_a_three_byte_shm`
+  and `gh294_read_only_namespace_recovery_changes_only_ns_use`, bd-j2dtf;
+  `delete_all_then_reinsert_external`, bd-qxdk4; all filed on main today). Rebased onto
+  26950fa4c (its commits since ba8d3f295 change connection.rs, connection/literal_params.rs and
+  codegen.rs in other functions; clean merge), on the exact tree pushed (the push rebased once
+  more over a .beads-only commit): clippy -D warnings fsqlite-core --lib + the keeper target
+  clean; fsqlite-vdbe lib 1,254 passed, 1 failed (bd-bhalc), golden_bytecode_snapshots 8/8;
+  fsqlite-core lib 4,190 passed, 4 failed (the t6741 pair, bd-nouem;
+  `bd_2dgf5_explain_query_plan_agrees_with_emitted_program` and
+  `bd_2dgf5_explain_query_plan_matches_c_sqlite`, where EXPLAIN QUERY PLAN of `SELECT COUNT(*)
+  FROM t WHERE k = 2` reads SCAN INDEX instead of SEARCH ... (k=?): the base CLI b081f59ea and
+  the W3 + A1 CLI built at ba8d3f295 both print SEARCH, so it arrived with the commits between
+  ba8d3f295 and 26950fa4c, not these levers); the A1 keeper, window_function_oracle (71), the
+  sync-lane oracle and core_sql_rusqlite_conformance pass; fsqlite-types lib 592 passed. Landed
+  as 7fd28df47.
+- Verdict: WIN against stock live: sum(c) OVER (PARTITION BY a) x1.29-1.32 -> x1.16-1.22 (x1.04-1.05
+  with A1); window_row_number x0.91-0.92 -> x0.82-0.83 (x0.75-0.77 with A1). It costs
+  order_by_text_limit10 3-6% of its cycles through the interpreter loop's layout (above), a
+  loss on that row that the window rows' 8-14% outweighs; it is on the list for that row's lever.
+- Retry condition: none (kept). Measurement trap for this file: a change inside
+  run_hot_opcodes_sync's inlined arms can move other statements' cycles by 5-7% with their
+  instruction counts unchanged or lower; check rows that do not run the changed arm with
+  interleaved paired cycles before trusting par_probe's CPU medians, whose spread for identical
+  code is up to 10 ms on these rows.
+
+## 2026-11-15 - REJECTED on its kill line: the single-integer-key sort moves rows by destination swaps over a u32 map instead of following the (key, position) pairs (bd-w4pr1.13.8, lever S1)
+
+- Target: the in-place permutation that applies the pair sort to the sorter's rows in
+  `SorterCursor::sort_rows_by_single_integer_key`. On the two GROUP BY rows G3 declines (distinct
+  records: `GROUP BY a` with sum(c), x1.56-1.63 stock CPU, and `GROUP BY id % 100000`,
+  x1.71-1.82), that function's own code is 30.5% of the statement's cycles (perf cycles:u, base
+  b081f59ea; the pair sort's quicksort another 5.5% / 7.6%), ~120-130 ms of ~400 ms; perf
+  annotate puts 81% of it at the 96-byte row swap's first load and 12% at `keyed[current].1 =
+  current`: the cycle walk reads its next source from the 16 MB pair array at random and then
+  the 96 MB row array at random (THP is madvise-only on this host). Callgrind: 422.7M Ir
+  inclusive of which the pair sort is 338.3M, so the walk itself is cheap in instructions and
+  expensive in misses. Touched (reverted): `crates/fsqlite-vdbe/src/engine.rs`
+  (sort_rows_by_single_integer_key, its stable-order unit test).
+- Ledger preflight: 2026-11-10 bd-w4pr1.13.3 (the pair sort; kept); G3 below; INDEX "Thinning
+  sorter rows" (not this: rows are not thinned).
+- Scratch experiment before the prediction (`scratchpad/r3/permexp/perm.rs`, 1M 96-byte rows,
+  keys `id * 919 % 1000` and `id % 100000`, best of 5): the current walk 88.1-91.6 / 45.2-46.4 ms;
+  destination swaps over a u32 map 66.2-71.7 / 41.3-41.8 ms; a gather into a fresh Vec 72.3-74.0
+  / 64.2-65.9 ms (it faults in 96 MB; into already faulted memory 20.7 / 10.0 ms); a two-pass
+  blocked distribution 105-118 / 76-93 ms.
+- Pre-registered on bd-w4pr1.13.8 (08:39Z, before the code): GROUP BY a with sum(c) CPU -15 to
+  -40 ms, Ir within +-15M; GROUP BY id % 100000 CPU -5 to -35 ms; other rows within 0.3% Ir.
+  Kill: GROUP BY a with sum(c) CPU not lower by at least 10 ms in each of two runs.
+- Change: after the pair sort, `dest[source] = sorted position` (u32), the pairs dropped, then for
+  each slot `while dest[slot] != slot { rows.swap(slot, dest[slot]); dest.swap(..) }`.
+- Result (thinkstation1, governor powersave, io_uring refused, serial on every arm; arms built at
+  b081f59ea: W3 + A1 = ed5fad4a8f6a7709, + S1 = 68c1fad72c6d068c; stock sqlite3 3.46.1 live):
+  par_probe run 1 (reps 5, load 3.1): GROUP BY a with sum(c) 437.7 -> 411.7 ms (-26.0), Ir
+  3,854.7M -> 3,849.9M; id % 100000 356.3 -> 353.3 ms (-3.0), 2,841.7M -> 2,836.9M. Run 2 (reps
+  7, load 5.0): 435.7 -> 429.7 ms (-6.0), 372.8 -> 357.6 ms (-15.2). Interleaved perf stat, 10
+  pairs: 1,547.8M -> 1,439.0M cycles:u (-7.0%), task-clock 456.5 -> 426.9 ms; id % 100000
+  1,186.4M -> 1,098.9M (-7.4%), 371.2 -> 357.1 ms. Rows that do not sort integer keys moved
+  within the run's spread (identical code between the two arms moved by up to 10 ms CPU in
+  par_probe, e.g. GROUP BY a % 10 216.4 vs 206.6 ms in run 1).
+- Verdict: REJECTED on its own kill line (-6.0 ms in run 2 against the required 10 ms in each of
+  two runs), reverted. The kill line sat inside par_probe's spread for identical code on these
+  rows (up to 10 ms); the interleaved pairs say the change is a real ~7% of cycles on both
+  rows.
+- Retry condition: re-register with a kill line taken from interleaved paired cycles (10 pairs or
+  more, A/A pair run alongside), where this change measured -7.0% / -7.4%; or as part of hash
+  aggregation for GROUP BY with a payload (bd-w4pr1.13.8), which removes this sort from both rows
+  altogether. The diff is kept in the round-3 lane scratchpad (`r3/s1_with_w3v2_a1_full.patch`,
+  the S1 hunks of engine.rs).
+
+## 2026-11-15 - WIN (probe not met): COUNT(*) over an exact equality prefix of an index counts the run from the b-tree (bd-zgbhb)
+
+- Target: `SELECT count(*) FROM t WHERE a = 5` (5.0x stock): after bd-2fb53 the lone COUNT(*)
+  still took the aggregate equality seek and stepped every matching entry with an AggStep.
+  Touched: crates/fsqlite-vdbe/src/codegen.rs (count_star_index_range_target takes an equality
+  prefix that is exactly the WHERE when each value is index_range_bound_is_seek_safe; the
+  emitter builds one key record with each key term's affinity, seeks it and counts with
+  IdxCountBefore inclusive). A text literal on the INTEGER column keeps the equality walk.
+- Result (a3ae297ea; scratchpad cnt_ab.py, 200k-row t with ANALYZE, stock live, answers equal;
+  ELF before 631b8c89affe8939, after 9c188885bb0d2c38; thinkstation1): 603.0k -> 135.4k
+  (4.99x -> 1.12x stock); range, IS NULL and IS NOT NULL rows unchanged. The 1.0x probe is
+  missed by the seek itself: ~15k instructions against stock's ~2k.
+- Retry condition: a cheaper SeekGE from a fresh cursor (bd-w4pr1.13.15); counting is no
+  longer the cost.
+
+## 2026-11-15 - WIN (small; retry of the 2026-11-12 rejection): a WAL refresh over a restarted WAL's stale tail reads one frame header, not a 15-frame batch (bd-w4pr1.7, lever L1)
+
+- Target: every WAL commit on a file-backed database after a checkpoint has restarted the WAL in
+  place. The file keeps the previous generation's frames past the new end. Until the new
+  generation outgrows them, the commit's append preflight (`native_append_baseline` ->
+  `WalFile::refresh`) finds frames past its prefix. It then read a batch of up to 15 frames
+  (61,800 bytes) into a freshly zeroed buffer, only to stop at the first one's salts.
+  Touched: `crates/fsqlite-wal/src/wal.rs` (`WalFile::refresh`, `WalFrameReader` allocates its
+  buffer at its first read, and the `AppendProbeFile` test helper records reads).
+- Ledger preflight: the 2026-11-12 entry "REJECTED: a WAL frame reader whose first read fetches one
+  frame, not a 15-frame batch (bd-w4pr1.7)". That variant read one 4,120-byte frame first. Its CPU
+  moved inside a ±7 us band over 5 runs. Its retry condition was "a profile showing the refresh's
+  frame read above 2% of commit CPU". Evidence that it is met:
+  - 5,420 of 6,000 CLI one-row commits and about 60% of the bench's commits issued the
+    61,800-byte pread;
+  - a C microbenchmark on this VM (scratchpad `p6_syscost.c`) costs it at 3.63 us against 0.87 us
+    for a 32-byte pread, plus 0.51 us for the calloc and free;
+  - 0.9 x 3.27 is 2.9 us of about 77 us commit CPU, 3.8%.
+- Change: before the absorb loop, `refresh` reads only the 24-byte header of frame `frame_count`.
+  When that read is whole and the salts are not this generation's, the loop would accept nothing,
+  so it scans no frame. The tail updates after the loop run as before: frame count to the last
+  commit, running checksum, recorded headers. A short read or matching salts runs the loop
+  unchanged; with a peer's frames to absorb, that costs one extra 24-byte pread. The GH#534 length
+  check, the header re-read and every frame validation are untouched.
+- Result. A = main fd57be379 (CLI 51afadb4260669a5, bench 0fca3befc638fbd2); B = A + L1 (CLI
+  b7ed138ebc761cca, bench 6a6890ac6bac2bb7). Stock live in every run; thinkstation1, governor
+  powersave, load 19-23 from other lanes.
+  - CLI `BEGIN; INSERT; COMMIT` x N, per transaction (N=6,000 minus N=2,000), 6 reps with the arms
+    rotated:
+    - tmpfs NORMAL CPU 136.3 -> 131.9 us (-4.4; paired -15.2 / +4.1 / -1.8 / +1.5 / -4.3 / -10.8;
+      stock 13.4, so 10.2x -> 9.8x stock);
+    - sys 39.4 -> 34.5 us;
+    - user instructions 223.4k -> 218.9k, kernel 102.4k -> 93.4k (stock 30.3k / 24.4k);
+    - disk NORMAL CPU 151.4 -> 149.2 us, wall 174.5 -> 166.0 (stock 18.5 / 45.3).
+  - pread per transaction: 4.06 -> 4.09 calls, and 60,990 -> 4,609 bytes.
+  - Exact (callgrind inside COMMIT, 3,000 commits, rep stosb counted per byte): 158.9k -> 112.3k per
+    commit; `WalFile::refresh` 48.4k -> 1.9k.
+  - mt-mvcc-bench, one row per transaction:
+    - 1 writer, 6 interleaved reps: B/A 1.006 (per rep 0.97-1.04), F/C 0.084 -> 0.085; COMMIT
+      stage 81.9 -> 80.5 us;
+    - 8 writers separate, 2 reps: 0.987 (0.95, 1.02), F/C 0.249 -> 0.268;
+    - 32 writers separate, 2 reps: 1.007 (0.98, 1.03), F/C 0.235 -> 0.264.
+  - Prediction (bead comment, before code), against the result:
+    - CLI CPU -2.0 to -3.5 us: -4.4, above the range;
+    - bench 1w +1% to +2.5%: +0.6%, missed low (fewer bench commits hit a stale tail);
+    - 8 / 32w within ±3%: met.
+  - Kill lines: CPU >= 1.0 us down, cleared; bytes >= 40 KB down, cleared (-56.4 KB); 1w >= -2%
+    and 8/32w >= -3%, not hit.
+- Test: `test_refresh_over_a_restarted_wal_reads_one_frame_header_of_its_stale_tail`.
+  - Setup: a peer restarts a 20-frame WAL in place and commits in the new generation.
+  - The reader's refresh must absorb the second new-generation commit.
+  - With nothing new, it must read no frame-sized block and must read the header of the first
+    frame past its prefix.
+  - It must end in the state of a fresh open.
+  - It fails on main's refresh, which reads `[(0, 32), (8272, 61800)]`. It also fails on a probe
+    that skips when the salts match (frame count 1, not 2).
+- Gate (rch, on fd57be379 + this change; reds are the known ones on main):
+  - fsqlite-wal lib 1,175 pass. One later run on a tree with another change had 22 reds: the
+    known native_commit metrics-lock poisoning flake, in a crate identical to this one.
+  - fsqlite-mvcc lib 1,682 pass.
+  - fsqlite-pager lib 1,113 pass + `bd_2jpu6_2`.
+  - fsqlite-core lib 4,192 pass + the t6741 pair.
+  - fsqlite-core keepers 8 targets pass: certificate append tail, flush floor after peer growth,
+    path identity once per transaction, `bulk_import_upsert_text_pk_phantom_pk`, cache staleness,
+    gh525, `gh534_sigkill_unpublished_wal_tail`, read-your-own-write peer races.
+  - fsqlite-e2e concurrent-writer / SSI / checkpoint / group-commit batch: 120 pass in 16 targets.
+    Second batch: 41 pass in 7 targets (`refused_commit_ends_transaction_e2e`,
+    `gh364_stale_wal_cert_file_replacement` among them).
+  - `multiprocess_autocommit_busy_timeout_e2e` with `--test-threads=1`: 8 pass.
+  - bd-73pfl's repro on this tree plus lever 4 (next entry): integrity ok 10/10.
+  - Clippy: `-D warnings --all-targets` on fsqlite-wal is clean on the rebased tree.
+- Landed as a4ff2c4ca, rebased onto d8f44c18f; no commit since fd57be379 touches fsqlite-wal.
+- Retry condition for what is left of the refresh: none for the stale tail. The duplicate 32-byte
+  WAL header pread at commit (the path check reads it, then the refresh reads it again under the
+  same append gate, about 0.9 us) is the next item. It needs the refresh to accept the header the
+  gate already validated, which crosses into the wal_adapter append paths the cross-process lane
+  (perf8) is working in.
+
+## 2026-11-15 - REJECTED on its one-writer kill line (8-64 writers far above the prediction): active-peer SSI candidates by a direct scan instead of a per-commit hash index (bd-i0tn6 scaling lever 4)
+
+- Target: the registry-guard holds of concurrent commits at 16-64 writers (`mt-mvcc-bench
+  --one-row-per-transaction`, separate and shared tables). Touched, then reverted:
+  `crates/fsqlite-mvcc/src/begin_concurrent.rs`:
+  - new `HandleView::may_have_read`, `may_have_written` and `is_edge_peer_of`;
+  - new `overlaps_pages_or_cells`, `active_incoming_candidates` and `active_outgoing_candidates`;
+  - `pending_publication_blocks` scans with early exit;
+  - `ActiveEdgeDiscoveryIndex` becomes `cfg(test)`, as the oracle.
+  - Patch: scratchpad `i0_r3_lever4_scan_on_l3_wip.patch` (session 1f77802a), which applies to
+    fd57be379 as is.
+- Ledger preflight:
+  - lever 3 below (WIN) named the index builds and the pending check as the next item;
+  - lever 2 (WIN small) caches the view parts this scan reads;
+  - lever 1 (REJECTED) showed that removing waits elsewhere only lengthens these holds.
+- Evidence before (hold-split probe on lever 3's tree, bead comment 2026-11-15 02:00 UTC):
+  - at 64 writers the validate hold was 81.0 us: `pending_publication_blocks` 24.4 + SSI prepare
+    52.0 (peer views 16.8, `ActiveEdgeDiscoveryIndex::build` 16.3);
+  - publish was 69.9 us (views 19.7, index build 17.4, prune 9.7);
+  - each build fills six hash maps and four id lists over every registered peer's view, to answer
+    one incoming and one outgoing question.
+- Change: one pass over the views in collection order, with exactly the index's rules. The pending
+  check tests each pending peer under its handle lock and stops at the first candidate.
+- Result:
+  - Binaries: A = main fd57be379 + bd-w4pr1.7 lever L1 (mtbench sha256 6a6890ac6bac2bb7);
+    B = A + this change (706c6c767e49dbd8).
+  - Setup: thinkstation1, 64 hardware threads, governor powersave, tmpfs, NORMAL; 500 rows per
+    writer, 5 rounds; stock live in every run; pairs interleaved with the order alternating per
+    rep; load 15-23 from other lanes; 265 observed OS threads at 64 writers.
+  - B/A of the means over 4 reps, with F/C A -> B:
+    - separate tables:
+      - 1w 0.944 (pooled 12 reps 0.953, per rep 0.74-1.11), F/C 0.096 -> 0.090
+      - 8w 1.050, F/C 0.287 -> 0.277
+      - 16w 1.161, F/C 0.303 -> 0.367
+      - 32w 1.489 (every rep 1.47-1.52), F/C 0.268 -> 0.383
+      - 64w 1.744 (1.68-1.80), F/C 0.142 -> 0.274
+    - shared table:
+      - 1w 1.004 (pooled 12 reps 1.003)
+      - 8w 1.044
+      - 16w 1.109
+      - 32w 1.179, F/C 0.204 -> 0.226
+  - Registry hold (validate + publish), A -> B:
+    - 64w separate 117.9 -> 51.6 us (-56%);
+    - 32w separate 72.1 -> 37.8;
+    - 8w separate 27.0 -> 16.8;
+    - 32w shared 79.7 -> 53.5.
+  - Bulk (1,000-row transactions, 1 rep each): B/A 0.86-1.10. That is not resolvable with one
+    rep. The 1w bulk hold grew 15.3 -> 18.5 and 15.6 -> 21.3 us (see below).
+  - Worker failures: none.
+  - bd-73pfl repro (`mw_conflict.py explicit-same 8 300 10 5000`): stock integrity_check ok on
+    10/10 files per arm.
+  - Exact 1w work (callgrind of the bench's transaction body): 164.3k -> 164.6k per transaction.
+  - Prediction (bead comment, before code), against the result: 64w separate +8% to +20%, 32w +4%
+    to +12%, 16w 0 to +6%, 8w and 1w within ±2%, 64w hold -12% to -25%, shared 32w +3% to +12%.
+    Every multi-writer row missed high. The A arm's 64w hold had grown from round 3's 91 us to
+    117.9 us with main's changes since the prediction (250db23d7's structural claims among them),
+    so the index builds removed were larger than the ones the prediction sized.
+  - Kill line: 1w worse than -2%. Pre-registered before the extra reps, the 1w verdict is the
+    pooled mean of 12 reps per shape. Separate 1w came in at -4.7%: hit. Rejected; the kill line
+    is final.
+- Why the 1w reading is probably noise (recorded for the retry, not used against the verdict):
+  - at 1 writer the separate and shared shapes are the same workload, and their pooled means
+    differ by 5 points;
+  - the exact count differs by 0.18%.
+  - One real 1w cost exists: the scan tests the overlap rules before `is_edge_peer_of`, so it
+    searches the committer's own view. A 1,000-row summary makes that 3-6 us per commit (the bulk
+    hold above); a one-row transaction pays a few hundred instructions.
+- Tests (pass on B):
+  - `test_active_candidate_scan_matches_the_candidate_index`: 2,000 random cases, the same tokens
+    in the same order as the old index;
+  - `test_pending_publication_blocks_on_an_exact_cell_overlap_alone`;
+  - fsqlite-mvcc lib 1,684 pass / 0 fail.
+  - Negative run: with the exact-cell rule dropped, both new tests fail.
+- Retry condition: re-post a prediction on current main with the scan testing `is_edge_peer_of`
+  first. Decide the 1w line on a measurement that resolves 2%, such as the bench's 2,000 x 11
+  one-writer shape, 12 interleaved pairs at host load below 5, plus the exact count.
+
+## 2026-11-15 - WIN (prediction missed, beyond its range): a literal SELECT keyed on any column of a rowid table without a partial index runs parameterized (bd-w4pr1.13.18, read/seek round 4, lever L2)
+
+- Target: the non-prepared point lookup by a secondary key, point_sec_key_2000 of the read sweep
+  (`SELECT id, name FROM s WHERE k = <int>`, 2,000 distinct literals, each its own autocommit
+  statement through the CLI): main 458M user instructions against stock's 67.4M (6.8x), 207 ms CPU
+  against 29.9 ms. Round 3's callgrind put compile_with_cache at 64.4k of 229k a statement and the
+  parse at about 27k. bd-5310l's literal parameterization already gave the rowid twin
+  (point_rowid_2000) one parse and one compiled program for every literal, but
+  `literal_statement_may_run_parameterized` admitted a keyed statement only when the key was the
+  rowid alias.
+- Touched: `crates/fsqlite-core/src/connection/literal_params.rs` (`LiteralStatementKind`, recorded
+  on `ParameterizedLiteralStatement`), `crates/fsqlite-core/src/connection.rs`
+  (`literal_statement_may_run_parameterized`), the keeper in
+  `crates/fsqlite-core/tests/bd_5310l_literal_parameterization_oracle.rs`.
+- Rule: a SELECT may also key on another column of the table when the table is a rowid table and
+  none of its indexes is partial. The planner reads a literal's value only to prove a partial
+  index's predicate (`k = 13` implies `k > 10`; `expr_implies_partial_predicate`); there is no
+  stat4 sampling. The recognizer takes only integer literals, which like a bound integer have no
+  affinity, so the column's affinity and collation apply alike. UPDATE and DELETE keep the
+  rowid-alias rule. Text the parse cache already holds keeps the text path, as before.
+- Ledger preflight: bd-5310l's entries (the literal parameterization and its rowid-only rule); no
+  entry on widening the rule.
+- Result. thinkstation1, governor powersave, load about 18, io_uring refused, 3 reps interleaved;
+  stock sqlite3 3.46.1 live (5a910e452929c124); each fsqlite arm on its own database built by its
+  own CLI; answers equal stock's on every row. A/B on the base this was measured on: p1v4 =
+  fd57be379 + the P1 v4 fetch change (CLI b7f9020c980ce794; P1 was then rejected, the entry below),
+  l2 = p1v4 + this change (CLI afdbc1ae72984355). L2 touches no fetch code.
+
+  | statement | stock | p1v4 | l2 |
+  |---|---|---|---|
+  | point_sec_key_2000, instructions | 67.4M | 449.1M (6.67x) | 256.6M (3.81x), 128k a statement |
+  | point_sec_key_2000, user cycles | 49.2M | 695.9M (14.1x) | 373.2M (7.6x) |
+  | point_sec_key_2000, CPU | 29.5 ms | 210.0 ms (7.1x) | 126.8 ms (4.3x) |
+  | point_rowid_2000 (control) | 44.0M | 173.1M | 173.2M (+0.06%) |
+  | orderby_page_500x20 (control) | 60.7M | 298.9M | 298.6M |
+  | multicol_eq_1000 (control) | 60.1M | 386.1M | 385.7M |
+  | count_star_t_1M (control) | 4.7M | 2.8M | 2.8M |
+
+  Against main fd57be379 (CLI 810f41242c6c347c) in another run, the tree with P1 v5 and this change
+  gave point_sec_key_2000 461.0M -> 256.2M (6.84x -> 3.80x). The landed tree is origin/main
+  ba8d3f295 (rebased to 593e3aca1) plus this change, without P1; it was not rebuilt as a release
+  binary for a third A/B.
+- Prediction (bd-w4pr1.13.18, before code): point_sec_key_2000 458M -> 270M to 320M (missed beyond
+  its range: -192.5M; parse plus compile cost more than the 91k a statement estimated from round 3's
+  profile), CPU 120 ms to 165 ms (inside), controls within 0.3% (inside). Kill (under -40M, a
+  control worse than 0.3%, an answer differing, a keeper failing): not crossed.
+- Keeper: `literal_statements_run_identically_parameterized_as_text_and_on_stock` gains a table
+  with an indexed column of every affinity (INTEGER, TEXT, REAL, NUMERIC, BLOB, none), a NOCASE TEXT
+  column, an unindexed INTEGER and a VIRTUAL generated column, holding integers, integer-looking
+  text ('13', ' 13'), reals (13.0, 13.5), a blob, NULL and text, several rows per key; 63 keyed
+  SELECTs (signed, zero, absent keys), a star projection and `k = NULL` (stays text), each run
+  parameterized, on the `main.`-qualified text path and on stock, compared exactly; unknown columns
+  compared by outcome. Engagement on the parse-cache counters: 60 distinct secondary-key SELECTs
+  parse at most 4 times; a table with a partial index and a WITHOUT ROWID table keep the text path
+  (60 parses each); adding a partial index to the admitted table turns the shape away, dropping it
+  admits it again. A rule that skipped the partial-index check, or admitted WITHOUT ROWID, fails
+  the counters; one whose bound key missed an affinity conversion fails the answers.
+- Gate (rch). On origin/main ba8d3f295 plus this change, the tree that lands: clippy -D warnings on
+  fsqlite-core, all targets: clean; fsqlite-core --lib together with the savepoint / trigger / peer /
+  staleness batch and the prepared-statement / schema-change / literal-parameterization keepers (20
+  targets, bd_5310l's included): 4,324 passed and 2 failed, the t6741 pair (bd-nouem). On
+  78e67b4f6 plus this change (and the wal_adapter clippy fix main then took as ba8d3f295; the rebase
+  pulled other lanes' connection.rs work, hence the rerun above): the core join / seek and seek-key
+  batches, 18 targets, 46 passed and 1 failed, bd_8c68u's
+  `scalar_subquery_when_guards_compile_once_and_match_stock` (92 compilations against its limit 60,
+  the known red bd-f8m1v, same count); 21 fsqlite aggregate / composite / range / count oracle
+  targets, 34 passed. Not run: btree / pager / vdbe --lib (only fsqlite-core is touched), the
+  fsqlite min/max / range oracle batch (stopped for time), the cross-process battery and the
+  fsqlite-e2e concurrent-writer set (no pager, WAL or transaction-begin change).
+- Landed in 6e2943d21 (rebased onto 593e3aca1, which touched none of its files).
+- Retry / widen: multicol_eq_1000 (`SELECT count(*), sum(val) FROM s WHERE g = ? AND h = ?`, 6.4x)
+  is not recognized (aggregate projection, two equalities); the same rule (no partial index) would
+  admit it once the recognizer reads those spellings (measure the plan on stock first).
+  orderby_page_500x20 (`k > N ORDER BY k LIMIT 20`) is a range shape the recognizer does not take.
+
+## 2026-11-15 - REJECTED on its kill line (four versions): a page fetch shares the image its cache holds instead of copying it twice (bd-05xlf, read/seek round 4, lever P1)
+
+- Target: every first read of a page in a transaction (a non-resident fetch). Measured on the
+  prepared secondary-key lookup of bd-05xlf (`SELECT id FROM t WHERE a = ?1`, fsqlite-e2e
+  prepared-dml-probe select-index, 100k-row table), which makes four fetches per execution: callgrind
+  on main e53dcdff1 put them at 13.3k of 92.9k Ir, about 3.3k each. Each copied the page twice and
+  allocated twice: `WalFramePageCache::get` returned `bytes.to_vec()` and the transaction read
+  cache's `page.clone()` materialized an `Arc::from(&[u8])` of that Owned page; on a checkpointed
+  file `get_copy` and the same Arc copy. A frame-cache hit also went through two boxed futures.
+- Touched (never committed; patches in the coordinator scratchpad `rs4/p1_v1.patch` (v2),
+  `p1_v3.patch`, `p1_v4.patch`, `p1v5_l2.patch`): `crates/fsqlite-pager/src/traits.rs`
+  (`WalBackend::read_page_pinned` / `read_page_pinned_without_io` answer `PageData`),
+  `crates/fsqlite-pager/src/pager.rs` (`WalPageLookup` carries `PageData`; `get_nonresident_page`
+  keeps the shared image; the pinned-miss read takes `cache.get_shared`),
+  `crates/fsqlite-core/src/wal_adapter.rs` (the frame cache hands out its `Arc<[u8]>`;
+  `read_page_pinned_without_io` answers a committed frame the cache holds), five test doubles, and
+  keepers (adapter without-I/O answer shared and frame-exact; frame cache keyed by generation, frame
+  and page; reads, peer commits and a rolled-back write through shared images against stock on a WAL
+  file and a checkpointed one).
+- Ledger preflight: the 2026-07-11 bd-5310l decomposition named the per-page 4 KB copy "a broad
+  pager zero-copy refactor, not a micro-lever"; `PageData` has since gained a shared representation
+  with copy on write and the page cache `get_shared` (used by the rollback-journal read path), so
+  this tried the fetch without a refactor.
+- Result. thinkstation1, governor powersave, load 17 to 20, io_uring refused; every arm on main
+  fd57be379 (which carries 250db23d7), each on its own database file built by its own binary; stock
+  live in the same runs (sqlite3 3.46.1 for the CLI sweep, a 3.54.1 amalgamation driver of the same
+  prepared loop, `scratchpad/rs4/stock_lookup.c`, for the probe); answers equal everywhere. main CLI
+  810f41242c6c347c / probe fb30f459a359a8db.
+
+  | row | stock | main | P1 (v4 / v5) |
+  |---|---|---|---|
+  | prepared select-index, instructions per execution | 5,058 | 77,431 (15.3x) | 68,996 / 68,847 (13.6x) |
+  | prepared select-index, checkpointed | 5,058 | 75,521 | 69,036 / 69,007 |
+  | select-rowid (memdb fast path, control) | 4,725 | 8,139 | 8,129 / 8,129 |
+  | autocommit INSERT (control) | - | 145,088 | 144,888 / 145,089 |
+  | point_rowid_2000 (CLI) | 44.0M | 181.3M | 173.3M / 173.2M (-4.5%) |
+  | orderby_page_500x20 / multicol_eq_1000 | 60.7M / 60.1M | 305.5M / 398.0M | 298.8M / 385.5M |
+  | rowid_lookups_200k | 554.4M | 2,684.6M | 2,695.6M / 2,695.3M (+0.40%) |
+  | range_noncovering_200k | 637.6M | 3,357.9M | 3,368.9M / 3,368.3M (+0.31%) |
+
+  User cycles at that load moved within run-to-run noise in the last runs (select-index -5.8% to
+  -11.5% in three runs, -6.6% in the fourth; checkpointed -3.2% to -8.9%, +3.3% in the fourth).
+- Prediction (bd-05xlf, before code): select-index 68.5k to 71.5k (met), checkpointed 68.5k to
+  70.5k (met), point_rowid_2000 164M to 174M (met), controls unchanged (met). v2 measured
+  rowid_lookups_200k +1.4% and range_noncovering_200k +1.0% (the main cache asked twice on a miss);
+  the comment reporting v2 added the kill line "those two rows not worse than 0.2%" (posted while v3
+  was building, before it was measured), and v5's comment, posted before its code, declared it the
+  last try. v3 +0.41% / +0.32%; v4 (foldhash for the frame cache, built under v3's kill line
+  without a comment of its own; it did not move them, their pages come from the main file) +0.41% /
+  +0.33%; v5 (the miss path without the async layer) +0.40% / +0.31%. REJECTED.
+- Why the miss rows lose (callgrind of rowid_lookups_200k, main against v4, 188,562 main-cache
+  misses): `get_nonresident_page`'s own code grows from 335 to 406 Ir per call, because a fetch now
+  carries a `PageData` (the Owned/Shared enum and its image token, more than twice the size of the
+  `Option<Vec<u8>>` it replaced) through the WAL lookup's answer and the cache probe; the cheaper
+  probe (get_shared's miss 91 Ir, get_copy's 119) does not pay for it when nearly every fetch misses.
+  Also observed: an entry read through `get_shared` keeps its shared snapshot until changed or
+  evicted, so a read-hot cache can hold a second 4 KB per entry (peak RSS of the two miss rows 32.6
+  to 32.9 MB on main, 33.8 to 34.7 MB with v2).
+- Measurement trap: under callgrind the blocking facade's move of the statement future shows as
+  17.5k Ir of memcpy per call, because glibc picks `rep movsb` on valgrind's CPU model (callgrind
+  counts one Ir per byte); natively it takes the AVX loop (perf annotate put memmove's samples on its
+  vmovdqu lines, none on rep movsb), about 140 iterations. Its native share of the lookup's cycles
+  was not separated from the page copies. Read memcpy in callgrind with perf stat beside it.
+- Retry condition: share the cached image on a hit without widening what a miss moves before the
+  file read (the WAL lookup and the cache probe answering a small hit/miss value, the image taken
+  only on a hit), or a smaller `PageData`. Judge it on rowid_lookups_200k and range_noncovering_200k
+  (not worse than 0.2%) as well as the prepared lookup; the hit-path gains above are what it has to
+  keep. A frame-cache-only variant is untested and widens the WAL lookup's answer the same way.
+
+## 2026-11-15 - WIN (small): a repeat dirty mark of the root a statement marked last skips the hash insert (bd-w4pr1.13.20, lever M)
+
+- Target: every row a storage-cursor INSERT, DELETE or UPDATE writes: the engine marks the table's root dirty for
+  the MemDatabase mirror's lazy sync (bd-g595c) with a hashbrown `HashSet<i32>::insert` of the same root on every
+  row. Touched: `crates/fsqlite-vdbe/src/engine.rs` (`DirtyRootPages`, the `dirty_root_pages` field).
+- Evidence before (callgrind of a 100k-row INSERT ... SELECT, toggle on run_statement, main fd57be379):
+  `mark_storage_root_page_dirty` 45 a row (4.50M over 100,000 calls); round 3 put the DELETE's dirty mark at ~80 a
+  deleted row together with its cursor-to-root lookup.
+- Ledger preflight: round 3's lever SD entry names this as its retry; the engine-reuse entry (dirty_root_pages
+  reset on an engine reset) is kept: the reset clears through the same type.
+- Change: the set remembers the root it inserted last and skips the insert when the same root is marked again;
+  every way of emptying the set (the MemDatabase sync's `clear_dirty_root_pages`, the commit-time engine reset)
+  goes through `DirtyRootPages::clear`, which forgets it. Which roots are dirty, and when, is unchanged.
+- Prediction (on bd-w4pr1.13.20 before code): bulk -35M to -42M, memory_script -8M to -14M, delete -1.5M to
+  -2.5M, update -0.8M to -1.5M. Kill: bulk under 20M removed.
+- Result, stock sqlite3 3.46.1 live in the same runs (binaries main fd57be379 167524ed..., the change on it
+  32e3c42f..., thinkstation1, governor powersave, load 17, io_uring refused for the DML rows):
+  `bulk_insert_1M_one_txn` min 7,096.6M -> 7,048.8M (-47.8M; 1.70x -> 1.69x stock 4,177.5M), median -11.3M (3 reps;
+  this row's count moves 10-40M between runs); callgrind of the same INSERT ... SELECT at 100k rows (exact):
+  599,149,765 -> 595,248,377, -39.0 a row, `mark_storage_root_page_dirty` 45 -> 6 a row. `memory_script_200k`
+  3,682.5M -> 3,672.3M (-10.2M); `delete_14pct_300k` 365.9M -> 364.3M (-1.6M); `update_10pct_300k` 567.3M ->
+  566.1M (-1.2M). All four inside their predictions; the kill line is cleared by the min and by callgrind, not by
+  the 3-rep median. CPU and wall inside the noise. Answers equal stock's; stock integrity_check ok.
+- Test: fsqlite-vdbe `test_repeat_dirty_marks_of_one_root_leave_the_set_an_uncached_mark_leaves` (repeat and
+  alternating marks leave the set an uncached mark leaves; after a sync clear and after an engine reset the root
+  marked last is inserted again, the negative case a never-invalidated cache fails).
+- Gate (rch). Round 4, on origin/main 78e67b4f6 + the change: clippy -D warnings on fsqlite-vdbe with all targets
+  clean; fsqlite-vdbe lib 1,252 pass and 1 fail (bd-bhalc's indexed IN-list count test, red on main);
+  golden_bytecode_snapshots 8 pass. Round 5, on the exact tree that landed (origin/main 5cf0db4d5 + the change, the
+  same diff): clippy -D warnings on fsqlite-vdbe with all targets clean; fsqlite-vdbe lib 1,254 pass and 1 fail
+  (test_codegen_select_count_star_indexed_in_list_uses_index_probe_expansion, red on main), the new test among the
+  passes; golden_bytecode_snapshots 8 pass; the 80 fsqlite-core keeper / EXPLAIN-reading targets 583 pass and 9 fail
+  (the gh516 trio, bd-d8s37's two fk_insert_conflict_oracle tests, bd_group_by_depth's indexed GROUP BY test,
+  bd-jlbrk's two bd_i3csr_1 tests, all red on main; and
+  bd_nn29x_conflict_clause_review_oracle::review_omitted_rowid_alias_ignores_defaults, red in every gate log of
+  three lanes since 2026-11-13 on trees without this change: a file-backed IPK table returns rowid 102 after deleting
+  its maximum where stock returns 101); the 71 fsqlite targets 227 pass and 1 fail
+  (compat_tests::gh294_read_only_namespace_recovery_changes_only_ns_use, bd-j2dtf, 151060e9b); fsqlite-core lib
+  4,192 pass and 2 fail (the t6741 pair, bd-nouem); fsqlite-e2e golden_bytecode_shapes_oracle_e2e 17 pass.
+- Landed in round 5, rebased on 5cf0db4d5 with the same diff (main had not touched the dirty-root code since the
+  measured base, so it was not re-measured). Retry / widen: the DELETE's `mark_storage_table_dirty` still looks the
+  cursor's root up in `cursor_root_pages` every row (~30); caching it needs every `cursor_root_pages` mutation to
+  invalidate it (eight sites).
+
+## 2026-11-15 - REJECTED on its kill line (bulk +163M): a table row stores an integral real of a REAL-affinity column as an integer, as stock does (bd-w4pr1.13.20, lever L)
+
+- Target: table rows with an integral real in a REAL-affinity column (the scorecard's `c = value * 1.5`, integral
+  on half its rows) and file-size parity with stock. Touched (not landed; patches `scratchpad/r4_L_v1.patch` and
+  `r4_L_v2.patch` of the bulk-write lane, on fd57be379): `crates/fsqlite-types/src/record.rs`
+  (`real_affinity_stored_integer` and two helpers), `crates/fsqlite-vdbe/src/engine.rs` (MakeRecord with `E` in its
+  affinity string or a STRICT REAL slot; the compiled simple-INSERT template), `crates/fsqlite-vdbe/src/codegen.rs`
+  (v2: which table-row MakeRecords carry `E`; the record baked for a literal VALUES row),
+  `crates/fsqlite-core/src/connection.rs` (the prepared direct INSERT lane's three record builders), and a keeper in
+  `crates/fsqlite-core/tests/bd_real_affinity_stock_file_oracle.rs` (byte-compares every table and index b-tree of
+  a fsqlite-written file with stock's for the same statements, cross-reads both files, stock integrity_check).
+- Evidence before: stock stores 3.0 of a REAL column with serial type 1 where fsqlite used 7; the setup file had
+  2,250 leaves against stock's 2,052 (bd-w4pr1.13.20, 2026-11-15 05:37Z).
+- Ledger preflight: bd-real-affinity-on-read-lsjei (read side done, write side "optional and separate"); round 3's
+  handoff named this lever.
+- What "as stock stores it" means (probe of both versions with a page walker, `scratchpad/r4/l/walk.py`, and a
+  3.54.1 amalgamation driver, `r4/sq354`): SQLite 3.54 changed `OP_Affinity` (3.54.1 sqlite3.c, `case
+  OP_Affinity`): REAL affinity turns an integer into a plain real instead of `MEM_IntReal`, so only a `MakeRecord`
+  that applies the affinity itself stores the integer.
+
+  | table, statement | 3.54.1 (repo oracle) | 3.46.1 (benchmark stock) |
+  |---|---|---|
+  | no index, INSERT 3.0 / -0.0 | 1 / 8 | 1 / 8 |
+  | any index (even on another column, partial, expression), INSERT | 7 (-0.0 becomes +0.0) | 1 |
+  | a CHECK constraint, INSERT | 7 | 1 |
+  | WITHOUT ROWID | 7 | 1 |
+  | STRICT, rowid or WITHOUT ROWID, with or without an index or CHECK | 1 | 1 |
+  | indexed table, UPDATE of a non-indexed column / of an indexed column or the rowid | 1 / 7 | 1 / 1 |
+  | CREATE INDEX over integer-stored rows: the key | the stored integer | the stored integer |
+
+  v1 stored integers on every table row (3.46.1's rule): keeper red on the 32 rows of its indexed table. v2 follows
+  3.54.1 (codegen marks a REAL column `A` in the record's affinity string where stock's MakeRecord applies none):
+  every table record of the keeper is byte-equal; red only on the 47 keys CREATE INDEX built over integer-stored
+  rows (fsqlite reads the column with REAL affinity and keys an 8-byte real). The benchmark's table has no index,
+  so v1 and v2 write the same bytes there.
+- Prediction (on bd-w4pr1.13.20 before code): delete -8M to -12M, update -7M to -11M, bulk within +-15M,
+  memory_script within +-10M, setup file 8.9 -> 8.0-8.1 MB. Kill: delete under 5M removed or bulk up more than 25M.
+- Result, stock 3.46.1 live in the same runs (main 167524ed..., L v1 e3c52e49..., thinkstation1, governor
+  powersave, load 13-14, io_uring refused for the DML rows): `delete_14pct_300k` 365.9M -> 355.3M (-10.6M, met;
+  3.03x -> 2.94x stock 120.7M; task-clock min 119.5 -> 107.4 ms, 9 reps); `update_10pct_300k` 567.3M -> 566.0M
+  (-1.3M, missed); `bulk_insert_1M_one_txn` 7,104.7M -> 7,267.7M (+163.0M: killed); `memory_script_200k` 3,682.3M
+  -> 3,922.3M (+240.0M, missed); setup file 9,285,632 -> 8,466,432 bytes (stock 8,429,568), leaves 2,250 -> 2,057
+  (stock 2,051). Answers equal stock's; stock integrity_check ok.
+- Why (callgrind, toggle on run_statement): the conversion serializes through an iterator that substitutes the
+  integers, and the generic serializer walks it several times: `serialize_record_with_real_affinity_integers`
+  ~1,000 inclusive a converted row, ~+390 over the old path (100k-row INSERT ... SELECT: 599.1M -> 618.7M). On
+  memory_script about +170M of the +240M is the pager's per-transaction read cache in the JOIN's lookups of `u`
+  (`cache_transaction_read_page` 345 -> 862 a call, `get_nonresident_page` 919 -> 1,425, the same ~170k calls).
+  The mechanism is not established (the cache's budget branch is the first suspect: with the smaller `t` the
+  cache may still have room, so the insert branch runs where main's full cache takes the cheap one); pager code
+  this lever does not touch.
+- Also found: stock never keeps -0.0 in a REAL column (the integer 0, or +0.0 in 3.54 indexed tables); fsqlite
+  keeps -0.0 in table records and index keys, so `sqlite3_column_double` (rusqlite) returns -0.0 where stock
+  returns 0.0; printf, quote and comparisons already agree.
+- Retry condition: start from `r4_L_v2.patch`; (1) materialize the stored values once (a SmallVec of refs) or
+  substitute in the serializer's layout pass, so a converted row costs at most ~20 more, judged on the bulk row;
+  (2) CREATE INDEX keys a REAL column's stored integer as stock does (`sqlite3GenerateIndexKey` deletes the
+  `OP_RealAffinity`); (3) the read-cache cost on memory_script above explained and fixed or separated first
+  (point-lookup lane), or that row regresses; then a new prediction and kill line on all four rows.
+
+## 2026-11-15 - REJECTED on CPU (instruction kill line cleared): a checkpoint keeps the frames it validated and copies and verifies from them (bd-w4pr1.13.20, lever B)
+
+- Target: the autocheckpoint after a large commit (the scorecard's `delete_14pct_300k`, `update_10pct_300k`,
+  `bulk_insert_1M_one_txn`). Touched (not landed; patch `scratchpad/r4_B_v1.patch` of the bulk-write lane, on
+  fd57be379): `crates/fsqlite-wal/src/checkpoint_executor_impl.rs`, `checkpoint_validation.rs`,
+  `checkpoint_integrity_tests.rs`.
+- Evidence before (callgrind of the DELETE's commit on main fd57be379, attribution table on bd-w4pr1.13.20,
+  2026-11-15 05:25Z): commit + autocheckpoint is 73.0M user instructions under perf stat against stock's 2.3M
+  (32.3k against 1.1k a frame). The checkpoint hashes every frame three times with XXH3-128 (source validation,
+  the backfill's re-read, the read-back's re-read; 19.24M) and reads every frame from the WAL three times
+  (the two re-reads 3.76M).
+- Ledger preflight: lever E1 (2026-11-12, one read-back per checkpoint), lever D (2026-11-12, rejected: the
+  own-certificate re-hash), E2 (assessed unsound: the GH#294 compare-before-write read), and the 2026-11-13 16:17
+  analysis on bd-w4pr1.13.20, whose retry condition this is ("retain the validated payloads of the frames to be
+  copied (bounded memory) so the backfill writes exactly the validated bytes").
+- Change: a window of at most 64 MiB of WAL bytes is read by validation straight into one buffer, with no
+  digests; the backfill writes each page from those bytes and the read-back compares the database page against
+  them; a physical WAL header re-check before the read-back keeps refusing a replaced generation. A larger
+  window keeps the digest path. New and changed tests in `checkpoint_integrity_tests.rs` (both paths write the
+  same pages; a changed frame after validation cannot reach the database on the retained path and is still
+  refused on the digest path; a replaced generation refuses publication and reset).
+- Prediction (on bd-w4pr1.13.20 before code): `delete_14pct_300k` -18M to -23M user instructions, CPU -2% to
+  -5%; `update_10pct_300k` the same; bulk -60M to -80M, peak RSS up by up to the window. Kill: delete under 12M.
+- Result, stock sqlite3 3.46.1 live in the same runs (binaries main 167524ed..., lever 78b4fab9..., thinkstation1,
+  governor powersave, load 23-25, io_uring refused for the DML rows): instructions met. `delete_14pct_300k`
+  365.9M -> 342.5M (-23.4M, 0.4M beyond the range; 3.03x -> 2.84x stock 120.7M); `update_10pct_300k` 567.3M ->
+  543.9M (-23.4M); bulk 7,084.6M -> 7,018.6M (-66.0M), peak RSS 121.2 -> 151.2 MB (stock 16.7 MB). Callgrind:
+  execute_checkpoint 54.81M -> 31.69M for 2,260 frames. CPU is a loss: delete row, 9 reps interleaved, order
+  alternating (`r4_cpu_split.py`, `r4_cycles_split.py`): task-clock min 118.5 -> 126.0 ms and median 124.2 ->
+  136.0 ms (stock 47.3 / 55.6), user cycles min 184.8M -> 191.1M, kernel cycles min 267.0M -> 284.9M, page
+  faults 10,997 -> 13,219; the update row's median CPU 148.7 -> 154.9 ms and the bulk row's 1,047.5 -> 1,029.2 ms
+  (5 and 3 reps, inside this load's noise). The 9.3 MB buffer is fresh memory each checkpoint: 2,222 page faults at
+  about 8k kernel cycles each on this VM. User cycles rose too although 23M fewer instructions ran; the likely
+  cause, not separated, is that the backfill and the read-back read the window cold where the old path re-read
+  each frame into a hot 4 KiB buffer. Rejected: a lever that lowers instructions and raises CPU is not a win.
+- Gate (partial, the lever was rejected first): clippy -D warnings on fsqlite-wal with all targets clean;
+  fsqlite-wal lib 1,176 pass.
+- Retry condition: memory the process has already faulted in for the window (a buffer the WAL handle keeps and
+  reuses across checkpoints, so a long-lived connection pays the faults once), judged by task-clock and cycles
+  with the arms interleaved, not by instructions alone; or a host whose page faults cost under 1 us. Not on a
+  single-checkpoint CLI row like the scorecard's, where every checkpoint maps the window fresh.
+
+## 2026-11-15 - WIN: a short ASCII TEXT value read from a record is stored inline without the general UTF-8 validation (bd-w4pr1.13.28, lever O1)
+
+- Target: `Column` of a TEXT column decodes through SmallText::from_record_text_bytes_shared ->
+  from_bytes_shared -> simdutf8 (core::str::from_utf8 for short input): 108.4M Ir of from_utf8
+  over 1,000,000 calls plus 33.0M of from_record_text_bytes_shared on order_by_text_limit10 (a
+  9-to-11-byte "row-N" key). Touched: `crates/fsqlite-types/src/value.rs` (from_bytes_shared, a
+  unit test).
+- Ledger preflight: 2026-11-12 bd-w4pr1.13.28 (length() on stored bytes; its retry condition, a
+  from_utf8 above 2% of a measured statement, holds at 6.2%).
+- Pre-registered on bd-w4pr1.13.28 (recorded 02:19Z before the code, posted 02:39Z before any
+  build): order_by_text_limit10 Ir -100 to -125M, CPU -5 to -10 ms; rows reading no TEXT within
+  0.3%. Kill: under -60M Ir or CPU not lower, a no-TEXT row up more than 0.3%, or a TEXT / UTF-8 /
+  UTF-16 / invalid-UTF-8 oracle change.
+- Change: a payload of at most 23 bytes is copied into the zeroed inline buffer; when the OR of the
+  buffer's bytes is below 0x80 it is ASCII, hence UTF-8, and the inline value is returned as
+  SmallText::new builds it. A non-ASCII byte or a longer payload takes the simdutf8 path unchanged
+  (invalid UTF-8 stays byte-preserving Raw).
+- Result (method as in G3's entry below; base G3 24872ad9d13297b1, candidate acf247c9ce835877 = G3 +
+  G4 + W2 + O1; order_by_text_limit10 has no GROUP BY and a ten-row outer projection, so G4 and W2
+  do not reach it): order_by_text_limit10 1,735.5M -> 1,641.4M Ir (-94M; stock 778.0M; par_probe
+  1,732.7M -> 1,638.3M), CPU 134.6 -> 133.0 / 138.1 -> 132.2 ms (x2.01 -> x1.99, x2.02 -> x1.94
+  stock), and 150.5 -> 144.9 ms task-clock, 514.1 -> 505.1M cycles (medians, whole process) in 10
+  interleaved pairs. Rows reading no TEXT unchanged (scan_filter_agg 1,259.7M, count_star 59.4M).
+  Prediction: Ir missed low by 6M (-94M against -100..-125M: the copy into the buffer now precedes
+  the check), CPU at the low end (-1.6 to -5.9 ms against -5..-10). Kill lines not crossed.
+- Gate: the one in G3's entry below (fsqlite-types lib on both trees) and the unit test
+  `record_text_ascii_shortcut_matches_validating_decode` (every length 0..=24 over ASCII, NUL, a
+  two-byte character, 0xFF, a lone continuation byte and a truncated sequence at every position,
+  against the validating decode: bytes, validity, inline storage and equality with SmallText::new).
+- Verdict: WIN against stock live, small: order_by_text_limit10 x2.01-2.02 -> x1.94-1.99 CPU.
+- Retry condition: none (kept). `SmallText::as_str` of an inline value still re-validates on every
+  call (bd-w4pr1.13.28's note); a consumer that borrows inline TEXT as &str per row is the next
+  place, when a profile shows its from_utf8 above 2% of a statement.
+
+## 2026-11-15 - WIN: a join or derived-table projection that is one plain column reads its source slot directly (bd-w4pr1.12, lever W2)
+
+- Target: the outer SELECT of every window scorecard row materializes the window result through
+  execute_join_select, whose projection evaluated every value with
+  eval_join_expr_with_using_registry: 409.0M Ir for 1M one-column rows on `sum(c) OVER (PARTITION
+  BY a)` (eval_join_expr 305M; the fallback-registry guard 24M; per row a thread-local USING
+  probe, a binding lookup that hashes the ColumnRef's strings, the clone). Touched:
+  `crates/fsqlite-core/src/connection.rs` (execute_join_select's projection loop),
+  `crates/fsqlite-core/tests/bd_derived_table_column_alias_oracle_probe.rs`
+  (`join_and_derived_table_projections_match_rusqlite_oracle`).
+- Ledger preflight: 2026-11-12 "WIN on CPU: a table window SELECT reads a one-column key from the
+  scanned row" (same technique for window keys); 2026-11-13 steps 6+7 (the projection consumes its
+  rows; kept). No entry on the projection's per-row evaluation.
+- Pre-registered on bd-w4pr1.12 (recorded 02:07Z before the code, posted 02:39Z before any build):
+  sum(c) OVER (PARTITION BY a) Ir -330 to -390M, CPU -20 to -40 ms; the other window rows the same
+  per row; GROUP BY rows within 0.1%; scan rows unchanged. Kill: under -200M Ir or CPU not lower,
+  another read row up more than 0.3% Ir, or a join / derived / USING / NATURAL / window oracle
+  change.
+- Change: when the projection bindings are active (no subquery, no USING skip), a result column
+  that is `Expr::Column` is resolved once before the loop exactly as eval_join_expr resolves it on
+  every row under those bindings (an unqualified USING column's coalesced projection first, left
+  to the evaluator; then resolve_join_expr_column_index), and each row reads `row.get(slot)
+  .cloned()` (NULL past the row). Anything else keeps the evaluator.
+- Result (method as in G3's entry below; base for window rows: main 6a0e84b3c and G3 give
+  identical Ir on them; candidate acf247c9ce835877, whose G4 and O1 do not reach these statements --
+  no GROUP BY codegen, no TEXT read on the first three; three par_probe runs, reps 5, 5 and 9, plus
+  a 10-pair interleaved perf stat): sum(c) OVER (PARTITION BY a) 5,149.9M -> 4,778.8M Ir (-371M;
+  stock 6,587.3M), CPU 682.3 -> 652.0 / 664.2 -> 638.2 / 681.1 -> 651.1 ms (x1.33 -> x1.27, x0.95
+  -> x0.92, x1.35 -> x1.29; stock's own CPU moved 498-696 ms between runs); window_row_number
+  4,737.0M -> 4,367.0M, CPU 603.1 -> 596.8 / 657.4 -> 710.5 / 626.7 -> 602.9 ms (one run of three
+  higher; x0.89-0.93 in the other two); PARTITION BY a % 7 ORDER BY c * 2 6,263.3M -> 5,893.3M, CPU
+  860.8 -> 863.6 / 817.2 -> 822.2 / 839.6 -> 858.4 ms in par_probe (+0.3 to +2.3%), but 887.8 ->
+  868.8 ms task-clock and 2,508 -> 2,404M cycles (medians) in the interleaved pairs; rank() OVER
+  (ORDER BY b) (also reads TEXT b: O1 and W2 together) 5,197.6M -> 4,733.1M, CPU 618.4 -> 609.3 /
+  595.5 -> 565.0 / 604.9 -> 576.7 ms. Prediction: Ir inside (-371M against -330..-390M); CPU
+  inside on the measured row (-26 to -30 ms against -20..-40); on the other window rows the CPU
+  gain is smaller than the Ir and within their run-to-run spread. Kill lines not crossed.
+- Gate: the one in G3's entry below, including the new oracle (17 queries, file-backed and
+  :memory:, stock live: window results summed and grouped outside, qualified / unqualified /
+  shared-name / rowid-alias columns, NULL and mixed types, and USING / NATURAL / LEFT / RIGHT /
+  FULL joins whose shared column a left-slot read gets wrong). The rebased core lib run found the
+  one test this lever changes the mechanism of: `test_join_projection_columns_use_prebound_indexes_for_every_result_row`
+  required a binding lookup per result row (at least 6 for 3 rows; W2 takes 4). It becomes
+  `test_join_projection_columns_resolve_through_prebound_indexes_once_per_statement`: the columns
+  still resolve through the prebound indexes with no column-map rescan, the same statement over
+  twice the rows takes the same number of lookups (a per-row lookup fails it), and the joined
+  values are checked.
+- Verdict: WIN against stock live on its row: sum(c) OVER (PARTITION BY a) x1.33-1.35 ->
+  x1.27-1.29 CPU in the two runs whose stock arm was steady (x0.95 -> x0.92 in the third).
+- Retry condition: none (kept). Next on the same rows: the result-row handoff (VDBE ResultRow ->
+  take_reg_range -> SmallVec<[SqliteValue; 16]> by value -> TableRowSink::accept -> push_row:
+  ~780 Ir a two-column row, two ~400-byte moves), and execute_group_by_join_select_inner's own
+  per-row work for an ungrouped aggregate (dropping 1M (key, row) tuples 229M, the group-key
+  compare 31M).
+
+## 2026-11-15 - WIN: a sorted GROUP BY stops copying each sorter record into a register no opcode reads, which takes group_by_1000_groups below stock's CPU (bd-w4pr1.13.8, lever G4)
+
+- Target: the output loop of every sorted GROUP BY ran `SorterData sorter, r` once per row, and
+  codegen_select_group_by_aggregate never reads `r` (keys and aggregate arguments are read with
+  `Column` on the sorter cursor itself). Each row allocated an `Arc<[u8]>` copy of the record and
+  freed the previous one: execute_sorter_data 257-261M Ir inclusive on every 1M-row GROUP BY row,
+  ~8-10% of group_by_1000_groups' cycles after G3 (execute_sorter_data 2.1% + malloc 2.5% + free
+  0.7% + Arc drop 0.6% + most of set_reg's 5.5%). Touched: `crates/fsqlite-vdbe/src/codegen.rs`,
+  the `select_grouped_aggregate` and `aggregate_group_by_filtered` goldens.
+- Ledger preflight: no entry on SorterData or a dead sorter register; INDEX "Removing or adding
+  single arms of try_execute_hot_opcode" does not apply (no arm changes; an opcode leaves the
+  program).
+- Pre-registered on bd-w4pr1.13.8 (recorded 2026-11-15T01:38Z before the code, posted 02:39Z
+  before any build): group_by_1000_groups Ir -240 to -270M, CPU -12 to -25 ms; the other sorted
+  GROUP BY rows the same per row; other read rows within 0.3% Ir. Kill: under -150M Ir or CPU not
+  lower, another read row up more than 0.5% Ir, or a keeper / golden / EXPLAIN test changing
+  beyond the reviewed opcode removal.
+- Change: the sorter loop of codegen_select_group_by_aggregate no longer emits SorterData (nor
+  allocates its register); SorterNext returns to the first Column. GOLDEN-CHANGE, reviewed line by
+  line: in both goldens the SorterData line is gone, every address and jump target after it is one
+  lower (SorterNext's target stays: it now names the first Column), every register above the
+  removed one is one lower, and `registers:` drops by one; nothing else changes.
+  codegen_select_ordered_scan and five other loops emit the same dead SorterData; not in this
+  lever (no scorecard row runs them over more than ten rows).
+- Result (method as in G3's entry below; base G3 24872ad9d13297b1, candidate acf247c9ce835877 = G3
+  + this lever + W2 + O1, which touch other statements: the GROUP BY rows read no TEXT, and W2
+  changes only their outer projection; two par_probe runs, reps 5, load 5.2 and 6.0):
+  group_by_1000_groups 2,735.6M -> 2,448.6M Ir (-287M; stock 2,876.2M), CPU 209.6 -> 189.9 and
+  216.5 -> 189.6 ms (x1.03 -> x0.93, x1.03 -> x0.91 stock); GROUP BY a with sum(c) 4,144.6M ->
+  3,855.9M (-289M), CPU 440.7 -> 423.5 / 434.2 -> 416.7 ms (x1.69 -> x1.62, x1.63 -> x1.56);
+  GROUP BY a % 10 2,834.4M -> 2,541.2M, CPU 214.7 -> 196.4 / 223.0 -> 190.2 ms (x1.04 -> x0.95,
+  x1.04 -> x0.89); GROUP BY id % 100000 3,309.2M -> 2,943.8M (-365M: G4 plus W2 on its
+  100,000-row outer projection), CPU 403.2 -> 372.9 / 404.1 -> 383.7 ms (x2.13 -> x1.97, x2.02 ->
+  x1.92). scan_filter_agg 1,259.7M both, count_star 59.4M both. Prediction: Ir beyond its range by
+  17M (-287M against -240..-270M: the register the loop no longer writes also no longer frees the
+  previous row's Arc); CPU inside and above (-17 to -33 ms against -12..-25). Kill lines not
+  crossed.
+- Gate: the one in G3's entry below: golden_bytecode_snapshots 8/8 with this lever's two
+  GOLDEN-CHANGE snapshots on both trees, the GROUP BY EXPLAIN-pinning targets on the rebased tree.
+- Verdict: WIN against stock live: group_by_1000_groups x1.03 -> x0.91-0.93 CPU (below stock's
+  CPU); GROUP BY a % 10 x0.89-0.95. With G3, group_by_1000_groups went x1.76-1.83 -> x0.91-0.93
+  this round.
+- Retry condition: none (kept). Widen to codegen_select_ordered_scan's output loop (and the
+  grouped join, DML-without-rowid and IN-subquery sorter loops) when a row that outputs many
+  sorted rows is measured; each saves ~260 Ir a row output.
+
+## 2026-11-15 - WIN (CPU prediction missed, beyond its range): a sorter whose records repeat keeps one row and a count per distinct record, which takes group_by_1000_groups to stock's CPU (bd-w4pr1.13.8, lever G3)
+
+- Target: the sort of a GROUP BY whose aggregates read only its keys. Its sorter record is the key,
+  so group_by_1000_groups (1M rows, 1,000 groups) sorted a million copies of a thousand records:
+  `SorterCursor::sort` 422.7M Ir inclusive (the (i64, u32) pair sort 338.3M + the in-place cycle
+  permutation of 1M ~80-byte rows, whose dependent swaps serialize their cache misses), ~30% of the
+  cycles (`sort_rows_by_single_integer_key` 21.8% + its quicksort 7.5% + sort8 0.7%), the row drop
+  1.5%, ~5% kernel time faulting in the ~80 MB of rows; peak RSS 140.9 MB. Touched:
+  `crates/fsqlite-vdbe/src/engine.rs` (`SorterRuns`, `SorterCursor::{insert_program_record,
+  start_runs, collect_record, insert_record_with_runs, push_record, expand_runs, sort_runs,
+  position_at_first, advance}`, the spill writer, `sort`, `reset`, the Rewind/SorterSort and both
+  SorterNext arms, the IdxBulkLoad guard, two unit tests),
+  `crates/fsqlite-core/tests/bd_w4pr1_13_1_sync_lane_boundary_oracle.rs`
+  (`sorter_runs_match_sqlite_on_a_strict_file_database`).
+- Ledger preflight: 2026-11-10 bd-w4pr1.13.3 (the pair sort; kept, and still sorts every sorter
+  that does not collect); INDEX "Thinning sorter rows" (does not apply: rows are not thinned, the
+  sorter stores distinct records); INDEX "Narrow aggregate lanes" (no aggregate touched). No entry on
+  collapsing sorter records.
+- Pre-registered on bd-w4pr1.13.8 (2026-11-15T00:32Z): group_by_1000_groups Ir 3,009.8M ->
+  2,500-2,700M, CPU -80 to -120 ms, peak RSS under 60 MB; GROUP BY a % 10 about the same gain;
+  GROUP BY a with sum(c) and id % 100000 within 1% Ir and 3% CPU; the non-sorter rows within 0.3%;
+  CREATE INDEX over 300k rows within 1% Ir. Kill: under -40 ms on group_by_1000_groups, another
+  GROUP BY shape worse by more than 3% CPU, the CREATE INDEX probe worse by more than 2% Ir, or a
+  keeper change.
+- Change: a sorter opened without a top-N bound and with no collation on any key starts Undecided
+  and inserts as before. At 4,096 records, if it has not spilled or been positioned, it scans its
+  program once for a Rewind / Last / Prev on its cursor (an unsorted read of insertion order); with
+  none, no REAL key value, every pair of records with equal keys the same bytes, and at most half as
+  many distinct records as records, it keeps each key's first record with a count and collects from
+  then on: a record joins its key's run when it is the run's bytes. Keys are equal as the
+  comparator finds them with no collation (NULL, INTEGER by value, TEXT and BLOB by bytes), so any
+  arrangement of the multiset sorts to the same bytes and the distinct rows sorted, each emitted
+  its count times, are the stable sort. A REAL key (1 = 1.0, -0.0 = 0.0 in other bytes), equal keys
+  in other bytes (a payload that differs), under 2x compression at a doubling check (8,192, 16,384,
+  ...) or an insert after the sort turns the runs back into rows (copies beside each other, the
+  current position kept) and the sorter continues as before; a spill writes each run its count
+  times. SorterSort sorts the (row, count) pairs (distinct keys: one INTEGER key by the key, else
+  the comparator); positioning and both SorterNext lanes emit a row count times with the position
+  and row-decode cache in place; IdxBulkLoad declines runs; ResetSorter starts Undecided again;
+  `rows_sorted_total` counts records. The hash is a folded 64x64 multiply from a per-sorter random
+  seed (TEXT and BLOB bytes through foldhash). No bytecode change.
+- Result (thinkstation1, 64 CPUs, governor powersave, io_uring refused, serial `parallel_workers=1`
+  on every arm; base main 6a0e84b3c sha256 77fe20def717213e, G3 24872ad9d13297b1 = 6a0e84b3c + this
+  diff; stock sqlite3 3.46.1 live in the same par_probe run, reps 5, two runs at load 7.9 and 5.9;
+  answers equal everywhere; all four levers were measured before the rebase, so both arms lack
+  origin/main's commits since 6a0e84b3c -- 250db23d7's cross-process structural claims, the
+  bulk-write lane's 908c771bc, bd-k66zh and bd-isckl -- which change write, subquery-aggregate and
+  JSON paths these read statements do not run): group_by_1000_groups 3,008.1M -> 2,730.0M Ir
+  (stock 2,876.2M), CPU 376.2 -> 208.9 ms and 374.4 -> 220.8 ms (x1.76 -> x0.98, x1.83 -> x1.08
+  stock); GROUP BY a % 10 3,108.2M -> 2,834.1M, 367.3 -> 225.7 / 365.1 -> 220.3 ms (x1.75 -> x1.07,
+  x1.73 -> x1.04); peak RSS 139.8 -> 31.8 MB (SELECT 1: 23.3 MB). Sorters that do not collect pay
+  ~39-42 Ir a record (the out-of-line runs test, the argument moves into the push, the first-check
+  test): GROUP BY a with sum(c) 4,103.7M -> 4,142.6M (+0.95%), CPU 462.0 -> 441.4 / 441.6 ->
+  431.7 ms; GROUP BY id % 100000 3,267.4M -> 3,308.9M (+1.3%), CPU 408.3 -> 400.1 / 391.6 -> 386.1
+  ms; CREATE INDEX ia ON t(a) over the 1M-row file, each run on a fresh copy, 5 alternating native
+  runs (perf stat, whole process): 2,986.6M -> 3,026.9M instructions (+1.35%), task-clock 450.4 ->
+  436.1 ms, cycles 1,283.9M -> 1,237.6M (callgrind's `execute_create_index` inclusive agrees:
+  2,878.9M -> 2,919.1M). Measurement trap: callgrind's whole-process count of that statement moved
+  by 350M between two runs of the same binary and by +1,354M between the arms, all of it in the
+  close-time WAL FEC flush and the scheduler's background lanes (valgrind serializes the threads);
+  compare a writing statement under callgrind by the statement's own inclusive count, or natively.
+  scan_filter_agg 1,259.7M -> 1,259.5M, order_by_text_limit10 1,735.6M -> 1,732.4M, count_star
+  59.4M both, window_row_number 4,737.0M -> 4,736.7M, sum(c) OVER (PARTITION BY a) 5,151.0M ->
+  5,150.7M. Prediction: CPU missed beyond its range (-155 to -167 ms against -80..-120: the sort's
+  cache misses and the fault-in of 80 MB cost more cycles than their instructions suggested); Ir
+  missed high by 30M (2,730M against 2,500-2,700M); RSS inside; the non-collecting shapes missed
+  the 1% Ir line (+1.3% on id % 100000) but are inside every kill line (CPU lower in both runs,
+  CREATE INDEX +1.35% against 2%). A first build (v1) cost the collecting path ~578 Ir a record (a
+  foldhash hasher per key, an out-of-line equality) and the plain path +41; v2 and v3 moved the
+  runs path out of line and hashed one INTEGER key with a single multiply.
+- Gate (one gate over this lever and G4, W2 and O1 above; rch). On 6a0e84b3c + the four diffs (the
+  tree measured): clippy -D warnings fsqlite-vdbe and fsqlite-types --all-targets and fsqlite-core
+  --lib + both keeper targets clean; fsqlite-types lib 592 passed; fsqlite-vdbe lib 1,253 passed, 1
+  failed (bd-bhalc's `test_codegen_select_count_star_indexed_in_list_uses_index_probe_expansion`,
+  red on main), golden_bytecode_snapshots 8/8 (G4's two GOLDEN-CHANGE snapshots included); round
+  1's 26 GROUP BY / ORDER BY / DISTINCT / aggregate / index-build / window keepers with the parallel
+  scan oracle (13/13) and budget (1/1) all pass but
+  `indexed_group_by_predicates_match_sqlite_without_table_scans` (red on main); the G3 keeper's file
+  3/3. A second job (fsqlite-core --lib with W1's window-using targets, the GROUP BY EXPLAIN-pinning
+  targets and the join / derived-table targets) timed out at 5,400 s on its worker while the lib's
+  slow `builder_refuses_a_build_that_exceeds_its_write_set_ceiling` ran (2,585 lib tests had
+  passed, the t6741 pair red as on main); its integration targets did not run on that tree.
+  Rebased onto origin/main fd57be379 (250db23d7 and 908c771bc change engine.rs, codegen.rs and
+  connection.rs in other functions; clean merge), on the exact tree pushed: clippy -D warnings
+  fsqlite-vdbe and fsqlite-types --all-targets clean, fsqlite-core --lib + both keeper targets clean
+  with `--no-deps` (without it clippy stops in fsqlite-ext-json: two `use_self` errors at lib.rs:2099
+  and 2111 that arrived with origin/main's 9d7e6e249, red on main); fsqlite-types lib 592 passed;
+  fsqlite-vdbe lib 1,253 passed, 1 failed (bd-bhalc), golden_bytecode_snapshots 8/8; 58 integration
+  targets of fsqlite-core and fsqlite (round 1's 26 keepers with the parallel scan oracle and budget,
+  the G3 and W2 keepers, 10 GROUP BY EXPLAIN-pinning targets, 4 join / derived-table / UTF-16
+  targets, the 14 fsqlite count / min / max / range / EXPLAIN oracles): 231 passed, 1 failed
+  (`indexed_group_by_predicates_match_sqlite_without_table_scans`, red on main); fsqlite-core lib,
+  after W2's updated unit test, 4,192 passed, 2 failed (the t6741 pair, bd-nouem). Rebased once more
+  onto 78e67b4f6 (bd-ukvhn, connection.rs's grouped evaluator) and the affected targets re-run on
+  the exact tree pushed (its new oracle, the G3 and W2 keepers' files, bd_group_by_depth, the two
+  min/max bare-row oracles, window_function_oracle): all pass but
+  `indexed_group_by_predicates_match_sqlite_without_table_scans` (red on main). Not run
+  on any tree: W1's window-using core targets beyond the 26 keepers and window_function_oracle, and
+  the fsqlite-e2e window / join / derived / bytecode-shape targets.
+  Keepers: `test_sorter_runs_emit_what_one_row_per_record_emits` (20,000-record sequences
+  inserted into a collecting and a plain sorter, sorted and compared record by record: 37 INTEGER
+  groups ASC and DESC; a key that turns REAL (3.0 among the 3s) and one with -0.0 / 0.0 after the
+  runs started; a REAL key from the start; a payload that follows the key for 6,000 records and then
+  varies -- a collapse by key alone reorders it; one that always follows it; ten keys for 8,000
+  records and then all new (expands at 16,384); unique keys; under 4,096 records; NULL / INTEGER /
+  TEXT / BLOB two-column keys under three direction pairs; a record shorter than its key; a program
+  with a Rewind on the sorter and one with a Rewind on another cursor; each case asserts the state
+  it ends in), `test_sorter_runs_spill_insert_after_sort_and_reset` (a spill while collecting, an
+  insert after the sort at record 26 of a run of 20, ResetSorter, the bulk-load guard), and the
+  stock oracle `sorter_runs_match_sqlite_on_a_strict_file_database` (20,000 rows on a strict file
+  database: 27 GROUP BY / ORDER BY / DISTINCT queries that run the sorter program over every case
+  above, 6 strict-refused shapes compared with strict off, CREATE INDEX over duplicated values, a
+  failing CREATE UNIQUE INDEX and integrity_check; NOCASE keys never collect and only their group
+  count is compared, since the spelling a group prints is bd-ukvhn's divergence).
+- Verdict: WIN against stock live: group_by_1000_groups x1.76-1.83 -> x0.98-1.08 CPU, GROUP BY
+  a % 10 x1.73-1.75 -> x1.04-1.07.
+- Retry condition: none (kept). The plain path's ~40 Ir a record is worth removing (keep the
+  plain push inline and the runs test at one compare) when a sorter-heavy row that does not
+  collect, such as CREATE INDEX or GROUP BY with a payload, is the lever. Hash aggregation
+  (bd-w4pr1.13.8's general fix) is what GROUP BY with sum(c) and the unique-key shapes still need.
+
+## 2026-11-15 - WIN (prediction missed, beyond its range): a separator repair whose new rowid has the stored one's varint length writes it in place (bd-w4pr1.13.20, lever J)
+
+- Target: every table delete that removes a leaf's last cell, whose ancestor separator the b-tree then lowers to
+  the leaf's new maximum (stock never repairs a table separator). The scorecard's `delete_14pct_300k` removes 310
+  leaf maxima. Touched: `crates/fsqlite-btree/src/cursor.rs` (`replace_table_interior_separator_rowid`, the new
+  `refresh_stack_entries_showing`).
+- Evidence before (callgrind of the DELETE on main 51d16b5d3, toggle on run_statement): each repair re-read the
+  interior page, sized all ~268 of its cells (`cell_on_page_size_fast`, 83,088 calls), sorted them (ipnsort 9.1M),
+  moved them, rewrote every pointer and reloaded the page twice; attribution on bd-w4pr1.13.20 (2026-11-14
+  round 3).
+- Ledger preflight: 2026-05-10 "Direct DELETE parent-separator admission" was a prepared direct-lane lever; no
+  entry on the bytecode row loop's separator repair.
+- Change: when the new rowid's varint is exactly as long as the stored one (a removed maximum and its predecessor
+  almost always are), the varint is written over the old one and the stack entries showing the page are
+  refreshed; any other length keeps the rewrite. Same separator value and cell bytes; no cell or pointer moves.
+- Prediction (on bd-w4pr1.13.20 before code): `delete_14pct_300k` -10M to -15M user instructions. Kill: under 7M.
+- Result, stock sqlite3 3.46.1 live (r3_mut_probe, 3 reps, io_uring refused; binaries 933a1a2f... main 51d16b5d3,
+  920a6f97... main + this diff), host thinkstation1 (governor powersave, load 5.2): `delete_14pct_300k` 422.9M ->
+  397.8M (-25.1M; 3.50x -> 3.30x stock 120.7M), CPU 122.4 -> 113.2 ms (noise at this load); `delete_id14_stmt`
+  -23.5M; `update_10pct_300k` unchanged (578.6M / 578.7M, a later run). Prediction missed beyond its range: ~81k
+  a repair, not ~50k (the attribution left out the interior page's own copy-on-write and full pointer rewrite).
+  Answers equal stock's; stock `integrity_check` ok on every file written.
+- Test: fsqlite-btree `test_separator_repair_writes_a_same_length_varint_in_place` (the leaf holding 128 loses its
+  rows from its maximum down to 128 under a one-level root: each same-length repair changes no root byte but the
+  varint's, 128 -> 127 takes the rewrite, the cursor's stack shows the repaired root, the tree invariants hold,
+  every other row is found).
+- Gate: one gate for levers J, SD, UR and I; see the lever I entry below.
+- Retry / widen: a varint of another length (a removed maximum at a power-of-128 boundary) still rewrites the page;
+  worth doing only if a profile shows those rewrites above 1% of a DML row.
+
+## 2026-11-15 - WIN (prediction missed low, kill line cleared by 0.4M): a plain DELETE of a row on a staged compact leaf runs on the synchronous lane (bd-w4pr1.13.20, lever SD)
+
+- Target: every row a plain DELETE (no OPFLAG_ISUPDATE) removes from a table leaf the transaction already holds
+  staged, compact with descending pointers, the cell neither the leaf's only nor its last, without overflow: ~40k
+  of the 42,857 deletes of `delete_14pct_300k` (the first delete of each leaf, the leaf maxima and overflow rows
+  keep the ordinary path). Touched: `crates/fsqlite-btree/src/cursor.rs` (new
+  `BtCursor::try_delete_table_leaf_cell_in_staged_image`), `crates/fsqlite-vdbe/src/engine.rs` (its
+  `CursorBackend` wrapper, an `Opcode::Delete` arm in `try_execute_hot_opcode_sync`, `execute_plain_delete_hot`).
+- Evidence before (same attribution): 2,513 of the 2,590-a-row marginal cost was the Delete arm and the cursor's
+  delete: the async-arm exit and re-entry 264, the async wrappers and postlude ~220, the pointer-vector copy and
+  StackEntry rebuild ~215, every pointer of the leaf rewritten, the inlined body ~680.
+- Ledger preflight: levers F, P (2026-11-13) and D (2026-11-14) built the staged in-place delete this reuses;
+  lever S (2026-11-14) moved VColumn / VNext / MustBeInt into the synchronous lane; the May 2026 direct-lane
+  delete levers are scoped to prepared direct lanes (INDEX).
+- Change: the new b-tree function makes exactly the page bytes the compact descending branch of
+  `remove_table_cell_from_leaf_deferred` makes (only the pointers from the removed index on are written), updates
+  the stack entry's pointer vector in place, and does the ordinary path's bookkeeping (row-image epoch, seek and
+  rightmost caches, depth gauge, descending-image record); it returns false having changed nothing in every other
+  case. The engine's synchronous arm does the main arm's bookkeeping for a plain DELETE (row-cache invalidation,
+  memdb dirty mark, changes, pending Next) and otherwise leaves the opcode to the main arm. `BtCursor::delete`
+  does not call it (a first-write leaf would be tried twice).
+- Prediction (on bd-w4pr1.13.20 before code, measured on main + J): `delete_14pct_300k` -50M to -65M user
+  instructions, CPU -8% to -14%. Kill: under 30M.
+- Result, stock live (r3_mut_probe, 5 reps, io_uring refused, load 6.6; J 920a6f97..., J + SD + UR + I
+  5ca507b1...; the DELETE runs neither UR nor I): `delete_14pct_300k` 397.7M -> 367.3M (-30.4M; 3.30x -> 3.04x
+  stock 120.7M), CPU 115.7 -> 111.9 ms (stock 46.8; noise). Prediction missed low (~710 a delete, not ~1,500);
+  kill line cleared by 0.4M. Callgrind of the new binary: the marginal deleted row is 1,618 (main 2,590); the
+  synchronous path still pays the pager's staged-mutate dispatch ~245 and try_rewrite's wrapper ~80, the cell move
+  and tail pointers ~370, CellRef::parse 85, the b-tree checks and bookkeeping ~450, and the engine's ~250 (the
+  memdb dirty mark's HashMap insert 80 a row). Answers equal stock's; stock `integrity_check` ok.
+- Tests: fsqlite-btree `test_synchronous_leaf_delete_matches_the_ordinary_delete_and_refuses_the_rest` (a one-pass
+  scan deleting two rows in three on a staged store, against the same deletes on a store without staged images:
+  every page byte-equal, the same rows visited; refusals of a leaf's last cell, an only cell, an overflow cell and a
+  disturbed leaf change nothing); fsqlite-core `one_pass_delete_oracle::staged_leaf_delete_matches_stock` (changes()
+  and total_changes(), a partial and an expression index, ROLLBACK TO a savepoint after in-place deletes, a
+  correlated subquery, RETURNING; `:memory:` and file, direct and prepared) and
+  `staged_leaf_delete_is_invisible_to_an_open_snapshot_as_in_stock` (a second connection's open snapshot, step by
+  step against stock in WAL mode).
+- Gate: see the lever I entry below.
+- Retry / widen: the engine's per-row memdb dirty mark (a HashMap insert of the same root page each row, ~80) and
+  the pager's staged-mutate dispatch (~245, pager-side; its owner first) are the next pieces; the cell move itself
+  is the b-tree's compact-on-delete design (see the comment in `remove_table_cell_from_leaf_deferred`: a freeblock
+  chain left 1-3 byte gaps stock reports as corruption), whose retry is a freeblock delete with its own integrity
+  oracle, not this path.
+
+## 2026-11-15 - WIN: an UPDATE that keeps its rowid on a table without a UNIQUE index keeps no copy of the old row (bd-w4pr1.13.20, lever UR)
+
+- Target: every row an UPDATE rewrites in place (OPFLAG_UPDATE_KEEPS_ROWID) on a table with no UNIQUE index: the
+  scorecard's `update_10pct_300k` (30,000 rows). Touched: `crates/fsqlite-vdbe/src/codegen.rs` (`codegen_update`
+  sets the new Delete P5 bit OPFLAG_UPDATE_NO_RESTORE, 0x200), `crates/fsqlite-vdbe/src/engine.rs` (the Delete arm
+  skips the restore capture under it); GOLDEN-CHANGE `update_with_where_predicate` (Delete p5 144 -> 656) and
+  fsqlite-core `bd_9ag5r_update_in_place_oracle`'s EXPLAIN p5 table (kept-rowid deletes on tables without a UNIQUE
+  index now carry the bit; a UNIQUE-index table is added whose deletes must not).
+- Evidence before (callgrind on main 51d16b5d3, UPDATE ... id % 10 against id % 20): 5,682 per updated row, of it
+  the Delete arm's `CursorBackend::payload` copy into PendingUpdateRestore 300 and its drop ~60; the restore is read
+  only after a conflict, and with the rowid kept only a UNIQUE index can conflict (CHECK and NOT NULL run first).
+- Ledger preflight: lever U (2026-11-14) named this lever; bd-9ag5r and bd-c1vth define the restore.
+- Prediction (on bd-w4pr1.13.20 before code): `update_10pct_300k` -7M to -11M. Kill: under 4M.
+- Result, stock live (same run as lever SD): `update_10pct_300k` 578.7M -> 568.7M (-10.0M; 2.12x -> 2.08x stock
+  273.3M), CPU noise. Prediction met. Answers equal stock's; `integrity_check` ok.
+- Test: fsqlite-core `one_pass_delete_oracle::update_without_restore_matches_stock` (twin tables, a plain index
+  and a UNIQUE one: same-size and growing rewrites, OR IGNORE / OR REPLACE with nothing to conflict on, a UNIQUE
+  conflict under IGNORE, REPLACE and ABORT, an UPDATE of another column of the UNIQUE table).
+- Gate: see the lever I entry below.
+- Retry / widen: `codegen_update_from` still captures; a table with a UNIQUE index still copies every row's payload
+  although only conflicting rows need it (a restore built on conflict would need the old payload kept elsewhere).
+
+## 2026-11-15 - WIN: INSERT ... SELECT uses the INTEGER PRIMARY KEY alias register as its rowid register (bd-w4pr1.13.21, lever I)
+
+- Target: every row of an INSERT ... SELECT into a table with an INTEGER PRIMARY KEY and no explicit hidden-rowid
+  source: the scorecard's `bulk_insert_1M_one_txn`. Touched: `crates/fsqlite-vdbe/src/codegen.rs`
+  (`codegen_insert_select`'s rowid routing).
+- Evidence before: the row ran IsNull / MustBeInt / Copy alias -> rowid / Goto (round 2's callgrind on the landing
+  tree); lever K measured an elided integer Copy at ~130 a row.
+- Ledger preflight: lever U (2026-11-14) did the same for UPDATE; no entry on INSERT ... SELECT's routing.
+- Change: the alias register is the rowid register: IsNull alias -> auto; MustBeInt alias; Goto; auto: NewRowid
+  into the alias. Both Copies go; the CHECK row, unique prechecks, Insert, index inserts and RETURNING read the alias
+  register. `codegen_insert_values` and its goldens are unchanged.
+- Prediction (on bd-w4pr1.13.21 before code): bulk -100M to -150M, memory_script_200k -20M to -30M. Kill: bulk under
+  60M.
+- Result, stock live (r2_bulk_probe, 3 reps interleaved, load 4.4; main 933a1a2f..., main + J + SD + UR + I
+  5ca507b1..., the bulk row runs none of the other three): `bulk_insert_1M_one_txn` 7,227.1M -> 7,091.7M (-135.4M;
+  1.73x -> 1.70x stock 4,177.5M), CPU 969.3 -> 877.2 ms (stock 436.7; the -9.5% is noise at this load); answers
+  equal, `integrity_check` ok. `memory_script_200k` 3,800.2M (J) -> 3,762.1M with SD, UR and I together (1.97x
+  stock 1,914.0M; not split). Prediction met.
+- Test: fsqlite-core `one_pass_delete_oracle::insert_select_alias_rowid_register_matches_stock` (11 statements
+  against rusqlite: alias sources NULL / INTEGER / TEXT '7' / REAL 8.0 / negative / present, plain / OR IGNORE / OR
+  REPLACE, 5.5 as a key, CHECKs on the alias and the rowid, the alias left out, AUTOINCREMENT, RETURNING, 2,981 CTE
+  rows, a partial index over the alias).
+- Gate: one gate for levers J, SD, UR and I (rch, 2026-11-15, on origin/main ae505a097 plus the change; the
+  measured binaries were built on 51d16b5d3 plus the same diff, which applied unchanged): clippy -D warnings with
+  all targets on fsqlite-btree and fsqlite-vdbe, and on the two touched fsqlite-core test targets, clean;
+  fsqlite-btree lib 562 pass; fsqlite-vdbe lib 1,250 pass and 2 fail: bd-bhalc's
+  `test_codegen_select_count_star_indexed_in_list_uses_index_probe_expansion` (red on main) and
+  `test_shared_txn_page_io_short_owned_write_tracks_in_place_zero_extend_metrics`, the process-global counter flake of
+  bd-p3963 (it passed in the same stage on the 51d16b5d3 base, 1,251 / 1, and no changed code writes pages);
+  goldens 8 pass with `update_with_where_predicate` hand-edited (GOLDEN-CHANGE in the commit); the 80 fsqlite-core
+  keeper and EXPLAIN-reading targets 582 pass and 9 fail, all red on main with the assertions and values of round
+  2's runs (the gh516 trio, bd-d8s37's two `fk_insert_conflict_oracle` upsert tests, bd-mkon7, bd-jlbrk's two
+  `rowid_replace_preflight_*` tests, `bd_group_by_depth_oracle_probe::indexed_group_by_predicates_match_sqlite_without_table_scans`);
+  the 71 fsqlite DML and EXPLAIN-reading targets 226 pass; fsqlite-core --lib 4,186 pass and 2 fail (the t6741 pair,
+  bd-nouem, red on main). Not run: fsqlite-e2e `golden_bytecode_shapes_oracle_e2e` and
+  `bd_2jbl5_update_from_triggers_oracle` (time; the fleet took 25-60 minutes a job), the e2e concurrent-writer batch
+  (no MVCC or commit code changed). Moved onto 0dea37f2d before landing: of the changed files upstream had touched
+  only codegen.rs (SELECT range routing, a WITHOUT ROWID upsert probe), so fsqlite-vdbe lib + goldens and the two
+  touched fsqlite-core targets were re-run on that tree: vdbe lib 1,251 pass and 1 fail (bd-bhalc; the counter test
+  passed), goldens 8 pass, the two targets 19 pass. The commits between 0dea37f2d and the landing base 9d7e6e249
+  touch none of the changed files. Landed as 908c771bc.
+- Retry / widen: `codegen_insert_values` has the same routing (one row per statement; its upsert goldens pin it).
+
+## 2026-11-15 - WIN: committed SSI history keeps its page indexes entry by entry instead of rebuilding them at every commit, +44% at 64 separate-table writers and +59% at 32 shared-table writers (bd-i0tn6 scaling lever 3)
+
+- Target: the registry-guard holds of concurrent commits at 16-64 writers (`mt-mvcc-bench
+  --one-row-per-transaction`, separate and shared tables). Touched:
+  `crates/fsqlite-mvcc/src/begin_concurrent.rs` (`CommittedHistory<E>`, `CommittedHistoryInfo`,
+  `ConcurrentRegistry::committed_readers` / `committed_writers`,
+  `prune_committed_conflict_history`; `rebuild_committed_history_indexes`,
+  `index_committed_reader` / `index_committed_writer` and `collect_precise_candidates` removed).
+- Ledger preflight: lever 2 below (view parts shared until a peer changes, WIN small) named this
+  rebuild as the next item and the DRO coupling: history lengths feed `evaluate_prepare_t3_dro`,
+  so pruning must stay exact. Lever 1 below (REJECTED) showed that removing waits elsewhere only
+  lengthens these holds. Nothing earlier touched the committed-history indexes.
+- Evidence before (hold-split probe on 67fd99d10, bead comment 2026-11-14 16:57 UTC):
+  `prune_committed_conflict_history` ran at every commit under the guard and, after the retain,
+  cleared all eight committed-history index maps and re-summarized every retained record to
+  rebuild them, although each push had already indexed its own record: 46.3 us of a 56.2 us
+  prune at 64 writers (112 records retained), 92.3 us of 101.4 at 32 shared-table writers (440
+  records), 24% and 42% of the two holds.
+- Change: each record gets an id in publication order and keeps the witness summary computed at
+  push; the page / page-witness / exact-cell / global lists hold ids. `prune_at_or_before` pops
+  `(commit_seq, id)` from a min-heap while `commit_seq <= horizon`, so it finds a record wherever
+  it sits (publication order can differ from commit order since S3), and removes the id from its
+  own pages' lists, dropping a key once empty. A record pruned behind a retained one leaves an
+  empty slot until the older records go, so `len()`, iteration and candidate order equal a vector
+  in publication order with the same records removed. Pruning stays eager: same retain predicate,
+  horizon, MAX_HISTORY_ENTRIES path and clear-on-no-horizon path.
+- Prediction (bead comment, before the code was built): separate 64w +15% to +35%, 32w +12% to
+  +30%, 16w +5% to +20%, 8w +0% to +8%, 1w within 2%; shared 32w +20% to +60%, 16w +8% to +25%;
+  hold at 64w separate -20% to -35%, at 32w shared -30% to -45%; probe prune at 64w <= 12 us, at
+  32w shared <= 15 us. Kill: separate 32w or 64w below 1.05 in either rep; shared 32w below 1.08;
+  1w worse than -2% or 8w worse than -3% over the reps; 64w hold cut below 15%; probe prune at 64w
+  above 20 us; a worker failure A does not show; an SSI keeper red; the keepers passing on a lazy
+  variant.
+- Result (A = main 8fb2902ee mt-mvcc-bench sha256 6ef6eec0f6413d0b, B = A + this change
+  05592099d737f44f; thinkstation1, Threadripper PRO 5975WX, 64 hardware threads, governor
+  powersave, tmpfs, synchronous=NORMAL, 500 rows per writer, 5 rounds per row, stock SQLite live in
+  every run; pairs interleaved with the order alternating per rep; host load 4-7). B/A of the
+  means with F/C A -> B:
+
+  | writers | separate B/A (4 reps) | F/C A -> B | shared B/A (4 reps) | F/C A -> B |
+  |---|---|---|---|---|
+  | 1 | 0.998x (12 reps pooled, see below) | 0.096 -> 0.093 | 0.999x (12 reps pooled) | 0.094 -> 0.091 |
+  | 8 | 1.005x | 0.290 -> 0.279 | 1.034x | 0.169 -> 0.201 |
+  | 16 | 1.090x | 0.304 -> 0.306 | 1.170x | 0.168 -> 0.205 |
+  | 32 | 1.227x (every rep 1.20-1.25) | 0.229 -> 0.277 | 1.591x (1.45-1.75) | 0.146 -> 0.213 |
+  | 64 | 1.440x (1.37-1.49) | 0.123 -> 0.170 | not run | |
+
+  Separate F wps 64w 5,001 -> 7,202, 32w 7,855 -> 9,639. Registry hold (validate + publish, the
+  bench's unprobed decomposition) 64w separate 148.6 -> 91.1 us (-39%), 32w separate 82.6 ->
+  60.9, 32w shared 154.5 -> 72.3 (-53%). Probe (never landed) prune per commit: 64w separate
+  56.2 -> 9.7 us, 32w shared 101.4 -> 8.4. One writer (2,000 rows, 11 rounds, 3 reps): 0.994x
+  (F/C 0.087 both). Bulk (1,000-row transactions, 1 rep): separate 0.93-0.98x, shared 1.00-1.17x;
+  bulk commits are 1-64 per round, so this is not separated from noise with one rep. Worker
+  failures: none in B; A lost 26,000 rows at bulk shared 32w (main's bulk-shared abort storm).
+  1w: the first 4 reps of the sweeps' 1w rows read -4.4% (separate) and -2.8% (shared) with per-rep
+  B/A from 0.86 to 1.12; before running more, 8 more interleaved pairs per shape were
+  pre-registered on the bead with the verdict on the pooled 12-rep mean; that mean is -0.2% and
+  -0.1%. At one writer the history is pushed and cleared at every commit either way.
+  Against the prediction: 64w separate (+44%) and both hold cuts are above their bands; the rest
+  inside. No kill line hit. F/C stays at or below 0.31 at every writer count: fsqlite pays 11.4x
+  stock per one-row transaction at one writer (148.7 against 13.0 us), and concurrency recovers at
+  most about 3.3x of that (bd-i0tn6 step-2 comment, 2026-11-15).
+- Tests: `test_dro_pivot_decision_reads_the_exactly_pruned_history` (a lagging prune reads DRO
+  populations 19 / 19 where the exact one reads 3 / 3, which the default matrix decides
+  differently), `test_prune_drops_history_published_out_of_commit_order`,
+  `test_committed_history_matches_a_rebuilt_vector_under_out_of_order_pushes_and_prunes` (2,000
+  random steps against a Vec with retain and the old index rules). Negative runs: a lazy prune
+  (skip while <= 64 records) fails the first two; a front-only prune fails the second and third.
+- Landed as 57d3cb3c1 (the clone's commit, taken to main by the sweep before the gate below had
+  finished; the gate then completed on that exact tree, 8fb2902ee + this change).
+- Gate (rch, on 8fb2902ee + this change): clippy -D warnings on fsqlite-mvcc / core / e2e all
+  targets clean; fsqlite-mvcc lib 1,681 pass, 1 red that passed when rerun alone
+  (`lifecycle::tests::test_range_scan_tracking_overhead_under_five_percent`, a wall-clock ratio
+  with 900 us sleeps, 52.7% against 25% on a loaded worker; lifecycle.rs is not touched); core
+  keepers 195 + 7, fsqlite 8; fsqlite-e2e concurrent-writer / SSI / group-commit batch 118 pass
+  in 16 targets (`ssi_write_skew`, `ssi_conflict_oracle_e2e`, `bd_3plop_5`, `bd_2yqp6_6_1`,
+  `correctness_mvcc_isolation`, `observed_disjoint_writer_overlap_for_certificate` among them);
+  second batch 41 pass including `refused_commit_ends_transaction_e2e` 4 and
+  `mvcc_edge_case_oracle_e2e`, 1 red:
+  `multiprocess_autocommit_busy_timeout_e2e::cross_process_explicit_writers_on_own_tables_certify_the_durable_floor`,
+  whose failing assertion is its 8x300 own-table STOCK oracle shape (`run_shape("stock-explicit-own")`:
+  rusqlite child processes; 4 of 2,400 autocommit INSERTs got "database is locked" within the
+  5 s busy_timeout on the worker); no fsqlite code runs in those writers, so it is not this
+  change; reported to the coordinator, not rerun. fsqlite-core lib 4,186 pass with the 2 known
+  t6741 reds; fsqlite-pager lib 1,112 pass with the known bd_2jpu6_2 red (bd-mcpbv). Stock
+  integrity (bd-73pfl request): 20 shared-table runs at 8 / 16 / 32 writers, A and B interleaved,
+  every database checked with system sqlite3 3.46.1 `PRAGMA integrity_check`: 150 fsqlite files
+  per arm and 450 stock files per arm, all ok, every fsqlite file holding all of its rows.
+- Retry condition for what is left: at 64 writers the holds are now validate 81 / publish 70 us
+  on the probe's scale, of which `pending_publication_blocks` 24.4, the peer view collection 16.8
+  + 19.7 and `ActiveEdgeDiscoveryIndex::build` 16.3 + 17.4 (bd-i0tn6 lever 4 design: candidates by a
+  direct scan). Below 16 writers the holds are not the binding cost: the group-commit waiter wait
+  (167-282 us per commit at 8-16w) and the BEGIN refresh CPU (+140-188 us) are. Do not retry a lazy
+  or deferred prune: the DRO pivot decision reads the history length.
+
+## 2026-11-14 - WIN: a composite index range walks a later qualifying index that covers the statement, not the first declared one (bd-w4pr1.13.18, read/seek round 3, levers R1 and R1b)
+
+- Target: the worst row of round 3's stock-live read sweep (`scratchpad/rs3_sweep.py`, table on
+  bd-w4pr1.13.18): `SELECT count(*), sum(val) FROM s WHERE g BETWEEN 100 AND 599` over a 500k-row
+  file table with s_gh(g, h) declared before s_gv(g, val). Stock walks s_gv as a covering index;
+  fsqlite walked s_gh and looked every entry's row up (IdxRowid + SeekRowid): 17.8x stock in
+  instructions, 26x in CPU. A plain `SELECT g, val ...` over the same range did the same (4.9x)
+  and returned its rows in s_gh's order, not stock's.
+- Touched: `crates/fsqlite-vdbe/src/codegen.rs`. `composite_index_prefix_range_target` takes an
+  optional covering test. Every index it admits enforces the whole WHERE (its residual guard
+  admits only conjuncts the prefix or the range column pins), so all of them visit the same
+  entries. With the test, a first qualifying index that fails it is kept as the fallback while a
+  later one that passes is looked for. The aggregate walk passes `aggregate_seek_is_covering` (R1);
+  the plain SELECT passes `resolve_covering_output_sources` when it has no ORDER BY (R1b), and
+  none with one, since `composite_order_by_satisfied` depends on the chosen index; the COUNT(*)
+  gate passes none. No IN-list path is touched.
+- Ledger preflight: no entry covers the choice among composite candidates. bd-k96op (2026-11-14)
+  orders residual-covering indexes first in the single-column/residual target; bd-bn45n made the
+  pure leading range a composite seek; bd-y8zgm's retry note asks the same of the eq-residual
+  target.
+- Result. thinkstation1, governor powersave, io_uring refused, 3 reps, stock sqlite3 3.46.1 live,
+  one fsqlite-built database (fsq.db 4842db3b7bb7fda1). Binaries main eb5782e1a 1a27ecdab9224dc4,
+  r1 518258c685cbd88b, r1b = r1 + R1b 510248630f228bb2. Answers equal stock's on all 20 rows with
+  r1b, including row order.
+
+  | statement | stock | main | r1b |
+  |---|---|---|---|
+  | range_covering_250k (aggregate) | 184.7M, 18.0 ms | 3,281.7M (17.77x), 470.0 ms | 849.0M (4.60x), 76.0 ms |
+  | nonagg_range_covering_50k (`SELECT g, val`, 50k rows) | 156.1M, 14.8 ms | 770.0M (4.93x), 104.5 ms, other order | 402.6M (2.58x), 42.4 ms, stock's order |
+  | nonagg_range_limit_1000 | 3.2M | 17.7M (5.57x), other order | 8.4M (2.63x), stock's order |
+  | point_rowid_2000 (control) | 44.0M | 178.6M | 178.7M |
+
+  Every other row within 0.1M or 0.1% of main, except point_sec_key_2000 at +0.8M (+0.18%) in R1's
+  own run and +0.2M in R1b's: callgrind puts that on the allocator's slow path (_int_malloc entered
+  70,330 times against 65,495 with unchanged malloc and free counts), a heap-layout effect of the
+  binary; the target's own code is +41 instructions on that row.
+- Predictions (bead, before code): R1 780M to 860M and 60 to 95 ms (measured 849.1M, 70.6 ms);
+  R1b 360M to 420M and 35 to 50 ms (402.6M, 42.4 ms), order equal to stock's. Controls inside.
+  Kill lines not crossed.
+- Behaviour: rows of a plain SELECT, and of an order-sensitive aggregate (group_concat), over such
+  a range now come in the covering index's order, which is the order stock returns.
+- Keepers (`crates/fsqlite/tests/agg_composite_prefix_range_oracle.rs`):
+  `agg_composite_range_prefers_a_later_index_that_covers` and
+  `nonagg_composite_range_prefers_a_later_index_that_covers`, against rusqlite in memory, on a file
+  fsqlite wrote and on a file stock wrote (whole REAL values stored as integers), strict mode on
+  the files, rows compared in order. Negative cases: a WHERE only the first index pins keeps it
+  with its lookups; a first index that covers stays chosen; when none covers the first is kept;
+  an ORDER BY keeps today's choice; a WITHOUT ROWID twin.
+- Gate (r3g4 on the landed diff, rch; then the rebase onto 64cb4061f brought d17095073 into
+  codegen.rs, and clippy, the vdbe lib suite with the goldens and the composite-range oracles
+  were run again on the rebased tree):
+  - clippy -D warnings on fsqlite-vdbe, fsqlite and fsqlite-e2e, all targets: clean;
+  - the keeper file 5/0;
+  - fsqlite-vdbe --lib 1,251/1 (test_codegen_select_count_star_indexed_in_list_uses_index_probe_expansion,
+    red on main: the same failure in round 2's r2g3 run at a527f8a1f), golden_bytecode_snapshots
+    8/0, hot_arm_stream_reachability 1/0, issue_531_grouped_index_input 14/0;
+  - 41 fsqlite aggregate / composite / range / min-max / count oracle targets, 65/0;
+  - round 2's keeper batches: join/seek 10 targets 29/1 (bd_8c68u's compile-count test,
+    bd-f8m1v), seek-key 8 targets 17/0, savepoint/trigger/peer/staleness 9 targets 65/0;
+  - --lib: btree 560/0, pager 1,113/1 (bd_2jpu6_2, bd-mcpbv), core 4,186/2 (the t6741 pair,
+    bd-nouem).
+  - Not run: the cross-process battery and the fsqlite-e2e concurrent-writer set (no pager, WAL
+    or cache change).
+  - The final rebase onto cb5fff4ea brought only `wal_adapter.rs` changes, in no file this
+    touches.
+- Landed in 514a631b4.
+- Retry / widen: the covered walk is 3,396 instructions a row against stock's 739 (aggregate) and
+  8,052 against 3,123 (plain, printed): the VDBE row loop (Column decode, AggStep, dispatch),
+  the serial read lane's. COUNT(*) over the same composite range still steps every entry (2,364
+  against 371 a row): bd-2fb53's own retry note.
+
+## 2026-11-14 - REJECTED on its kill line: interior routing keys kept on the decoded-page memo's hit, the keep folded into DecodedPageMemo::lookup (bd-w4pr1.13.18, read/seek round 3, lever R2)
+
+- Target: the interior binary search's routing-rowid decode, retried as the 2026-11-14 lever-4
+  entry below asks ("the served-again test folded into `DecodedPageMemo::lookup`, so `load_page`
+  gains no branch or move").
+- Touched (reverted, never committed; patch `scratchpad/rs3/r2_v1_only.patch` of the coordinator
+  session): `crates/fsqlite-btree/src/cursor.rs`. Lever 4's 32 direct-mapped routing-key entries
+  (empty, unallocated, until the first keep; an entry never handed to another page), filled on the
+  memo's hit branch from the hit's checked cell pointers and the page's usable bytes;
+  `table_seek_for_insert` searches a kept slice. Lever 4's three keepers, adapted, passed.
+- Result. thinkstation1, governor powersave, load 1.9 to 2.4, io_uring refused, 3 reps, stock
+  sqlite3 3.46.1 live, round 3's 17-row read sweep (`scratchpad/rs3_sweep.py`). Binaries r1
+  518258c685cbd88b (main + lever R1) and r12 = r1 + this diff 5a8ea6c681360590. Answers equal
+  stock's.
+
+  | statement | stock | r1 | r12 |
+  |---|---|---|---|
+  | rowid_lookups_200k | 554.4M | 2,674.7M (4.82x) | 2,496.8M (4.50x) |
+  | join_1M_to_pk_1000 | 1,721.4M | 4,477.2M (2.60x) | 4,427.7M (2.57x) |
+  | join3_pk_300k | 952.2M | 3,104.4M | 2,898.9M |
+  | range_noncovering_200k | 637.6M | 3,347.7M | 3,174.6M |
+  | point_rowid_2000 (control, one lookup a statement) | 44.0M | 178.7M | 178.7M |
+  | orderby_page_500x20 (20 lookups a statement) | 60.7M | 303.4M | 330.0M (+8.8%) |
+  | multicol_eq_1000 (5 lookups a statement) | 60.1M | 395.3M | 398.0M (+0.68%) |
+
+- Prediction (bead, before code): rowid -130M to -175M (measured -177.9M), join -25M to -45M
+  (-49.5M), the one-lookup control within +0.3M (0), other rows within 0.3%. Kill: another row
+  worse by more than 0.3%. Crossed twice: REJECTED and reverted.
+- Why (callgrind of both binaries on orderby_page_500x20, per statement +53.1k): the key decode
+  (+22.3k in `read_varint`, about 11k of iterator code), the `Vec<i64>` collect growing by realloc
+  (about 10k of malloc work) and the memo lookup (+8.3k), against 14.8k saved in
+  `table_interior_rowid_at`. A statement's fresh cursor makes 20 descents; each interior page of s
+  (about 250 cells) that the memo serves a second time pays a whole decode and is searched only a
+  few more times. Lever 4's sweep had no short multi-lookup statement, so it never showed this.
+- Retry condition: keep keys only after a page has been served enough times to repay its decode
+  (decode about 30 x cells, a slice search saves about 70 x log2(cells), so about 13 searches for
+  a 250-cell page), with a count that survives the 8-slot memo's evictions (333k of rowid's 600k
+  loads miss it) and a presized collect. Judge it on orderby_page_500x20 and multicol_eq_1000 as
+  well as the one-lookup control; the gains above are what it has to keep. Such a design (a
+  per-cursor counter, threshold 2 + cells/20) is drafted, not built, in
+  `scratchpad/rs3/r2b_code_draft.rs`, with its prediction on bd-w4pr1.13.18.
+
+## 2026-11-14 - WIN (inside its prediction, at the low end on CPU): a Column on a sorter cursor runs on the synchronous hot lane (bd-w4pr1.13.8, lever G2)
+
+- Target: the output loop of a sorted GROUP BY (SorterData, Column on the sorter, IfPos, Ne, Copy,
+  AggStep, SorterNext) left the synchronous lane once per row for its `Column`: the sync Column arm
+  handled storage cursors only, so a sorter's Column went through `try_execute_hot_opcode_async`,
+  `execute_column_hot`, the async `column_to_reg_direct` probe that declines and the async
+  `cursor_column`: 524.7M Ir inclusive on group_by_1000_groups (cursor_column 133.0M x1M,
+  column_to_reg_direct 57.0M x1M, the async frame ~170M), ~400 Ir a row. Touched:
+  `crates/fsqlite-vdbe/src/engine.rs` (`sorter_current_row_column`, `try_sorter_column_to_reg`,
+  the sync Column arm, `cursor_column`'s sorter branch),
+  `crates/fsqlite-core/tests/bd_w4pr1_13_1_sync_lane_boundary_oracle.rs`
+  (`sorter_column_reads_match_sqlite_on_a_strict_file_database`).
+- Ledger preflight: 2026-11-11 bd-w4pr1.13.7 (SorterInsert / SorterCompare / SorterData moved to the
+  sync lane with their bodies unchanged; Column on a sorter was not among them); INDEX row "Removing
+  or adding single arms of try_execute_hot_opcode" -- no arm is added: the existing Column arm gains
+  a third lane, measured base and candidate in one invocation as its retry condition asks.
+- Pre-registered on bd-w4pr1.13.8 (2026-11-14T20:40Z): group_by_1000_groups Ir 3,406M ->
+  3,000-3,150M, CPU -25 to -50 ms; a GROUP BY reading a non-key sorter column lower by a similar
+  250-400 Ir per row read; other read rows within 0.1% Ir. Kill: under -150M Ir or CPU not lower on
+  group_by_1000_groups, another read row up by more than 0.5% Ir, a keeper change.
+- Change: cursor_column's sorter branch (it awaits nothing) becomes `sorter_current_row_column`,
+  called by `cursor_column` as before and by the sync Column arm after the two storage-cursor lanes
+  decline, for a cursor id that is neither a storage nor a memory cursor (cursor_column reads those
+  first) and is a sorter: the same value, `set_reg_fast`, metrics calls and errors. No bytecode
+  change.
+- Result (thinkstation1, governor powersave, io_uring refused, serial `parallel_workers=1`; base main
+  3dfe159c2 sha256 7e21f93bf43bfa15, G2 2007105f0a3df447 = 3dfe159c2 + this diff; stock sqlite3
+  3.46.1 live in the same par_probe run, reps 5, two runs at load 1.9 and 2.5; answers equal
+  everywhere): group_by_1000_groups 3,405.8M -> 3,010.8M Ir (-395M; stock 2,876.2M), CPU 378.4 ->
+  351.9 / 368.2 -> 340.4 (same run, second statement) / 374.0 -> 352.0 / 395.2 -> 340.0 ms
+  (x1.81-1.94 -> x1.67-1.75 stock); GROUP BY a with sum(c) (two sorter columns a row) 4,913.4M ->
+  4,106.4M, CPU x1.85-1.90 -> x1.62-1.66; GROUP BY a % 10 3,562.0M -> 3,170.0M, x1.82-1.93 ->
+  x1.66-1.73; GROUP BY id % 100000 3,717.1M -> 3,330.4M, x2.13-2.22 -> x1.88-1.95. scan_filter_agg
+  1,259.9M -> 1,262.4M (+2.5M, +0.2%: the Column arm's third lane changes the dispatcher's code
+  layout; inside the 0.5% kill line), order_by_text_limit10 1,740.3M -> 1,738.3M, count_star
+  unchanged. Prediction: Ir inside its range (-395M against -256..-406M); CPU -22 to -55 ms against
+  -25..-50 (low end); the non-key shape -807M (two Columns a row), above the per-read estimate.
+  Kill lines not crossed. After G2 the GROUP BY sort (`sort_rows_by_single_integer_key` 23.4% + its
+  quicksort 7.4%) is ~31% of group_by_1000_groups' cycles: the next lever there (G3, designed on
+  bd-w4pr1.13.8, not started).
+- Gate (on 3dfe159c2 + this diff): clippy -D warnings fsqlite-vdbe --all-targets and fsqlite-core
+  --lib + the keeper target clean; fsqlite-vdbe lib 1,249 passed, 1 failed (bd-bhalc's
+  `test_codegen_select_count_star_indexed_in_list_uses_index_probe_expansion`, red on main),
+  golden_bytecode_snapshots 8/8; fsqlite-core lib 4,185 passed, 2 failed (the t6741 pair,
+  bd-nouem); 26 GROUP BY / ORDER BY / DISTINCT / aggregate / index-build / window keepers plus the
+  parallel scan oracle and budget: 71 passed, 2 failed --
+  `indexed_group_by_predicates_match_sqlite_without_table_scans` (red on main) and the first
+  version of the new keeper, whose 6 of 11 queries strict mode refused (a NOCASE key, an
+  expression key with DISTINCT aggregates, `typeof(k)`, a DESC key order with max(s), two grouped
+  derived tables: they do not run the sorter program; no answer differed). Those now run with
+  strict mode off as plain answers and 3 more program-run shapes read non-key sorter columns; the
+  revised keeper passes (2/2 in its target; 8 program-run queries under strict mode, 5 plain). Its
+  first rerun found a divergence that is not this lever's: `GROUP BY s` over a NOCASE column
+  prints the first row's spelling of a group ('Name-0', 'b') where stock prints the last row's
+  ('NAME-0', 'B'); the main 3dfe159c2 CLI prints the same as G2 in memory and on a file, so it is
+  left out of the keeper and reported on bd-w4pr1.13.8. fsqlite agg_index_range,
+  distinct_loose_scan and the six count / min / max / range oracles: 17 passed.
+- Verdict: WIN against stock live: group_by_1000_groups x1.81-1.94 -> x1.67-1.75 CPU (a
+  self-speedup of the serial path whose stock ratio moved; still a loss to stock). Landed as
+  bef295de6 (rebased over upstream codegen-only commits; clippy -D warnings fsqlite-vdbe --lib
+  clean on the rebased tree).
+- Retry condition: none (kept). A sorter Column of a non-key column still decodes through the
+  sorter's row cache (`sorter_current_row_column`); an in-place decode like the storage Column lane
+  is worth it when a profile puts that function at 5% or more of a GROUP BY row.
+
+## 2026-11-14 - REJECTED on its point-SELECT kill line: an interior table image the cursor's memo serves again keeps all its routing keys, and the descent searches them as a slice (bd-w4pr1.13.18, join / rowid-seek round 2, lever 4)
+
+- Target: the interior binary search's routing-rowid decode (rowid_lookups_200k: 2.59M reads at
+  78, 7.3%; join_1M_to_pk_1000: 972k at 70). This is the narrowed retry of lever 2 (two entries
+  below): keys only, no per-read closure, no bit set.
+- Touched (reverted, never committed; patch `scratchpad/jr2_l4_v1_only.patch` of the coordinator
+  session): `crates/fsqlite-btree/src/cursor.rs`.
+  - `DecodedPageMemo::routing_keys`: 32 direct-mapped `(page, token, Vec<i64>)` entries, empty
+    until used. An entry is never handed to another page.
+  - `load_page` decodes and keeps all keys on a memo hit of an interior table image.
+  - `table_seek_for_insert` searches them with `binary_search_routing_keys`: the same loop, the
+    same cancellation check per probe.
+  - Keepers: equality with `binary_search_table_interior` over 95k targets; keys never route a
+    changed image; a colliding page does not take another's keys. clippy clean.
+- Result. thinkstation1, governor powersave, load 8.5, io_uring refused, 5 reps, stock sqlite3
+  3.46.1 live. Binaries l3 cf68d8835f195223 (the lever-3 WIN below) and l34 = l3 + this diff
+  8c946da5a372b1da. Answers equal stock's.
+
+  | statement | stock | l3 | l34 |
+  |---|---|---|---|
+  | rowid_lookups_200k | 554.4M | 2,681.4M (4.84x) | 2,521.3M (4.55x) |
+  | join_1M_to_pk_1000 | 1,721.4M | 4,478.1M (2.60x) | 4,444.9M (2.58x) |
+  | 2,000 autocommit point SELECTs | 42.7M | 167.8M | 169.3M |
+
+  group_by_1000_groups +0.4M, order_by_text_limit10 +1.4M; scan_filter_agg and count(*)
+  unchanged.
+- Prediction (bead, before code):
+  - rowid -120M to -175M; measured -160.1M, inside;
+  - join -30M to -55M; measured -33.2M, inside;
+  - the point-SELECT control within +0.2M; measured +1.5M.
+  Kill: that control worse by 0.4M or more. Crossed: REJECTED and reverted.
+- Why the control moved (callgrind of the control, +604 per statement). No statement kept keys:
+  each fresh cursor loads each page once. Two costs:
+  - `load_page` +139 (+46 per load): the served-again test and the StackEntry move the keep
+    needs;
+  - `_int_malloc` +313 and `unlink_chunk` +95, from the same 6,306 reallocs now leaving their
+    chunk more often. Those are the String/PathBuf growth in `journal_path`,
+    `refresh_runtime_committed_state` and `begin_wal_path_identity`, not this lever's code: a heap
+    layout effect, deterministic per binary.
+- Retry condition: the same keys with the served-again test folded into `DecodedPageMemo::lookup`,
+  so `load_page` gains no branch or move. Judge the point-SELECT control on process-level
+  instructions, and list the realloc sites separately when they move. The rowid and join gains
+  above are what such a retry has to keep.
+
+## 2026-11-14 - WIN: SipHash leaves the page-miss path: the in-flight read map and the WAL page index hash page numbers with foldhash (bd-w4pr1.13.18, join / rowid-seek round 2, lever 3)
+
+- Target: `RandomState::hash_one` on every page-cache miss. Callgrind on main a527f8a1f: 89.2M of
+  rowid_lookups_200k (3.2%), 753k hashes at 118 each:
+  - `InFlightReadLeader::finish`, 376k (a get, then a remove of the same page);
+  - `claim_in_flight_read`, 188k (the insert);
+  - the pinned WAL snapshot's page_index lookup, 189k.
+- Touched:
+  - `crates/fsqlite-pager/src/page_cache.rs`: `in_flight_reads` with `foldhash::fast::FixedState`;
+    `finish` removes the page's flight through one `entry()` probe, only while it is still this
+    leader's flight.
+  - `crates/fsqlite-pager/src/snapshot_reader.rs` and `lib.rs`: `pub type WalPageIndex =
+    HashMap<u32, usize, FixedState>`, the type of `WalSnapshotFrames::page_index` (the parallel
+    scan's snapshot reader shares the published index's Arc).
+  - `crates/fsqlite-core/src/wal_adapter.rs`: the published `page_index` and the publication
+    delta use it.
+- Ledger preflight: no entry covers these hashers. The page cache's shards already key
+  `PageNumber` maps with `FixedState`. Round 1's lever-2 retry note named the page-index SipHash
+  as part of a miss's remaining WAL-lookup cost.
+- Result. thinkstation1, governor powersave, load 4.3, io_uring refused, 5 reps, stock sqlite3
+  3.46.1 live. Binaries main b45c84151634c54f and l3 = main + this diff cf68d8835f195223 (the
+  landed commit differs from it only in test code and doc comments). One fsqlite-built database.
+  Answers equal stock's.
+
+  | statement | stock | main | l3 |
+  |---|---|---|---|
+  | rowid_lookups_200k | 554.4M | 2,777.8M (5.01x) | 2,681.4M (4.84x) |
+  | join_1M_to_pk_1000 | 1,721.4M | 4,482.7M (2.60x) | 4,478.1M (2.60x) |
+  | group_by_1000_groups | 2,876.2M | 3,407.0M | 3,403.1M |
+  | order_by_text_limit10 | 777.1M | 1,740.5M | 1,736.7M |
+  | 2,000 autocommit point SELECTs | 42.7M | 169.2M | 167.9M |
+  | 1,000 autocommit INSERTs (fresh file) | 23.61M | 183.07M | 182.87M |
+  | 100 transactions of 10 INSERTs (fresh file) | 16.49M | 57.01M | 56.97M |
+
+  Open plus `SELECT 1`: 5.32M -> 5.07M; the WAL index built at open hashes faster. rowid CPU, 8
+  interleaved pairs: user cycles 1,704M -> 1,670M (-2.0%), task-clock 692 -> 680 ms.
+- Prediction (bead, before code):
+  - rowid -60M to -90M; measured -96.4M, a little past the range;
+  - the three scan rows -1M to -4M; measured -3.8M to -4.6M;
+  - the point-SELECT control within 0.2M; measured -1.3M (open);
+  - write rows not worse; measured inside 0.1%.
+  Kill (rowid under 45M, a control 0.3% worse, an answer change): not crossed.
+- Measurement trap: a write probe that reused one growing database per arm showed this lever
+  about 1% worse on the transaction row. The arms' schemas differed (the table names carried the
+  arm label), and the per-statement schema scans account for the gap. Compare write rows on fresh,
+  identical files.
+- Gate (r2g3, on the landed tree before its rebase). clippy -D warnings on pager, btree, vdbe and
+  core, all targets: clean.
+  - --lib: btree 556/0; pager 1,112/1 (bd_2jpu6_2, red on main); core 4,182/2 (the t6741 pair,
+    bd-nouem); vdbe 1,249/1 (bd-bhalc).
+  - Keepers: the 10 join and seek targets, with one red, bd_8c68u's compile-count test
+    (bd-f8m1v); the 7 seek-key targets 13/0; the 9 savepoint, trigger, peer and staleness
+    targets 65/0.
+  - 24 targets on hz3: the pager-touch keepers (bulk_import_upsert_text_pk_phantom_pk, gh534,
+    gh525, gh457, gh338, bd_2jbl5), the fsqlite rowid keepers and the fsqlite-e2e
+    concurrent-writer batch. One red: `observed_disjoint_writer_overlap_for_certificate`, the
+    known duplicate commit_seq at finalize (bd-i0tn6).
+  - bd_2jbl5 first stalled past 7 minutes on vmi1156319 (bd-w4pr1.37), then passed in 47 s on
+    hz3.
+  - Post-rebase clippy on pager and core: clean.
+- Keepers: a finishing leader leaves a newer flight for its page in place
+  (`test_in_flight_finish_removes_only_its_own_flight`; removing by page number alone would strand
+  that flight's followers). The existing in-flight, snapshot-reader and WAL page-index tests, with
+  their expected maps built as `WalPageIndex`.
+- After (callgrind of l3, rowid):
+  - the WAL lookup on a miss is 353 (main 480);
+  - `claim_in_flight_read` 137 (main 249);
+  - `finish` 2,411 per miss (main 2,681). Most of it is still the eviction trim and its tracker
+    `forget` (1,587).
+- Landed in 091d26b0d.
+- Retry / widen: the WAL lookup's remainder is the registry handle, the read-lock helper and the
+  async frame. Widen only with a profile that puts it above 2% of a row.
+
+## 2026-11-14 - REJECTED on two kill lines: the decoded-page memo keeps the rowids a table search reads, and interior pages get memo slots leaves cannot take (bd-w4pr1.13.18, join / rowid-seek round 2, lever 2)
+
+- Target, from callgrind on main a527f8a1f:
+  - rowid_lookups_200k: the interior binary search read 2.59M routing rowids at 78 each (201.8M,
+    7.3%). 333k of 600k page loads missed the 8-slot memo and decoded their pointer array (355
+    each), because random leaves of t took the slots of its 18 interior pages.
+  - join_1M_to_pk_1000: the leaf search was 240 per probe (2.985M leaf rowid reads at 51), and
+    remember_table_landing re-read the leaf's first and last rowid.
+  This is the retry the 2026-11-14 lever-3 rejection named (routing keys decoded once per image,
+  kept with the memo).
+- Touched (reverted, never committed; patch `scratchpad/jr2_l2_v1.patch` of the coordinator
+  session): `crates/fsqlite-btree/src/cursor.rs`.
+  - `DecodedRowids` holds a `Vec<i64>` and a bit per cell. It is turned on when the memo serves
+    an image again, and a search's first read of a cell stores its rowid.
+  - The leaf search, the interior search and the leaf bounds take their rowid reader as a
+    parameter (`memo_rowid_reader`).
+  - An interior page displaced from the 8 inline slots moves to 32 interior slots, allocated at
+    the first displacement.
+  - Keepers: the memoized searches equal the plain ones over 24k targets on dense, gapped and
+    interior pages; stored rowids never answer for a changed image; leaf loads do not drop an
+    interior page. fsqlite-btree --lib 559 pass.
+- Result. thinkstation1, governor powersave, load 1.1, io_uring refused, 5 reps, stock sqlite3
+  3.46.1 live. Binaries main b45c84151634c54f and l2 = main + this diff 7f06046ea7bb8556. Answers
+  equal stock's.
+
+  | statement | stock | main | l2 |
+  |---|---|---|---|
+  | rowid_lookups_200k | 554.4M | 2,777.7M (5.01x) | 2,631.9M (4.75x) |
+  | join_1M_to_pk_1000 | 1,721.4M | 4,482.5M (2.60x) | 4,425.0M (2.57x) |
+  | 2,000 autocommit point SELECTs | 42.7M | 169.2M | 171.2M |
+
+  group_by_1000_groups +0.2M, order_by_text_limit10 +1.1M; scan_filter_agg and count(*)
+  unchanged. CPU on rowid did not move (658 ms both).
+- Prediction (bead, before code):
+  - rowid -130M to -230M; measured -145.8M, inside;
+  - join -200M to -300M; measured -57.5M;
+  - all-hits control within +0.3M; measured +2.0M.
+  Kill lines crossed: the join drop under 130M, and the all-hits control +0.8M or more. REJECTED
+  and reverted.
+- Why (callgrind of l2):
+  - The memo hit where it was aimed: on rowid, interior rowid decodes fell from 2.59M to 226k
+    and pointer decodes from 333k to 216k.
+  - A stored rowid costs about 28 per read against 51 to decode: the Option match, the
+    covered-cell test, the bit test and two bounds-checked slices. The prediction priced it at 8.
+    On the join, decoding fell by 250 per row, while the reader added 140 and the memo lookups in
+    the seek 36.
+  - Fresh cursors (the all-hits control) paid about 840 per statement:
+    - the interior table allocated on most point SELECTs, since t's descent loads two interior
+      pages and a leaf (about 230 in malloc and free);
+    - larger memo moves (+120 memcpy);
+    - the reader on images that never store (about 150);
+    - the memo lookups (about 140).
+- Retry condition: not this shape. Two separate retries:
+  1. Interior routing keys only: a complete `&[i64]` per interior image, searched as a plain slice
+     with no per-read closure and no bit set, and interior slots that cost a fresh cursor nothing
+     (no allocation, no larger inline memo). Gate it on the all-hits point-SELECT control within
+     0.2M. Tried the same day as lever 4 (two entries above) and rejected on that control; its
+     entry carries the next retry condition.
+  2. The join's leaf search (240 per probe), with a stored-rowid read at or under 10
+     instructions.
+
+## 2026-11-14 - REJECTED on its kill line: the eviction tracker forgets a page by lazy deletion through a page-to-slot HashMap (bd-w4pr1.13.18, join / rowid-seek round 2, lever 1)
+
+- Target: `S3FifoEvictionTracker::forget`, run on every page-cache eviction. Fresh callgrind on main
+  a527f8a1f: 1,587 per eviction, 297.5M of rowid_lookups_200k (10.8%; 187.5k evictions).
+  - This is the third try. The retry condition of the 2026-11-11 and 2026-11-12 rejections below
+    is lazy deletion with bookkeeping per admission under 100 instructions.
+  - Touched (reverted, never committed; patch `scratchpad/jr2_l1_v1.patch` of the coordinator
+    session): `crates/fsqlite-pager/src/page_cache.rs`. The S3-FIFO and ARC trackers share a new
+    `AccessTrace`:
+    - entries of (slot, generation);
+    - a slot per page with live entries, and a `HashMap<PageNumber, u32>` (foldhash) from page to
+      slot;
+    - `forget` frees the slot and advances its generation;
+    - a full history skips dead entries at the front when it drops its oldest live one;
+    - `VecDeque::retain` sweeps the ring at twice the bound;
+    - a back-to-back record of the same page reuses the last slot.
+  - Its keepers passed: a model test against the eager VecDeque over 100k random operations, a
+    negative case (a forget makes room in a full history), and S3-FIFO victim and snapshot
+    equality with a replay of the eager history.
+- Result. thinkstation1, governor powersave, load 5.6, io_uring refused, 5 reps, stock sqlite3
+  3.46.1 live. Binaries main b45c84151634c54f and l1 = main + this diff 4655a3e241c19adb. One
+  fsqlite-built database. Answers equal stock's.
+
+  | statement | stock | main | l1 |
+  |---|---|---|---|
+  | rowid_lookups_200k | 554.4M | 2,777.7M (5.01x) | 2,533.4M (4.57x) |
+  | join_1M_to_pk_1000 | 1,721.4M | 4,482.7M | 4,473.1M |
+  | group_by_1000_groups | 2,876.2M | 3,406.9M | 3,397.9M |
+  | order_by_text_limit10 | 777.1M | 1,740.5M | 1,732.4M |
+  | 2,000 autocommit point SELECTs (all page-cache hits) | 42.7M | 169.2M | 169.9M |
+
+  rowid CPU, 8 interleaved pairs: user cycles 1,712M -> 1,615M (-5.7%), task-clock 684 -> 663 ms
+  (-3%). scan_filter_agg and count(*) are unchanged.
+- Prediction (bead, before code):
+  - rowid -230M to -290M; measured -244.3M, inside;
+  - three scan rows -8M to -11M each; measured inside;
+  - the all-hits control +0.1M to +0.4M; measured +0.7M, above the range and under its 1.0M kill
+    line.
+  - Kill: tracker work per miss (record_admit + record_access + forget + the sweep) at or above
+    170, i.e. more than 100 above today's two trace pushes. Measured about 354: the old tracker's
+    310.7M less the row's 244.4M drop, over 187.5k misses. REJECTED and reverted.
+- Why it missed (callgrind of l1). The two records of a miss (admission, then the read) cost 249:
+  - VecDeque push and the retain sweep 51; the retain is about 20 per swept entry;
+  - the hashbrown insert about 45 with its SSE2 group and tag code;
+  - bounds checks 23;
+  - the function's own code 77.
+  `forget` costs 79, plus about 30 of inlined hashbrown removal. The prediction priced the hash
+  map at a third of that and did not price the retain per entry.
+- Retry condition: one tracker per miss under 170 by callgrind, from a purpose-built
+  open-addressing table keyed by page number in place of the HashMap, and dead entries popped at
+  the front on each record in place of the retain sweep. Under round-robin flat-slot eviction the
+  oldest entries die first. Estimated at 190 to 240 per miss before writing it, so measure the
+  table alone first. Also measure user cycles with interleaved pairs: a 5-rep task-clock showed
+  nothing here while cycles moved 5.7%.
+
+## 2026-11-14 - WIN (prediction missed, beyond its range): an UPDATE row body preloads only unassigned columns, re-inserts under its kept INTEGER PRIMARY KEY register and applies its second Affinity only when a constraint can change a register (bd-w4pr1.13.20, lever U)
+
+- Target: every UPDATE row of a rowid table through `codegen_update` (not UPDATE ... FROM, not WITHOUT ROWID):
+  the scorecard's `update_10pct_300k` (30,000 rewritten rows). Touched: `crates/fsqlite-vdbe/src/codegen.rs`
+  (`codegen_update`; `row_body_needs_affinity_after_constraints` now serves UPDATE too).
+- Evidence before: `EXPLAIN UPDATE m SET a = a + 1 WHERE id % 10 = 0` on main ran 16 opcodes per updated row: a
+  Rowid of the one-pass scan nobody read on an alias table, a dead `Column` preload of the assigned column, the
+  `IsNull` / `Copy` / `Goto` of an INTEGER PRIMARY KEY that is never assigned (its `NewRowid` branch cannot run),
+  and a second `Affinity` with no constraint between the two passes. Stock runs 11.
+- Ledger preflight: bd-9ag5r (in-place rewrite) and levers F / Q (2026-11-13) changed the b-tree rewrite; lever A
+  (2026-11-14) skipped the same second Affinity for INSERT ... SELECT. No entry on the UPDATE row body's opcodes.
+- Change: (1) the preload skips assigned columns (each assignment form writes its target register before anything
+  reads it; the SET expressions read the old row through the cursor); (2) a kept, preloaded INTEGER PRIMARY KEY
+  register is the re-insert's rowid register; (3) the one-pass scan emits no Rowid of its own on such a table; (4)
+  the second Affinity follows `row_body_needs_affinity_after_constraints` (CHECK, NOT NULL ... REPLACE). The row now
+  runs 10 opcodes.
+- Prediction (on bd-w4pr1.13.20 before code, amended twice before code): `update_10pct_300k` -10M to -20M user
+  instructions; DELETE and bulk unchanged. Kill: under 5M.
+- Result, stock sqlite3 3.46.1 live in the same runs (r2_mut_probe, 7 interleaved reps, io_uring refused, databases
+  on disk scratch), host thinkstation1 (governor powersave), binaries main 4fb410a8d (52ac94f0...) and main + this
+  diff (587e1f77...): `update_10pct_300k` 633.5M -> 598.3M (-35.2M, -5.6%; 2.32x -> 2.19x stock 273.3M), CPU 136.0 ->
+  133.6 ms (stock 58.6); the statement alone 6,907 -> 5,733 instructions per updated row; `delete_14pct_300k` 421.5M
+  -> 421.5M; `bulk_insert_1M_one_txn` 8,187.6M -> 8,163.4M (arms in sequence; main's own min was 8,176.3M an hour
+  earlier). Prediction missed beyond its range (the six opcodes cost ~1,170 a row, not ~700); kill line not met.
+  Answers equal stock's; stock `PRAGMA integrity_check` ok on every file written.
+- Test: fsqlite-core `one_pass_delete_oracle::update_row_body_matches_stock` (12 UPDATEs on 5 tables against
+  rusqlite, `:memory:` and file, direct and prepared: column swaps, a column assigned twice and one read while
+  assigned, assigned-value affinity, RETURNING rowid + alias on an alias and an implicit-rowid table, one pass on
+  the implicit-rowid table, the alias assigned, a STORED generated column over an unassigned column, NOT NULL ...
+  REPLACE with DEFAULTs of another storage class, a CHECK; a body that dropped an unassigned preload stores NULL
+  there, one that skipped the second Affinity on `r` stores TEXT '7' in an INTEGER column; not run as a mutation).
+  The vdbe unit test `test_codegen_update_set_column_self_ref` pinned the dead preload (">= 3 Column ops"); it now
+  asserts one read of the assigned column and one preload of the other.
+- Gate (one gate for levers U, H, K and F2, rch, 2026-11-14, on main 4fb410a8d plus the four changes): clippy -D
+  warnings with all targets on fsqlite-vdbe and fsqlite-mvcc, and on the two touched fsqlite-core test targets,
+  clean (re-run after test-only fixes); fsqlite-vdbe lib 1,251 pass and 1 fail
+  (`test_codegen_select_count_star_indexed_in_list_uses_index_probe_expansion`, bd-bhalc, red on main), goldens 8
+  pass with the hand-edited `update_with_where_predicate` (GOLDEN-CHANGE note in the commit); fsqlite-mvcc lib 1,679
+  pass; 80 fsqlite-core keeper and EXPLAIN-reading targets (DML, triggers, FK, RETURNING, UPSERT, conflict clauses,
+  rowid / AUTOINCREMENT / rewinds, concurrent-writer stress, INSERT ... SELECT one-program and batched replay, every
+  EXPLAIN-reading core target) 578 pass and 10 fail: nine red on main (the gh516 trio, bd-d8s37's two
+  `fk_insert_conflict_oracle` upsert tests, bd-mkon7's `review_omitted_rowid_alias_ignores_defaults`, bd-jlbrk's two
+  `rowid_replace_preflight_*` tests, `bd_group_by_depth_oracle_probe::indexed_group_by_predicates_match_sqlite_without_table_scans`)
+  and the first version of lever K's oracle, which read generate_series on rusqlite (its bundled SQLite has none)
+  and then compared a CREATE TABLE's change count (stock reports the last DML's); both test bugs fixed, the target
+  re-run: 5 pass. 71 fsqlite DML and EXPLAIN-reading targets 223 pass. `bd_2jbl5_update_from_triggers_oracle` alone
+  3 pass in 48 s (hz3). fsqlite-core --lib was not run. After the clean rebase onto 8fb2902ee (upstream had changed
+  other codegen functions and several EXPLAIN-reading tests): fsqlite-vdbe lib 1,251 pass and the same 1 fail,
+  goldens 8 pass, clippy -D warnings on fsqlite-vdbe / fsqlite-mvcc all targets clean; the EXPLAIN-reading tests
+  upstream changed (agg_composite_prefix_range_oracle, agg_index_range_oracle, is_null_index_seek_oracle,
+  nonagg_in_residual_oracle, compat_tests, join_aggregate_lookup_oracle, agent_swarm_explain_concurrency_contract,
+  issue_491_bulk_insert, window_function_oracle) were not re-run on the rebased tree (their new assertions are
+  index-seek opcode gates and value oracles). Landed as da18bbdfc (levers U, H, K) and 0798067f9 (lever F2).
+- Retry / widen: `codegen_update_from` and the WITHOUT ROWID UPDATE still preload every column. Next on the UPDATE
+  row: the Delete arm's update-restore copy of the old payload (300 a rewritten row, `CursorBackend::payload`), which
+  nothing reads when the in-place rewrite cannot conflict (no UNIQUE index); see the bd-w4pr1.13.20 handoff.
+
+## 2026-11-14 - WIN (prediction missed, beyond its range): a literal operand of arithmetic, `||` or a bitwise operator is loaded once in the prologue, and a left literal is the operator's second source (bd-w4pr1.13.21, lever H)
+
+- Target: every expression row loop with `x op literal` or `literal op x` for + - * / % || & | << >>: the
+  scorecard's `bulk_insert_1M_one_txn` (`(value*7919)%1000`, `'row-'||value`, `value*1.5`), the 300k mutation
+  setup, `memory_script_200k`, UPDATE SET `a + 1`, projections and aggregates over such expressions. Touched:
+  `crates/fsqlite-vdbe/src/codegen.rs` (`emit_binary_op`, `hoisted_operand_literal`; lever G's
+  `emit_where_comparison_operand` and `hoisted_where_literal` folded into them).
+- Evidence before (main 4fb410a8d): the bulk INSERT ran 23 opcodes a row, 4 of them per-row loads of `Integer 7919`,
+  `Integer 1000`, `String8 'row-'`, `Real 1.5` into scratch registers (stock loads all four once); callgrind of the
+  statement alone: 6,919 instructions a row, `write_text_to_reg` for the String8 98, the synchronous lane's
+  dispatch ~25-30 an opcode.
+- Ledger preflight: c1076d876 (bd-w4pr1.13.31, WIN) built the prologue for comparison literals; lever G
+  (08b5fa96b, WIN) read a right arithmetic literal from it inside WHERE comparisons only and kept a left literal as
+  the destination's per-row load. No entry rejects hoisting operands.
+- Change: an INTEGER, REAL or TEXT literal operand of those operators reads a prologue register
+  (`ProgramBuilder::hoisted_literal`; a program without a leading Init keeps the load). A right literal is P1; a left
+  literal is P2 and the right operand goes to the scratch register, the result to the destination, so nothing after
+  the prologue writes a literal register (the arithmetic, Concat and bitwise arms read P1 / P2 and write only P3).
+  AND / OR, comparisons, NULL / BLOB / CURRENT_* literals unchanged. The bulk row now runs 19 opcodes.
+- Prediction (on bd-w4pr1.13.21 before code): bulk -200M to -300M user instructions, CPU -1% to -3%; update -0.5M
+  to -2M; delete unchanged. Kill: bulk under 120M.
+- Result, stock sqlite3 3.46.1 live in the same runs, host thinkstation1 (governor powersave, load average 7-9 from
+  other lanes), binaries main + U (587e1f77...) and main + U + H (623ce6bc...): `bulk_insert_1M_one_txn`
+  (r2_bulk_probe, arms interleaved, 7 reps, io_uring allowed, disk scratch) 8,178.4M -> 7,794.8M (-383.6M, -4.7%;
+  1.96x -> 1.87x stock 4,177.5M), CPU 1,022.0 -> 987.7 ms (-3.4%), wall 1,156.9 -> 1,126.2 ms (2.09x -> 2.04x
+  stock 553.3 ms); callgrind of the statement alone 6,919 -> 6,540 a row; `update_10pct_300k` 598.4M -> 596.6M;
+  `delete_14pct_300k` 421.5M -> 421.5M. The bulk prediction was missed beyond its range (four loads and their
+  dispatch ~380 a row); the others met; kill line not met. Answers equal stock's; stock integrity_check ok.
+- Tests: fsqlite-vdbe `test_codegen_projection_literal_operands_are_loaded_once`; lever G's codegen test pinned the
+  left literal's per-row load and now asserts its prologue load, P2 role and that only the prologue loads its
+  register; fsqlite-core
+  `bd_integer_arithmetic_edges_oracle_probe::literal_operands_over_scanned_rows_match_rusqlite_oracle` (10 operators
+  x 7 literals on both sides over 2,000 mixed-type rows, an aggregate, a WHERE, two UPDATEs, an INSERT ... SELECT,
+  each query twice per connection, `:memory:` and file; a version that wrote a result into the literal's register
+  gives every later row a different operand; not run as a mutation). Its 153 statements give byte-identical CLI
+  output on main and on the landing tree.
+- Gate: one gate with lever U (its entry). Landed as da18bbdfc.
+- Retry / widen: none for literal operands; NULL / BLOB / CURRENT_* literals and AND / OR keep their loads.
+
+## 2026-11-14 - WIN (prediction missed, beyond its range): an operand held in a register row is read from its register, with no Copy (bd-w4pr1.13.21, lever K)
+
+- Target: arithmetic, `||` and bitwise operands that are columns of a row held in registers: a table-valued
+  function's row in INSERT ... SELECT (the scorecard's `bulk_insert_1M_one_txn` and the 300k mutation setup read
+  `value` three times a row), and the row a CHECK, generated column or index key is evaluated over. Touched:
+  `crates/fsqlite-vdbe/src/codegen.rs` (`emit_binary_op`, new `register_row_operand`).
+- Evidence before (EXPLAIN of the bulk INSERT on main + U + H): every read of `value` was `Copy 7 X` followed by the
+  one opcode that reads X (`Copy 7 3; Multiply 16 3 3`, `Copy 7 18; Concat 18 17 4`, `Copy 7 5; Multiply 19 5 5`).
+- Ledger preflight: the integer-write vein (set_reg_int for Copy / SCopy / Variable, WIN) made the Copy cheaper; no
+  entry on eliding it.
+- Change: an operand that `emit_expr` would compile to exactly `Copy R reg` (a stored column of a `RegisterRow`, or
+  its rowid register) is the opcode's P2 (left) or P1 (right) directly; the destination stays P3, so R is never
+  written. VIRTUAL generated columns, cursor columns and references qualified with another source keep `emit_expr`.
+  The bulk row now runs 16 opcodes (main 23).
+- Prediction (on bd-w4pr1.13.21 before code): bulk -100M to -200M user instructions, CPU -0.5% to -2%; DML rows
+  unchanged. Kill: bulk under 60M.
+- Result, stock sqlite3 3.46.1 live in the same runs, host thinkstation1: no binary of exactly main + U + H + F2
+  was built, so K is measured two ways. perf stat (r2_bulk_probe, interleaved, 7 reps): main + U + H + V2 + F2
+  (d14acf95...) -> the landing tree main + U + H + F2 + K (53e3a846...) 7,582.3M -> 7,204.9M (-377.4M by min,
+  -391.4M by median), CPU 982.3 -> 921.9 ms (-6.1%); that step also drops the rejected V2 (-17.7M on its own), so K
+  is about -395M. Callgrind of the statement: U + H 6,540 a row, U + H + V2 + F2 6,317 (F2 -192), landing 5,947, so
+  K = -401 a row. `update_10pct_300k` 596.6M -> 596.5M, `delete_14pct_300k` 421.6M -> 421.5M. Prediction missed
+  beyond its range (each elided Copy cost ~130: dispatch, the MakeRecord-sideband check, the read and the integer
+  store); kill line not met. Answers equal stock's; stock integrity_check ok.
+- Tests: fsqlite-vdbe `test_codegen_register_row_operands_are_read_in_place` (`(a * b) + 7 || a` over a register
+  row: no Copy, the row's registers as P1 / P2, nothing writes them); fsqlite-core
+  `bd_integer_arithmetic_edges_oracle_probe::register_operands_over_function_rows_match_rusqlite_oracle` (the
+  source column on both sides and twice over generate_series and json_each rows, a CHECK over two columns of the
+  row being written with OR IGNORE, `:memory:` and file, against rusqlite, whose side reads a recursive CTE for
+  generate_series; not run as a mutation). The vdbe unit test `test_codegen_insert_default_values_stored_generated`
+  pinned a Copy for the STORED column's `a + b`; it now asserts the Add reads the a and b registers and writes c's.
+- Gate: one gate with lever U (its entry). Landed as da18bbdfc.
+- Lane total, one run on the landing tree (main 4fb410a8d vs U + H + F2 + K, stock live): `bulk_insert_1M_one_txn`
+  8,164.4M (1.95x) -> 7,197.0M (1.72x stock 4,177.5M), CPU 1,010.2 -> 946.0 ms (2.21x -> 2.07x), wall 1,133.3 ->
+  1,060.5 ms (2.04x -> 1.91x stock 554.6); `update_10pct_300k` 633.4M (2.32x) -> 596.5M (2.18x);
+  `delete_14pct_300k` 421.5M (3.49x) unchanged; `memory_script_200k` 3,983.4M (2.08x) -> 3,802.1M (1.99x stock
+  1,914.0M).
+- Retry / widen: INSERT ... SELECT's INTEGER PRIMARY KEY routing still copies the alias register into a separate
+  rowid register every row (`IsNull` / `MustBeInt` / `Copy` / `Goto`); with the alias register as the Insert's rowid
+  register (as lever U does for UPDATE) that Copy goes too, about -100M to -150M on the bulk row (bd-w4pr1.13.21
+  handoff, not started).
+
+## 2026-11-14 - WIN (prediction missed, beyond its range): the rowid allocator's maps hash their (schema epoch, root page) keys with foldhash instead of SipHash (bd-i3csr.4, lever F2)
+
+- Target: every insert into a file-backed table (the rowid-floor bump after each row, reservations of implicit
+  rowids): the scorecard's `bulk_insert_1M_one_txn`, the 300k mutation setup, the txn and autocommit insert rows.
+  Touched: `crates/fsqlite-mvcc/src/rowid_alloc.rs` (`ConcurrentRowIdAllocator::tables` and
+  `session_reservations` use `foldhash::fast::FixedState`), `crates/fsqlite-mvcc/Cargo.toml` and `Cargo.lock`
+  (foldhash 0.2.0, already used by fsqlite-pager / btree / core).
+- Evidence before (callgrind of main 4fb410a8d, the bulk INSERT alone, 100k / 200k rows):
+  `bump_concurrent_storage_rowid_floor` 364 a row inclusive, `ensure_table_floor` 293, of which 197 the std
+  `HashMap` lookup (SipHash-1-3 of the key and the probe). bd-i3csr.4 lever 4.1's retry condition named this
+  exactly ("a profile where the allocator's cost is the hash itself").
+- Ledger preflight: the 2026-11-13 lever 4.1 entry (one lock and one lookup per row, WIN) and its retry condition;
+  the 2026-07-16 note that March foldhash swaps rested on stale profiles (this one rests on a current profile).
+- Change: the two maps' hasher only; no floor, reservation, rewind or epoch logic changes. The keys are the
+  engine's own, so SipHash's flooding resistance buys nothing.
+- Prediction (on bd-i3csr.4 before code): bulk -110M to -170M user instructions; txn / autocommit down slightly.
+  Kill: bulk under 70M; any allocator / rowid / rewind / concurrent-writer keeper changing outcome.
+- Result, stock sqlite3 3.46.1 live in the same runs, host thinkstation1 (load 6-7). Both arms carried the
+  rejected lever V2 (the F2 build was started before V2's numbers came back; V2 is in another function and is
+  reverted from the landing tree): binaries d943dda7... and d14acf95.... `bulk_insert_1M_one_txn` (r2_bulk_probe,
+  interleaved, 7 reps) 7,754.4M -> 7,563.0M by min (-191.4M, -2.5%), -178.0M by median; CPU and wall unchanged
+  within noise (1,001.9 -> 1,000.1 ms). `txn_1000x10_rows` / `autocommit_5k_inserts` (txn_row_probe): a 3-rep run
+  read +1.6% / +3.7%, a 5-rep rerun with the arms swapped -1.8% / -0.5%; pooled mins -8.7M / -4.3M; the lever's own
+  autocommit min moved 37.7M between the runs, so neither reading is resolvable. Bulk prediction missed beyond its
+  range; kill line not met. Answers equal stock's; stock integrity_check ok.
+- Test: no new test; the maps' behaviour does not change, and the allocator, rewind and concurrent-writer keepers
+  in the gate cover it.
+- Gate: one gate with lever U (its entry), including fsqlite-mvcc lib and the allocator / rewind / concurrent
+  keepers (`rowid_statement_rewind_concurrent_stress`, `concurrent_update_differential_stress`,
+  `bulk_import_upsert_text_pk_phantom_pk`, `issue_491_bulk_insert`, the bd_ih8ak pair, gh385, gh457, the rowid /
+  AUTOINCREMENT / statement-rollback oracles). Landed as 0798067f9.
+- Retry condition: none.
+
+## 2026-11-14 - REJECTED on its kill line: the append's stack-entry rebuild reuses the old entry's cell-pointer buffer (bd-i3csr.4, lever V2)
+
+- Target: every row appended to the cached rightmost leaf (`bulk_insert_1M_one_txn`, the 300k mutation setup).
+  Touched, not kept: `crates/fsqlite-btree/src/cursor.rs` (a `refill_top_cell_pointers` helper used by the two
+  stack rebuilds in `try_append_on_cached_rightmost_leaf`, and a unit test).
+- Evidence before (callgrind of main 4fb410a8d, the bulk INSERT alone, 100k / 200k rows): after each append the
+  stack entry is rebuilt with `cached.cell_pointers.clone()` (malloc 30 a row, 198,509 calls at 200k rows) and the
+  old entry's drop frees its buffer (the thread-local pool is full: free 34 a row, 201,454 calls; the recycle 53
+  inclusive). Attributed ~130 a row.
+- Ledger preflight: 2026-05-05 "Quick-balance one-cell pointer Vec pooling" and 2026-05-09 "Same-leaf direct DELETE
+  run in-place cell-pointer mutation" (both rejected) are other sites; the 2026-11-13 lever 4.2 entry named this
+  rebuild as a next lever.
+- Change: the rebuilt entry takes the old top entry's buffer (`mem::take`), clears it and refills it from the
+  cache's pointers.
+- Prediction (on bd-i3csr.4 before code): bulk -70M to -120M user instructions. Kill: under 50M.
+- Result, stock sqlite3 3.46.1 live, host thinkstation1 (load ~7), binaries main + U + H (623ce6bc...) and the
+  same + this diff (d943dda7...): bulk (r2_bulk_probe, interleaved, 7 reps) 7,786.4M -> 7,768.7M by min (-17.7M),
+  -24.1M by median; callgrind of the statement 6,540 -> 6,509 a row. The malloc and the free are gone (0 and 2,945
+  calls at 200k rows), ~70 a row; the refill (take, clear, extend_from_slice, the old entry's drop still entering
+  recycle for an empty buffer) gives ~40 back. Prediction missed; kill line met; reverted (its btree test, which
+  passed with it, went with it).
+- Retry condition: only with a change that removes the per-append stack rebuild itself (a stack entry sharing the
+  rightmost-leaf cache's pointers, or a cursor that defers the rebuild until a read needs the stack), measured on
+  `bulk_insert_1M_one_txn`; not as a standalone buffer reuse.
+
+## 2026-11-14 - WIN (CPU prediction missed by 20 ms): a window whose keys are numbers sorts them as packed (cells, row number) rows, which takes window_row_number below stock's CPU (bd-w4pr1.12, lever W1)
+
+- Target: the row-index sort in `execute_window_select` on the serial scorecard row
+  `window_row_number` (`row_number() OVER (PARTITION BY a ORDER BY c)`, 1M rows): a stable
+  `sort_by` through `cmp_sqlite_values` that was 4,520M Ir inclusive (53% of the statement, 29.9M
+  comparator calls) and ~55% of its cycles, every comparison reading both rows' keys from the
+  scanned rows at random. Touched: `crates/fsqlite-core/src/connection.rs`
+  (`PackedWindowSortKeys`, `packed_partition_runs`, the sort and partition split in
+  `execute_window_select`, three unit tests), `crates/fsqlite-core/tests/window_function_oracle.rs`
+  (`numeric_window_keys_match_stock`).
+- Ledger preflight: 2026-11-11 "REJECTED: numeric window sort keys, in two forms" -- form 2 (packed
+  u64 keys sorted unstable with the row number) was -11% CPU against a 15% kill on a 3,924 ms row,
+  its ~450 ms then hidden behind a duplicate output sort and the 1.2 GB materialization since
+  removed. Its retry condition ("on the tree without the duplicate sort, a call-graph profile that
+  puts the first window's sort at 15% or more of window_row_number's CPU") held at ~55%.
+- Pre-registered on bd-w4pr1.12 (2026-11-14T19:00Z): Ir 8,511M -> 4,000-4,700M, CPU 973 -> 430-600
+  ms; sum(c) OVER (PARTITION BY a) and the computed-key shape -25..-50% CPU; rank() OVER (ORDER BY
+  b) within 1%. Kill: CPU above 730 ms or Ir above 6,000M, rank() worse by more than 3%, or an
+  oracle change.
+- Change: when every PARTITION BY and ORDER BY value is INTEGER, non-NaN REAL or NULL and no key
+  column holds both INTEGER and REAL, each row's keys become u64 cells in the comparator's order
+  (integer with the sign bit flipped; real by the sign transform, -0.0 folded into 0.0; a DESC
+  ORDER BY term complemented; for a column holding a NULL a class cell first: NULL first for a
+  partition key as `cmp_sqlite_values` ranks it, the term's NULLS FIRST / LAST or default for an
+  ORDER BY key, not reversed by DESC, as `cmp_in_aggregate_order_keys` places it). One to four
+  cells a row sort as `([u64; K], row)` with `sort_unstable` (the unique row number last makes it
+  the stable order); more cells sort an index over the flat cells. Partitions are the runs of
+  equal partition cells. Form 2 refused NULL keys; this packs them. TEXT, BLOB, NaN and a mixed
+  INTEGER/REAL column keep the general comparator.
+- Result (thinkstation1, 64 CPUs, governor powersave, io_uring refused, serial `parallel_workers=1`;
+  base main 687feb125 sha256 3ce3002aea0e019b, W1 a662dc71d199cc17 = 687feb125 + this diff; stock
+  sqlite3 3.46.1 live in the same par_probe run, reps 5, two runs at load 11.5 and 4.6; answers
+  equal everywhere): window_row_number 8,511.2M -> 4,740.7M Ir (stock 8,223.9M), CPU 971.9 ->
+  619.5 ms and 1,012.0 -> 655.1 ms (x1.46 -> x0.93 and x1.48 -> x0.96 stock); sum(c) OVER
+  (PARTITION BY a) 6,511M -> 5,155M Ir, CPU 866 -> 659 / 913 -> 704 ms (x1.77 -> x1.35); PARTITION
+  BY a % 7 ORDER BY c * 2: 10,463M -> 6,267M, 1,251 -> 842 / 1,310 -> 887 ms (x1.86 -> x1.25);
+  the window plus a column: 10,079M -> 6,309M, 1,090 -> 741 / 1,237 -> 774 ms (x1.53 -> x1.03);
+  rank() OVER (ORDER BY b), a TEXT key: 5,201.3M -> 5,200.3M, 586 -> 582 / 601 -> 603 ms.
+  scan_filter_agg, group_by_1000_groups, order_by_text_limit10 and count_star identical in Ir.
+  Prediction: Ir missed high by 41M (4,741M against 4,000-4,700M), CPU missed high by 20-55 ms
+  (620 / 655 against 430-600); the computed-key shape inside its range, sum(c) OVER (PARTITION BY
+  a) just below it (-24% against -25..-50%). Kill lines not crossed. After W1 the sort is ~10% of
+  window_row_number's cycles; the largest items are the interpreter (15%), memmove (11.6%, the
+  scanned rows' and result vectors' growth) and the outer GROUP BY/join select (~10%).
+- Gate (on 687feb125 + this diff): clippy -D warnings fsqlite-core --all-targets clean; fsqlite-core
+  lib 4,185 passed, 2 failed (the t6741 pair, bd-nouem, red on main); the three new unit tests
+  (every pair of rows over integer and real columns with NULL, values beyond 2^53, signed zeros,
+  infinities, under nine direction / NULLS terms; one to seven cells a row against the general
+  stable sort and partition split; refusals of TEXT, BLOB, NaN, 1 beside 1.0, one row); the 41
+  window-using fsqlite-core integration targets plus the parallel scan oracle and budget (44
+  binaries, 2,143 passed; incl. the new 18-query oracle: -0.0 / 0.0 as one partition and peers,
+  2^53 and 2^53 + 1 as two partitions, NULL partitions, NULLS FIRST / LAST under DESC, +-inf,
+  mixed and TEXT controls; memory and file, direct and prepared), 13 fsqlite-e2e window targets
+  (92 passed), fsqlite distinct_loose_scan and the six count / min / max oracles (12 passed).
+  One failure, not this lever's: bd_json_scalar_oracle_probe `reserved_number_tag_strings_match_stock`
+  (`json(jsonb_group_object(k, v))` over keys that collide after the nonfinite tag: stock keeps
+  four members, fsqlite two; no window in the statement, and the main and W1 CLIs print the same
+  bytes for it). After rebasing onto origin/main (upstream touched no window code): clippy
+  -D warnings fsqlite-core --lib --tests clean.
+- Verdict: WIN against stock live: window_row_number x1.47 -> x0.93-0.96 CPU. Landed as 32084d5c0
+  (rebased over acf1fb0e3, a codegen-only commit).
+- Retry condition: none (kept). Widen to TEXT keys under BINARY on a UTF-8 database (cells from a
+  prefix with a tie-break on the full bytes) when a scorecard window row orders by a TEXT key
+  and its sort is 15% or more of that row's CPU; a column mixing INTEGER and REAL needs an exact
+  int/real cell (the comparator is exact past 2^53).
+
+## 2026-11-14 - WIN: an indexed IN-list scan answers covered outputs from the index entry (bd-mids0)
+
+- Target: `SELECT id FROM t WHERE a IN (3, 77, 500)` (10.0x stock): codegen_select_index_in_scan
+  did IdxRowid + SeekRowid into t for every entry of every run, though `id` is the entry's rowid.
+  Touched: crates/fsqlite-vdbe/src/codegen.rs (when resolve_covering_output_sources covers the
+  outputs and the residual reads only index columns, the entry answers the row through
+  emit_index_entry_where_filter / emit_covering_output_reads and the table is never opened).
+- Result (acf1fb0e3; scratchpad cin_ab.py, 200k-row t with ANALYZE, stock live, answers equal
+  and in stock's row order; ELF before 40e54cbe1be33311, after 3e69d86d23a4a99c; thinkstation1):
+  9.7x -> 3.3x stock (a second run 3.1x); `... AND c > 1000` (c not in the index) unchanged at
+  4.0x. The rest is ~6k instructions per entry in the seek/Next/ResultRow loop.
+- Retry / next: per-seek and per-opcode engine cost (bd-w4pr1.13.15, bd-w4pr1.13.7). And
+  a separate plan gap: `a IN (3, 77) AND b > 50` returns stock's rows in another order (stock
+  range-seeks t_ab per member; we walk t_a and filter), before and after this change.
+
+## 2026-11-14 - WIN (above its prediction): the parallel aggregate kernel reads a table-leaf cell stored whole on its page from its two varints, which takes its CPU below stock's on scan_filter_agg (bd-w4pr1.13.11 kernel lever K5)
+
+- Target: `CellRef::parse` in the parallel ungrouped-aggregate kernel, 86 Ir/row on scan_filter_agg
+  (two general varint reads ~28, the local-payload-size math, overflow checks and the `CellRef` it
+  builds) for cells that on this table never spill. Touched: `crates/fsqlite-btree/src/cell.rs`
+  (`table_leaf_local_record`, `read_varint_one_byte_first`, a unit test),
+  `crates/fsqlite-vdbe/src/parallel_aggregate.rs` (`scan_leaf`).
+- Ledger preflight: K1-K4 below; the serial cursor's `local_leaf_table_cell_span` already reads
+  the same span for the in-place Column lane, and is not touched (K4 showed what a change in the
+  serial lane's inlining can cost).
+- Pre-registered on the bead (2026-11-14T16:45Z): -30 to -50 Ir/row on the kernel at 8 workers,
+  serial rows unchanged; kill below -15.
+- Change: for a cell whose payload is at most `usable_size - 35` (the table-leaf maximum local
+  size, below which nothing spills), the rowid and record come from the payload-size and rowid
+  varints, each with a one-byte fast path; a cell that spills, or whose varints or record run past
+  the page or the usable size, still goes to `CellRef::parse`, which reads or rejects it as before.
+- Result (thinkstation1, 64 CPUs, governor powersave, io_uring refused; base 964c7bc59e0571dc =
+  3f5bed23e, K5 010fc99a6ea55beb = 3f5bed23e + this diff, landed as b18e5553a; stock sqlite3 3.46.1
+  live in the same par_probe run, reps 5; answers equal everywhere): scan_filter_agg at 8 workers
+  534.4M -> 469.4M user instructions (-65.0 Ir/row, above the predicted range), CPU 56.6 -> 52.0 ms
+  against stock's 60.0 in the same run (x0.94 -> x0.87), wall 7.5 ms both (stock 60.3), 7 helper
+  threads in both; callgrind exact 538.10M -> 473.06M, `CellRef::parse` off the hot path (85.9
+  Ir/row -> 0). Serial rows unchanged in instructions: scan_filter_agg 1,261.4M, count_star 63.4M,
+  group_by_1000_groups 3,407.2M, order_by_text_limit10 1,741.8M, window_row_number 8,512.6M (their
+  CPU medians moved by -8% to +9% with identical counts: run-to-run noise on the busy host).
+- Gate: the helper's unit test (held to `CellRef::parse` for payloads 0, 1, 127, 128, max_local-1
+  and max_local with rowids of 1 to 9 varint bytes incl. negatives; the negative cases are a payload
+  one byte over the threshold and one 200 over, which must be declined as spilling, and a local cell
+  crossing the usable size inside the page buffer, declined while the full parse rejects it), the
+  btree cell tests, the oracle file (13/13, incl. its overflow-payload test), the budget test, four
+  aggregate keepers, six fsqlite count / min / max oracles, clippy.
+- Verdict: WIN (MAINTENANCE by the suite's rules, a self-speedup of the default-on parallel path):
+  against stock live, scan_filter_agg at 8 workers is now x0.87 CPU and x0.12 wall. K1-K5 took the
+  kernel from 635 to 469 Ir/row (K2 -63, K3 -38, K5 -65; K1 and K4 rejected). The serial path is
+  untouched by all five (x1.97 stock CPU on the same row).
+- Retry condition: none (kept). What is left per row in the kernel: the record header parse (91,
+  see K4 for what a per-read fill cost), the decode (~105), the comparison and loop.
+
+## 2026-11-14 - WIN (join prediction missed in sign): a page-cache miss skips the get_page checks its resident answer already made (bd-w4pr1.13.18, join / rowid-seek lever 4)
+
+- Target: the cost lever 1 (the entry three below) put on every page-cache miss. The sync resident
+  attempt ran `get_page`'s prefix, and the async read then ran it again: about 185 per miss on
+  rowid_lookups_200k and about 400 per leaf miss on full scans. group_by_1000_groups was +0.09%
+  against base and order_by_text_limit10 +0.18%. Touched (it lands in the same commit as lever 1):
+  - `crates/fsqlite-pager/src/traits.rs`: `TransactionHandle::get_nonresident_page`, defaulting
+    to `get_page`, with its `TransactionKind` dispatch;
+  - `crates/fsqlite-pager/src/pager.rs`: `get_page` is now the prefix plus `get_nonresident_page`;
+    `get_resident_page` also answers the rolled-back zero-fill (`rolled_back_allocation_page`), so
+    its `None` means only that shared state must be read;
+  - `crates/fsqlite-btree/src/cursor.rs`: `PageReader::read_nonresident_btree_page_data`,
+    defaulting to `read_btree_page_data`; `TransactionPageIo` forwards it; `load_page` calls it only
+    after a `None`;
+  - `crates/fsqlite-vdbe/src/engine.rs`: `SharedTxnPageIo` skips the freed-page check the resident
+    attempt has just made.
+- Result: same method as levers 1 and 2 (load 4.0, io_uring refused, 5 reps; stock sqlite3 3.46.1
+  live). Binaries: base a3b4ef8d6 2699110b30fb374c, l2 45b5f01fa9fb1522, l4 = l2 + this diff
+  9108d5e06ad654a2. Answers equal stock's.
+
+  | statement | stock | base | l2 | l4 |
+  |---|---|---|---|---|
+  | rowid_lookups_200k | 554.4M | 2,955.6M | 2,871.8M | 2,831.5M (5.11x) |
+  | join_1M_to_pk_1000 | 1,721.4M | 4,847.8M | 4,738.3M | 4,748.1M (2.76x) |
+  | group_by_1000_groups | 2,876.2M | 3,335.8M | 3,338.9M | 3,333.8M |
+  | order_by_text_limit10 | 777.1M | 1,715.5M | 1,718.6M | 1,713.5M |
+  | scan_filter_agg | 498.7M | 573.5M | 573.5M | 573.5M |
+  | count(*) | 4.7M | 3.7M | 3.7M | 3.7M |
+
+- Prediction (bead, before code) and result:
+  - rowid -25M to -45M; measured -40.3M, inside;
+  - the two scan rows back to within 0.05% of base; measured a little below base;
+  - the join -1M to -3M; measured +9.8M (+0.2%), wrong in sign.
+  Callgrind of l4 puts the join's extra cost on the hit path: `get_resident_page` went from 125 to
+  133 per call. Its new arm (the rolled-back zero-fill behind the inner mutex) changed the call's
+  code generation. No kill line covered the join. The kill lines that did exist (rowid under -15M;
+  a scan row more than 0.1% above base; an answer change) were not crossed: kept.
+- Write rows, the landed tree (levers 1, 2 and 4) against base. Each arm built its own fresh
+  database; 3 reps; io_uring refused; stock live; answers equal.
+  - create_index_int_300k 928.7M -> 929.1M (+0.04%);
+  - update_10pct_300k 667.8M -> 668.8M (+0.15%);
+  - delete_14pct_300k 453.6M -> 454.6M (+0.22%);
+  - txn_1000x10_rows 563.0M -> 560.4M (-0.46%).
+  The wall-time scorecard (2 reps, load about 4, stock A/A drift up to 14%) shows no row outside
+  that drift.
+- Keepers: the pager test of lever 1 checks three more things here. A rolled-back allocation is
+  answered as zeros, equal to `get_page`'s. After a `None`, `get_nonresident_page` returns the
+  committed image. That read leaves the page resident.
+- Gate (gate g10, on the tree of levers 1, 2 and 4, rch). clippy -D warnings on pager, btree, vdbe
+  and core was clean, before the rebase onto main and again after it.
+  - --lib suites: btree 556/0; pager 1,111/1 (bd_2jpu6_2, red on main); core 4,181/2 (the t6741
+    pair, bd-nouem); vdbe 1,247/1 (bd-bhalc's codegen test).
+  - The join, seek, savepoint, trigger, snapshot and pager-touch keepers, the fsqlite rowid
+    keepers and nine fsqlite-e2e concurrent-writer / isolation / checkpoint targets all pass, apart
+    from two reds that are also red on main:
+    - bd_8c68u's compile-count test (bd-f8m1v);
+    - `concurrent_writer_mvcc_oracle_e2e::observed_disjoint_writer_overlap_for_certificate`, which
+      also fails on clean a3b4ef8d6 (both writers finalize at the same commit_seq; analysis on
+      bd-i0tn6).
+- Landed in 01d40bb9d, together with lever 1.
+- Retry / widen: get the 8 per hit back by keeping the zero-fill out of `get_resident_page`. The
+  non-resident read would then check `rolled_back_pages` itself. Measure it on the join and on a
+  savepoint keeper.
+
+## 2026-11-14 - REJECTED on its kill line: a table rowid search reads its rowids from page bytes taken once, and the seek cache records a landing in place (bd-w4pr1.13.18, join / rowid-seek lever 3)
+
+- Target: the rowid seek's own body. On rowid_lookups_200k that is the interior binary search
+  (2.59M `table_interior_rowid_at` calls, 78 each, 6.8% of the row). On join_1M_to_pk_1000 it is
+  the leaf search (240 per probe, 2.99M `table_leaf_rowid_at` calls at 51) and
+  `remember_table_landing` (259 per descent). Touched (reverted, never committed):
+  `crates/fsqlite-btree/src/cursor.rs`:
+  - `table_interior_rowid_in`, `read_stack_entry_cell_pointer_in` and `table_leaf_rowid_in`: the
+    old functions on a page slice that the search takes once;
+  - `binary_search_table_interior`, `search_integer_key_table_leaf` and `table_leaf_rowid_bounds`
+    use them;
+  - `remember_table_seek` rotates the landing's slot (or the first empty one, or the last) to the
+    front instead of rebuilding the array through a flatten iterator;
+  - a model test of that rotation against the rebuild.
+- Ledger preflight: the 2026-05-20 cell-parse family ("4-6 ns per cell, no lever"), whose retry
+  condition is whole-workload attribution. The shares above are that attribution.
+- Result: same run method as levers 1 and 2 (thinkstation1, governor powersave, load 3.4,
+  io_uring refused, 5 reps; stock sqlite3 3.46.1 live). Binaries l2 45b5f01fa9fb1522, l3 =
+  l2 + this diff 1abcddbbaa1c4a3b. Answers equal stock's.
+  - join_1M_to_pk_1000: 4,738.3M -> 4,706.3M (-32.0M);
+  - rowid_lookups_200k: 2,871.8M -> 2,836.8M (-35.0M);
+  - scan_filter_agg 573.5M and count(*) 3.7M unchanged.
+- Prediction (bead, before code): join -90M to -160M, rowid -70M to -130M. Kill: join under -45M or
+  rowid under -35M. The join kill line is crossed; the rowid result lands exactly on its line.
+  REJECTED and reverted.
+- Why short (callgrind of the l3 binary against main 70a46a0f3):
+  - the interior read went from 78 to 63 per probe;
+  - the leaf search from 240 to 231 per probe;
+  - `remember_table_landing` from 259 to 229 per descent.
+  Each part came in at about a third of its prediction. The release build (fat LTO, one codegen
+  unit) already inlines `usable_bytes` and most of the call frames this removed by hand. What is
+  left is the varint decode, the bounds checks and `observe_cursor_cancellation` per probe.
+- Retry condition: not this shape. A search that stops decoding per probe is a different lever:
+  routing keys decoded once per page image (kept with the decoded-page memo, bd-w4pr1.13.26), so a
+  probe compares two i64s. Retry that with a profile that still puts the interior or leaf search
+  above 5% of a row.
+
+## 2026-11-14 - WIN: a WAL lookup the pinned snapshot answers without reading a frame skips the boxed read futures (bd-w4pr1.13.18, join / rowid-seek lever 2)
+
+- Target: the WAL lookup made on every page-cache miss in WAL mode; measured on rowid_lookups_200k
+  (188.6k lookups, nearly all of them pages with no frame in the pinned snapshot). Touched:
+  `crates/fsqlite-pager/src/traits.rs` (`WalBackend::read_page_pinned_without_io`, default
+  `None`), `crates/fsqlite-pager/src/pager.rs` (`lookup_page_in_wal_backend` asks it before
+  awaiting `read_page_pinned`), `crates/fsqlite-core/src/wal_adapter.rs` (`PinnedPageRead`,
+  `WalBackendAdapter::pinned_page_read`, the prefix `read_page_pinned` and the new method share;
+  `PathRefreshingWalBackend` forwards).
+- Ledger preflight: the 2026-11-12 bd-w4pr1.13.18 WIN (a miss asks the pinned snapshot once, not
+  twice) removed the second lookup; this makes the remaining one cheaper. Not near the
+  eviction-trace rejections.
+- Evidence before (callgrind, main 70a46a0f3): `lookup_page_in_wal_backend` was 821 per lookup.
+  - The work was about 194: `resolve_visible_frame`, a HashMap get in the pinned page index.
+  - The rest was two `Box::pin` futures (`PathRefreshingWalBackend::read_page_pinned` around
+    `WalBackendAdapter::read_page_pinned`), a malloc and a free each, and their polling and drop,
+    about 330 together;
+  - plus the function's own code 215, the registry handle 34 and `attached_native_cx` 48.
+- Change: the refusals (pending checkpoint reset, no pinned snapshot), a snapshot with no
+  committed frame, and a miss in a complete page index are answered synchronously. A frame read or
+  a partial-index scan still goes through `read_page_pinned`, which starts from the same prefix.
+  Locking, the admission rule of the read lock and the frames read are unchanged.
+- Result: same method and run as lever 1 (thinkstation1, governor powersave, load 1.9, io_uring
+  refused, 5 reps; stock sqlite3 3.46.1 live; binaries l1 79397ad4cc80e79e, l2 45b5f01fa9fb1522 =
+  l1 + this diff). Answers equal stock's.
+  - rowid_lookups_200k: 2,936.1M -> 2,871.8M (-341 per lookup; 5.30x -> 5.18x stock's 554.4M);
+    the JOIN..ON spelling 2,936.5M -> 2,872.2M.
+  - join_1M_to_pk_1000: 4,740.9M -> 4,738.3M (7.6k lookups).
+  - scan_filter_agg 573.5M and count(*) 3.7M unchanged.
+  CPU moved inside the run-to-run noise: rowid 677 -> 684 ms refused and 658 -> 654 ms with the
+  ring (stock 342-362).
+- Prediction (bead, before code): -300 to -450 per lookup, rowid -57M to -85M. Measured -341 and
+  -64.3M, inside both. Kill (rowid under -30M) not crossed.
+- Keeper: `test_adapter_pinned_read_without_io_answers_only_pages_without_a_frame` (fsqlite-core).
+  Unpinned, both methods refuse with the same error. A page with a frame is left to
+  `read_page_pinned`, which reads its bytes. A page without one is answered as no frame. A later
+  commit of that page stays out of the pinned snapshot and is read in the next one.
+- Gate: gate g10 (the entry two above). Landed as fce23ccdf.
+- Retry / widen: a miss's WAL lookup is now about 480 (821 - 341): the registry handle, the
+  read-lock helper with `attached_native_cx`, the async frame of `lookup_page_in_wal_backend`
+  itself and the SipHash lookup in the page index. Widen only with a profile that puts that
+  remainder above 2% of a row.
+
+## 2026-11-14 - WIN (prediction missed low): a page load served by the transaction's own state skips the async read chain (bd-w4pr1.13.18, join / rowid-seek lever 1)
+
+- Target: every B-tree page load that the transaction read cache or write set answers. Measured on
+  join_1M_to_pk_1000 (810k such loads) and rowid_lookups_200k (412k such loads, plus 188k misses).
+  Touched: `crates/fsqlite-pager/src/traits.rs` (`TransactionHandle::get_resident_page`, default
+  `None`, and its `TransactionKind` dispatch), `crates/fsqlite-pager/src/pager.rs`
+  (`ResidentPageLookup`, `SimpleTransaction::resident_page_lookup`, the prefix `get_page` and
+  `get_resident_page` share), `crates/fsqlite-btree/src/cursor.rs`
+  (`PageReader::read_resident_btree_page_data`, default `None`; `TransactionPageIo` forwards;
+  `BtCursor::load_page` takes it first), `crates/fsqlite-vdbe/src/engine.rs` (`SharedTxnPageIo`:
+  the concurrent-context freed-page check in one sync helper, used by `read_btree_page_data` and
+  the new method).
+- Ledger preflight: the two bd-w4pr1.13.34 entries (a parked-leaf pool in front of the load,
+  rejected twice; the retry entry says to attack the load itself). Fresh attribution on main
+  70a46a0f3 also showed why that pool had nothing to serve. All 810k join loads come from descents
+  from the root (405k descents, root plus leaf). The seek cache never served a probe on a leaf other
+  than the current one, because u has 5 leaves in the fsqlite-built file and the probe keys step by
+  -81 (t.a = 7919*i mod 1000): a cyclic walk one larger than the 4-slot LRU. bd-w4pr1.13.26 (the
+  decoded-page memo) and bd-w4pr1.13.14 (page-read locks) are on this path and unchanged.
+- Evidence before (callgrind, main 70a46a0f3): a load on a transaction-cache hit cost about 590.
+  About 215 of that was future construction, polling and drop across `SharedTxnPageIo::
+  read_btree_page_data`, the `TransactionKind::get_page` dispatch and `SimpleTransaction::get_page`.
+- Change: `get_page`'s prefix (recovery barrier, freed pages, write set, rolled-back allocations,
+  snapshot size bound, transaction read cache) is one sync function. `get_page` runs it first;
+  `get_resident_page` runs only it and answers its page or its error, or `None` (for a rolled-back
+  allocation as well, which `get_page` still zero-fills). The cursor awaits the old path only on
+  `None`. The answers are the same images and errors, read from the same transaction-private state,
+  so MVCC visibility does not change. The time-travel reader and every test store keep the default
+  `None`.
+- Result: thinkstation1, governor powersave, load 1.8. io_uring refused, 5 reps repeating to 0.6M.
+  Stock sqlite3 3.46.1 live in the same invocation; each fsqlite arm on its own copy of one
+  fsqlite-built database. Base main a3b4ef8d6 (sha256 2699110b30fb374c), candidate a3b4ef8d6 + this
+  diff (79397ad4cc80e79e). Answers equal stock's everywhere.
+  - join_1M_to_pk_1000: 4,847.8M -> 4,740.9M user instructions (2.82x -> 2.75x stock's 1,721.4M);
+    CPU 476 -> 465 ms (2.45x -> 2.39x). With the ring allowed: 478 -> 455 ms (stock 192).
+  - rowid_lookups_200k: 2,955.6M -> 2,936.1M (5.33x -> 5.30x stock's 554.4M); CPU within noise
+    (661 -> 667 ms refused, 654 -> 686 ms with the ring; the JOIN..ON spelling 660 -> 659 ms).
+  - scan_filter_agg 573.5M and count(*) 3.7M unchanged to the instruction.
+- Other read shapes, levers 1 and 2 together (base against l2 45b5f01fa9fb1522, 3 reps, stock
+  live):
+  - correlated EXISTS over p: 3,116.7M -> 3,032.9M (4.81x -> 4.68x);
+  - scalar subquery per row: 2,930.4M -> 2,846.7M (4.40x -> 4.28x);
+  - the join restricted to t.id <= 100000: 478.8M -> 467.4M;
+  - join_no_index_5k_x_5k: unchanged.
+  The cost of this lever: group_by_1000_groups +3.1M (+0.09%) and order_by_text_limit10 +3.1M
+  (+0.18%), about 400 per page-cache miss on their 7.6k leaf loads. A miss runs the prefix twice,
+  in the sync attempt and again in the async read.
+- Prediction (bead, before code):
+  - per hit load -180 to -280; measured -132;
+  - join -146M to -227M, measured -106.9M (kill: under -100M, not crossed);
+  - rowid -55M to -104M, measured -19.5M (kill: not below base, not crossed). A miss runs the prefix
+    twice, and that cost about 185 per miss, not the predicted 60 to 100.
+- After (callgrind, candidate, join): a hit load is about 415.
+  - `DecodedPageMemo::lookup` 112 (it copies the cell pointers);
+  - `get_resident_page` 125 (hash 32, PageData clone 21);
+  - the concurrent-context check 23;
+  - `load_page`'s own code about 150.
+  The previous `StackEntry`'s drop is still 45 per probe.
+- Keepers: `test_get_resident_page_answers_only_from_the_transactions_own_state` (pager). A page
+  read before a peer's commit keeps its image. A page never read gives `None` even with the peer's
+  newer image in the shared cache. A staged write gives the staged image. A rolled-back allocation
+  gives `None` while `get_page` zero-fills it; with lever 4, which landed in the same commit, the
+  resident answer is those zeros and the test checks that instead. A freed page gives
+  `get_page`'s own error.
+  `test_load_page_takes_a_resident_page_without_the_async_read` (btree): resident pages skip the
+  async read, others take it, and a resident refusal is the load's error, not retried.
+- Landed together with lever 4 (the entry three above), which removes the prefix's second run on a
+  miss, in one commit: 01d40bb9d. Gate: gate g10, in that entry.
+- Retry / widen: the memo's pointer copy (112 per hit load) is the next item on the hit path. Share
+  the decoded pointers instead of copying them.
+
+## 2026-11-14 - REJECTED: a record header table filled on demand for the in-place Column lane and the parallel kernel (bd-w4pr1.13.11 kernel lever K4)
+
+- Target: `RecordColumnTable::parse`, 91 Ir/row both in the serial in-place Column lane
+  (`try_read_column_in_place`, 7.2% of serial scan_filter_agg) and in the parallel aggregate
+  kernel: every row's header was parsed for all four columns of t(id, a, b, c) although
+  scan_filter_agg and group_by_1000_groups read only `a`. Touched (reverted):
+  `crates/fsqlite-vdbe/src/engine.rs` (`RecordColumnTable`, `try_read_column_in_place`, the
+  column-table tests), `crates/fsqlite-vdbe/src/parallel_aggregate.rs` (`Row::decode`).
+- Ledger preflight: K1-K3 below; no earlier entry on this header parse.
+- Pre-registered on the bead (2026-11-14T15:14Z): -18 to -30 Ir/row on serial scan_filter_agg, on
+  serial group_by_1000_groups and on the kernel at 8 workers; count_star unchanged; kill below -9 on
+  serial scan_filter_agg, or a read-every-column row (order_by_text_limit10, window_row_number) up
+  by more than 0.5%.
+- Change: for a one-byte header (checked by an OR over the header bytes) `parse` only counted the
+  columns and `column_offset_in(record, idx)` filled offsets up to the column asked for; other
+  headers were filled whole; a short record was filled whole before the rowid-alias verdict. The
+  batch one-byte loop was gone; the decode-scratch equivalence test filled on demand, middle column
+  first, plus a test that a table reused from a longer record exposes no stale column.
+- Result (thinkstation1, 64 CPUs, governor powersave, io_uring refused; base 25b7602be3be6612 =
+  2f8f1b542, K4 da5d30fb591918a6 = 2f8f1b542 + diff 795e8d307bf40910; stock sqlite3 3.46.1 live in
+  the same par_probe run, reps 5; answers equal everywhere): user instructions went UP on every row
+  that reads a column: serial scan_filter_agg 1,261.3M -> 1,300.9M (+39.6 Ir/row), kernel at 8
+  workers 534.4M -> 577.4M (+43.0; CPU 58.1 -> 60.4 ms, stock 53.7), group_by_1000_groups 3,407.2M
+  -> 3,447.2M (+40), order_by_text_limit10 1,740.9M -> 1,796.8M (+56), window_row_number 8,512.6M
+  -> 8,610.4M (+98); count_star 63.4M both. Callgrind exact (serial): the parse itself did get
+  cheaper, 91.0 -> 63.0 Ir/row, and the short-record fill never ran (zero cost at that line); the
+  rest of the cost moved into the fill inlined into the lane and the interpreter's hot loop
+  (`try_read_column_in_place` became a 21 Ir/row self entry, and `run_hot_opcodes_sync`'s
+  inlining changed), more than the parse saved. The vdbe lib (1,250 passed; the one failure,
+  `test_codegen_select_count_star_indexed_in_list_uses_index_probe_expansion`, is bd-bhalc's,
+  already red on main), the oracle file (13/13), the budget test, six aggregate / view keepers and
+  clippy passed on the candidate: it was correct, only slower.
+- Verdict: REJECTED on its own kill rule (+39.6 Ir/row on serial scan_filter_agg against a
+  required -9), reverted.
+- Retry condition: not as a per-read fill in the lane. Worth retrying only as a header prefix
+  bounded once per cursor (the highest column the program reads from that cursor, known when the
+  program is prepared), parsed by the same batch loop up to that bound, with the instruction count
+  of `run_hot_opcodes_sync` and its callees compared before and after; or when a scorecard table
+  has many more columns than its scans read, where the saving per row grows with the unread tail.
+
+## 2026-11-14 - REJECTED on its kill line: a concurrent BEGIN reloads a stale memdb mirror inside its own pager transaction (bd-w4pr1.7, lever F)
+
+- Target: explicit transactions with peer writers committing (8 or 4 processes on separate tables,
+  BEGIN; one INSERT; COMMIT; the concurrency lane's shape on bd-i0tn6). Touched, not kept:
+  `crates/fsqlite-core/src/connection.rs`. The changes were:
+  - a new `concurrent_begin_reloads_mirror_in_its_own_txn`;
+  - the dispatcher's boundary refresh skips the mirror reload for a concurrent BEGIN;
+  - `execute_begin`'s prebound step only binds the publication;
+  - `refresh_concurrent_begin_from_open_txn` gains a `mirror_reload_deferred` parameter. With it,
+    the reload takes the dirty-mirror schema-only path and publishes the committed schema cookie.
+    The snapshot's schema epoch is re-keyed when the reload changed the cookie;
+  - a new test, `test_concurrent_begin_after_peer_commit_reloads_mirror_in_its_own_txn`.
+- Ledger preflight: lever E (the entry below) removed the own-commit case of the same boundary
+  reload. Nothing earlier on the peer case.
+- Evidence before (exact, 4 writers each under callgrind, 200 transactions each, lever E binary):
+  at 144-183 of 200 BEGINs per contended writer, the boundary refresh began a separate read
+  transaction to reload the mirror. That cost 71.9k: the publication bind with its full refresh
+  after the peers' commits 30.2k, the read transaction's begin 23.6k, its drop 11.3k, and the
+  reload 5.8k. execute_begin's prebound refresh did the same another 20-31 times per writer.
+- Result, stock sqlite3 3.46.1 live in the same runs; binaries 71f9e8a9... (96821c8bf) and
+  3def2450... (96821c8bf plus the change):
+  - Exact (same 4-writer callgrind): separate-transaction reloads at BEGIN went to 0 (149-183 per
+    contended writer now reload inside the BEGIN's transaction, 4.4k each). The boundary refresh
+    plus execute_begin per contended transaction went from 99-115k to 63-70k; the uncontended
+    writer is unchanged (34.5k vs 34.2k).
+  - Native, 8 writers, 300 transactions each, user instructions per transaction (stock 34.4k):
+    7 reps 335.4k -> 325.7k by min and -14.0k by median; 11 reps with the arms swapped 344.3k ->
+    328.8k by min and -12.5k by median. Pooled min over the 18 reps per arm: 335.4k -> 325.7k
+    (-9.7k).
+  - CPU per transaction (median): 365.5 -> 367.0 us and 372.8 -> 359.9 us (stock 74.5-76.2 us).
+  - 4 writers (7 reps): -1.6k by min, -6.8k by median, CPU 312.0 -> 310.4 us.
+  - Errors (8 writers, 12 reps per arm): 809 error lines and 156 rows lost in 5 runs on the base,
+    689 and 116 in 3 runs on the candidate; not higher, as the kill line required.
+  - Prediction (registered on bd-w4pr1.7 before code): -25k to -40k per transaction at 8 writers,
+    CPU down 10-25 us. Kill: under 12k. The pooled min (-9.7k) is under it, the medians sit at it,
+    and CPU moved within noise. Not kept, not pushed.
+- Why the miss: callgrind slows every writer about 50x. That serializes them, so most BEGINs follow
+  a peer's commit, and the exact count promised ~35k per contended BEGIN. Natively, the share of
+  BEGINs after a peer commit since the connection's own commit is low enough that the separate
+  reload averages only ~10-14k per transaction. Lever E already removed the own-commit case.
+- Retry condition: the patch is correct as far as it went (clippy clean; its test, lever E's and
+  the stale-detection test pass; the full gate was not run). It is worth retrying when a
+  multi-writer explicit-transaction shape shows the BEGIN boundary reload above ~25k per
+  transaction natively, measured with perf on the peer-commit path rather than inferred from
+  callgrind. Higher commit rates per peer, or many more writers, are the shapes to check. Or retry
+  it together with the autocommit statement boundary, which reloads a stale mirror the same way
+  (`refresh_memdb_if_stale_with_publication("autocommit_begin")`). How much `multiproc_8x500`
+  pays there is unmeasured, and moving that reload needs the prepare to see the refreshed schema
+  first, which is a separate design.
+
+## 2026-11-14 - WIN: an INSERT ... SELECT row applies its second Affinity only when a constraint can change a register (bd-w4pr1.13.21, lever A)
+
+- Target: every INSERT ... SELECT row into a rowid table without a CHECK constraint or a NOT NULL ... REPLACE column:
+  the scorecard's `bulk_insert_1M_one_txn`, the 300k-row mutation setup, INSERT ... SELECT copies. Touched:
+  `crates/fsqlite-vdbe/src/codegen.rs` (`row_body_needs_affinity_after_constraints`, `codegen_insert_select`,
+  `codegen_insert_select_without_from`).
+- Evidence before (callgrind of the bulk statement on main ffb7385aa): the row ran Affinity twice over its 4 column
+  registers, once before CHECK / NOT NULL (GH #169) and once before MakeRecord, ~480 instructions a row for the two
+  plus two exits from the synchronous lane.
+- Ledger preflight: 2026-05-24 "VDBE `Opcode::Affinity` hot-dispatch promotion" (rejected) changed the arm's
+  dispatch; this lever removes an opcode from the program and leaves the arm alone. bd-i3csr.3 (2026-11-13) made the
+  no-op case cheaper.
+- Change: the second Affinity is emitted only when code between the two can leave a column register without its
+  column's affinity: a NOT NULL column whose effective conflict action is REPLACE (it stores its DEFAULT, of any
+  storage class, over a NULL), a CHECK expression (compiled over the row registers), or a WITHOUT ROWID table
+  (implicitly NOT NULL key columns). INSERT VALUES, UPSERT and UPDATE keep both passes in this step.
+- Prediction (recorded before code, scope amended before code to INSERT ... SELECT only): bulk -180M to -300M user
+  instructions, CPU -2% to -3%; DML rows unchanged. Kill: bulk down by less than 100M.
+- Result, stock sqlite3 3.46.1 live in the same runs, host thinkstation1 (governor powersave), binaries main
+  b3a835a48 (0e921354...) and main + this diff (15515e76...), answers equal stock's: `bulk_insert_1M_one_txn`
+  (bulk_cpu_probe.py, 5 runs, io_uring allowed) 8,691.8M -> 8,177.6M (-514.2M, -5.9%; 2.08x -> 1.96x stock
+  4,177.5M), CPU 1,056.2 -> 1,028.0 ms (-2.7%), wall 1,054.7 -> 1,032.6 ms (2.52x -> 2.47x stock 417.8 ms); the
+  statement alone (io_uring refused, 5 interleaved runs, databases on disk scratch) 7,683.0M -> 7,165.9M (-517.1M),
+  CPU 902.0 -> 879.1 ms (stock 3,665.3M / 388.4 ms); `update_10pct_300k` 641.1M -> 641.1M, `delete_14pct_300k`
+  421.5M -> 421.5M. A first statement-only pass on /dev/shm failed part of its runs with EDQUOT (the per-user tmpfs
+  quota) and was discarded. Prediction exceeded (the removed pass cost ~517 a row against the ~325 estimate); kill
+  line not met. Stock's `PRAGMA integrity_check` is ok on all 5 files the lever wrote, and the 1M rows hash the same
+  as stock's.
+- Test: fsqlite-core `one_pass_delete_oracle::insert_select_affinity_after_constraints_matches_stock` (NOT NULL ...
+  ON CONFLICT REPLACE columns whose DEFAULT has another storage class, statement-level OR REPLACE, a CHECK over a row
+  column and a table with no constraint, typeof and values against rusqlite in `:memory:` and a file, direct and
+  prepared; a version that dropped the second Affinity unconditionally would store TEXT '7' in the INTEGER column,
+  which the typeof comparison rejects; not run as a mutation).
+- Gate, on b3a835a48 plus the change (rch, 2026-11-14): clippy -D warnings with all targets on fsqlite-vdbe and on
+  the touched fsqlite-core test target clean; fsqlite-vdbe lib 1,249 pass and 1 fail (the codegen IN-list test red on
+  main, see the lever C entry), goldens 8 pass unchanged (no golden holds an INSERT ... SELECT); 16 fsqlite-core
+  keeper targets (the new oracle, INSERT ... SELECT one-program and batched replay, NOT NULL conflict, CHECK depth,
+  generated columns, STRICT, RETURNING, conflict-clause review and atomicity, UPSERT, triggers, FK, affinity,
+  CHECK rowid alias) pass except the reds known on main: bd-jlbrk's two `rowid_replace_preflight_*` tests, bd-mkon7's
+  `review_omitted_rowid_alias_ignores_defaults` and bd-d8s37's two `fk_insert_conflict_oracle` upsert tests.
+  After the clean rebase onto 67fd99d10 (upstream bd-y8zgm changed other codegen functions), the fsqlite INSERT
+  targets (insert_test, insert_select_column_reorder, compat_tests) ran on the landing tree: 92 pass (the next
+  upstream commit, a ledger entry, followed before the push). Landed as 076eff697.
+- Retry / widen: INSERT VALUES (the txn / autocommit rows) and UPDATE run the same double pass; widening needs the
+  hand-updated `upsert_on_conflict_*` and `update_with_where_predicate` goldens.
+
+## 2026-11-14 - WIN (small): concurrent validations share each peer's SSI view parts until the peer changes (bd-i0tn6 scaling lever 2)
+
+- Target: the registry-guard holds of concurrent commits at 8-64 writers (`mt-mvcc-bench
+  --one-row-per-transaction`, separate and shared tables). Touched:
+  `crates/fsqlite-mvcc/src/begin_concurrent.rs` (`HandleViewParts`, `ConcurrentHandle::
+  view_parts_cache` / `view_parts` / `invalidate_view_parts`, `HandleView` derefs to shared
+  parts). The bench stage profiler in `crates/fsqlite-e2e/src/bin/mt_mvcc_bench.rs` landed in the
+  same batch.
+- Ledger preflight: lever 1 below (two fewer registry acquisitions, REJECTED: the O(N) holds
+  bind); the HashSet-to-sorted-Vec rewrite of `HandleView` (bd-m4s2c era) made the build cheaper,
+  not rarer. Nothing earlier caches views across validations.
+- Evidence before (bd-i0tn6 bead comment 2026-11-14, hold-split probe on c6f5c57f3): each
+  validation and each publication locked every registered peer and rebuilt its view
+  (`HandleView::new`, about 0.4 us per peer, allocating). That was 20% of the two holds at 16
+  writers, 24% at 32 and 27% at 64. The committed-history index rebuild in prune was 13-23% (38%
+  on the shared table at 32 writers); it is left for the next lever.
+- Change: the witness-derived vectors of a view live in an `Arc<HandleViewParts>` cached on the
+  handle. It is built on the first view after a change and shared until the next one. Identity,
+  flags and rw bits stay fresh per view. Every mutation that can change the parts drops the cache:
+  `record_read`, `record_read_witness`, `record_write_witness`, `ensure_page_state`,
+  `remove_page_state_if_empty`, `concurrent_clear_page_state`, `concurrent_mark_metadata_exempt`,
+  the page-state replacement in `concurrent_rollback_to_savepoint`, `reset_for_new_transaction`.
+- Prediction (bead comment, before code): registry hold at 32w down >= 15%; separate 16w +8% to
+  +20%, 32w and 64w +12% to +25%, 8w +2% to +8%, 1w within 2%; shared 16-32w +3% to +12%. Kill:
+  separate 32w or 64w below 1.05 in either rep, 1w worse than -2%, 8w worse than -3%, 32w hold
+  reduction below 10%, any worker failure, any SSI keeper red.
+- Result (mt-mvcc-bench, stock live in every run, interleaved A B; A = c6f5c57f3 + stage profiler
+  (mtbench-pv3), B = A + this change (mtbench-vc1), sha256 in the run metas; thinkstation1, 64
+  threads, powersave, tmpfs, NORMAL; host load 5-7 from other lanes). B/A with F/C A -> B:
+  - one row per transaction, separate tables, 2 reps: 1w 1.01x (0.088 -> 0.084), 2w 1.01x, 4w
+    1.02x, 8w 1.05x (0.309 -> 0.342), 16w 1.06x (0.304 -> 0.300), 32w 1.10x (0.214 -> 0.194,
+    1.10x in each rep), 64w 1.09x (0.112 -> 0.134; 1.08x and 1.09x).
+  - shared table, 2 reps: 1w 0.92x (the same one-writer workload read 1.01x in the separate runs),
+    2w 1.01x, 4w 1.09x, 8w 1.02x, 16w 1.04x, 32w 0.97x.
+  - one writer, 2,000 rows, 11 rounds, 3 reps: 0.99x (0.076 -> 0.075).
+  - bulk (1,000 rows per transaction): separate 1.03-1.11x at 1-32w; 64w read 0.86x in 2 reps and
+    1.06x (151.5k -> 160.3k) in 3 focused reps. Shared 0.98-1.11x except 2w 0.56x. The 2w
+    bulk-shared round time is bimodal (about 360k or 190k wps) in both arms. Which mode a run lands
+    in follows which writer loses the rightmost-leaf race: the bench retry jitter is (tid * 7 +
+    attempt * 3) % 5 ms, so thread 0's first retry sleeps 4 ms and thread 1's 1 ms. A ran fast in
+    4 of 5 runs and B ran slow in 5 of 5, with the same per-round engine work in both (one page-lock
+    wait of about 2 ms, one retry, equal registry holds). Recorded as a bench mode artifact,
+    not shown to be the engine.
+  - registry hold (validate + publish) per commit, A -> B: 8w 28.6 -> 24.7 us, 16w 45.4 -> 44.4,
+    32w 90.8 -> 80.8 (-11%), 64w 159.9 -> 143.3 (-10%).
+  - worker failures: bulk shared 64w hit the SSI abort storm (60 transactions out of retry budget)
+    in 1 of 6 runs per arm, A and B alike; no other failure.
+  The kill lines are not hit. The gain is below the predicted band at 16-64 writers (+6 / +10 / +9%
+  against +8-20 / +12-25%), because the remaining hold is the prune rebuild, the index builds and
+  the per-peer lock and clone. Tests: the cached parts equal a fresh build after every mutation
+  kind; views share one Arc until a change; a write skew whose operations follow a commit that
+  cached both peers still aborts the first committer as the pivot. All three fail with a cache that
+  is never dropped (checked).
+- Gate (on c6f5c57f3 + this batch, rch): clippy -D warnings mvcc/core/e2e all targets;
+  fsqlite-mvcc lib 1,679 pass; keepers k1-k3 and e1-e3 (the SSI / snapshot-isolation and
+  concurrent-writer targets: ssi_write_skew, ssi_conflict_oracle_e2e,
+  bd_3plop_5_ssi_serialization_correctness, bd_2yqp6_6_1_ssi_serialization_anomaly_differential,
+  correctness_mvcc_isolation, mvcc_edge_case_oracle_e2e and the rest) green; fsqlite-core lib 4,180
+  pass with only the 2 known test_t6741 reds.
+- Retry condition for the residual: the committed-history rebuild in
+  `prune_committed_conflict_history` re-summarizes every retained entry on every commit; it is the
+  next item, then `ActiveEdgeDiscoveryIndex::build`. History lengths feed
+  `evaluate_prepare_t3_dro` (which active pivots finalize marks for abort early), so making
+  pruning lazy changes that input; account for it first.
+
+## 2026-11-14 - WIN: a leaner column decode in the parallel aggregate kernel, which brings its CPU to stock's on scan_filter_agg (bd-w4pr1.13.11 kernel lever K3)
+
+- Target: the per-row column decode of the parallel ungrouped-aggregate kernel after K2 (above):
+  `Row::cell` 152.7 Ir/row on scan_filter_agg's filter path (call frame and cache check ~43, a
+  `drop_in_place` of `decode_scalar_value`'s `Option<SqliteValue>` ~10, the per-row REAL-column
+  lookup through `shape.real_columns`). Touched: `crates/fsqlite-vdbe/src/parallel_aggregate.rs`
+  (`ColumnSource`, `RowScratch::sources`, `Row::cell` / `Row::decode`), the oracle file.
+- Ledger preflight: K1 and K2 below. No earlier entry on this decode.
+- Pre-registered on the bead (2026-11-14T12:21Z): (a) decode through
+  `decode_numeric_column_from_offset` (Copy result, one bounds check, no drop glue; TEXT / BLOB to
+  the general decoder; NULL, serial types 10-11 and a NaN REAL read as NULL in both decoders), (b)
+  the cache check of `cell()` inlined into its callers, (c) each plan column's source (rowid or
+  alias, or declared index with its REAL flag) resolved once per walk. Prediction -30 to -55 Ir/row
+  at every worker count, CPU at 8 workers -2 to -5 ms; kill below -15.
+- Result (thinkstation1, 64 CPUs, governor powersave, io_uring refused; base 6607bdb8bb30d2de =
+  ac486d7f0; stock sqlite3 3.46.1 live in the same par_probe run, reps 5; answers equal
+  everywhere): with (b) as an `#[inline]` hint, which LLVM did not take (`cell` stayed a call),
+  K3 d1373ffdf495b4f9: scan_filter_agg at 8 workers 572.4M -> 546.4M user instructions (-26.0
+  Ir/row, below the predicted range, above the kill floor), CPU 60.9 -> 58.3 ms (stock 55.2; x1.10
+  -> x1.06), wall 7.7 -> 8.1 ms (stock 55.7), 7 helper threads in both; callgrind exact 572.06M ->
+  546.04M, `Row::cell` 166.7 -> 138.7, the `Option<SqliteValue>` drop gone (10 -> 0).
+  With (b) forced (`#[inline(always)]` under `#[allow(clippy::inline_always)]`, as engine.rs does
+  for measured hot paths), K3b 25f24cab81ffe4eb against the same base: 572.4M -> 534.4M (-38.0
+  Ir/row, inside the prediction), CPU 59.4 -> 56.8 ms against stock's 56.9 in the same run (x1.04
+  -> x1.00), wall 8.1 -> 7.7 ms (stock 56.8); callgrind exact 576.08M -> 538.11M, the decode now
+  an out-of-line `Row::decode` of 104.7 Ir/row behind an inline cache check. K3b is what
+  landed, as 61fe0d627.
+  Serial rows unchanged in every arm: scan_filter_agg 1,234.9M, count_star 63.4M,
+  group_by_1000_groups 3,334.0M user instructions (the serial engine is not touched).
+- Gate: the oracle file (13 tests; the serial-type test gains a plan reading the REAL column, an
+  INTEGER column and the INTEGER PRIMARY KEY together, whose sources a mix-up would swap), the
+  budget test, four aggregate keepers, six fsqlite count / min / max oracles, clippy. A first draft
+  of that new query filtered on `id > 100`, which the planner answers with a rowid range seek, so
+  it never reached the parallel plan; the landed query filters on `z <> 0`.
+- Verdict: WIN, kept as K3b (MAINTENANCE by the suite's rules, a self-speedup of the default-on
+  parallel path). Against stock live in the same run, scan_filter_agg at 8 workers is now x1.00
+  CPU and x0.14 wall; K1 + K2 + K3 together took the kernel from 635 to 534 Ir/row. The serial
+  path (x1.87-1.94 stock CPU on the same row) is untouched by all three.
+- Retry condition: none (kept). The decode after K3 is ~139 Ir/row; what is left in it is the
+  rowid-alias verdict and payload index (~18), the cache bookkeeping and the general bounds of
+  `column_offset`; the next kernel levers are the record header parse (91 Ir/row, shared with
+  the serial in-place Column lane) and the leaf cell parse (86 Ir/row).
+
+## 2026-11-14 - WIN: an explicit COMMIT alone in its window advances the memdb mirror to its own commit (bd-w4pr1.7, lever E)
+
+- Target: every explicit write transaction on a file-backed WAL database (the scorecard's
+  `txn_1000x10_rows`; multi-writer explicit transactions). Touched:
+  `crates/fsqlite-core/src/connection.rs` (`execute_commit_with_cx`, the doc comment of
+  `reset_cached_vdbe_engine_for_next_transaction`, and the new test
+  `test_explicit_write_commit_advances_mirror_only_past_its_own_commit`).
+- Ledger preflight: the autocommit tail's advance (5c3f0e9a3, 2026-09-24) is the same rule for
+  autocommit; bd-w4pr1.13.35 lever 6 (2026-11-14) names this lever as its explicit-transaction
+  retry condition. Nothing earlier on the explicit COMMIT.
+- Evidence before (callgrind, the scorecard's txn script, c8b483d42): the coordinator's note put
+  the stale mirror at ~3.5k per explicit BEGIN. That 3.5k is execute_begin's publication bind,
+  which stays. The stale-mirror cost was at the BEGIN statement's boundary. Every concurrent BEGIN
+  sets `memdb_requires_active_txn_reload`, the transaction's INSERTs skip the refresh (bd-33sht),
+  and the COMMIT left `memdb_visible_commit_seq` behind. So `refresh_memdb_from_active_txn_if_dirty`
+  failed its clean-mirror fast path on the sequence check alone, and `reload_memdb_from_pager`
+  began a separate read transaction, reloaded and dropped it: 1,000 calls, 36.4k each.
+- Change: after the file-backed write commit's `sync_filebacked_post_commit_visibility_floor`,
+  the explicit COMMIT advances the mirror sequence under the autocommit tail's rule. The mirror
+  must be at the transaction's begin sequence and the commit must be that sequence + 1. Also
+  required: no schema cookie to publish and an unchanged schema generation, no mirrored rows, no
+  AUTOINCREMENT tables, no live virtual tables, and no deferred mirror upserts. A ROLLBACK TO
+  inside the transaction reloads the mirror from the active transaction (`pragma_state` header
+  fields included), so what the mirror holds at COMMIT is what was committed.
+- Result, stock sqlite3 3.46.1 live in the same runs; binaries 5fed0073... (c8b483d42) and
+  8a69be4b... (c8b483d42 plus this diff); answers equal stock's; stock `integrity_check` ok on all
+  35 candidate files:
+  - `txn_1000x10_rows`: 590.5M -> 548.7M user instructions (7 reps) and 595.1M -> 555.5M (9
+    reps, arms swapped); stock 153.9M. CPU best 228.8 -> 223.6 ms and 234.8 -> 198.5 ms; wall
+    best 262.2 -> 262.2 ms and 266.6 -> 239.5 ms (stock 33.4 ms CPU, 67-71 ms wall).
+  - Exact (callgrind): boundary reloads 1,000 -> 0. The pager begin is +1.3k per transaction (the
+    first begin after the commit now does the read-mark update the boundary transaction used to
+    do), so the net is about -35k per transaction.
+  - Syscalls per transaction 36.8 -> 27.2 (statx 14.1 -> 10.1, fcntl 10 -> 8, access 2 -> 1;
+    stock 8.5).
+  - 8 writers on separate tables, 300 explicit transactions each (mw_txn_probe, 5 reps): 380.5k
+    -> 338.7k user instructions per transaction, CPU 414.7 -> 390.1 us (stock 34.5k, 75.5 us).
+    One writer: 281.4k -> 260.5k, 325.3 -> 308.1 us.
+  - `autocommit_5k_inserts` unchanged (924.1M vs 923.8M).
+  - Prediction (registered on bd-w4pr1.7 before code): -25M to -42M on `txn_1000x10_rows`. Kill:
+    under 12M. Cleared.
+- Test: `test_explicit_write_commit_advances_mirror_only_past_its_own_commit`. Three explicit
+  transactions alone in their window each advance the mirror, and the answers stay right. Two
+  negative cases: a peer commit inside the window, and a CREATE TABLE inside the transaction. Both
+  must leave the mirror behind the published sequence, and the next statement must see the peer's
+  row and the new table. An advance on every commit fails both, and main fails the first
+  assertion.
+- Gate (rch, c8b483d42 plus the change): clippy -D warnings on fsqlite-core and fsqlite
+  `--all-targets` clean; fsqlite-core lib 4,181 passed, 2 failed (the t6741 pair, red on main);
+  fsqlite-core keepers for explicit transactions, savepoints and memdb reloads 30, for header
+  pragmas, data_version, AUTOINCREMENT, TEMP/attached schema and prepared staleness 64, for WAL,
+  refresh and concurrency 14 + 204 + 36; fsqlite-e2e concurrency and group-commit targets 63 +
+  26; fsqlite WAL keepers 13.
+- Landed as 06751f418 (rebased onto 7a63c94d8). On the rebased tree ed051dea3 (on 2bee1f1bc):
+  clippy clean, fsqlite-core lib 4,181 passed with the same 2 red. The commits after it on main
+  touch neither `connection.rs` nor fsqlite-pager.
+- Retry condition: none for the single-writer case. With peers committing inside the window the
+  boundary reload stays. That is lever F on bd-w4pr1.7, which reloads inside the BEGIN's own
+  transaction. The fresh VDBE engine per explicit transaction (~1.85k) stays too: COMMIT still
+  discards it at its start and with its compilation caches. Extending the in-place reset there is
+  bd-w4pr1.13.35's retry condition.
+
+## 2026-11-14 - SMALL WIN (prediction missed, kill line cleared by 0.1M): the Delete arm reads the leaf cell's rowid and keeps its pending-Next cursors in a short vector (bd-w4pr1.13.20, lever D)
+
+- Target: every row a DELETE (or the delete half of an UPDATE that keeps its rowid) removes through a storage
+  cursor: the scorecard's `delete_14pct_300k` (42,857 deletes) and `update_10pct_300k` (30,000 in-place rewrites).
+  Touched: `crates/fsqlite-vdbe/src/engine.rs` (the `Opcode::Delete` arm, `CursorIdSet`,
+  `pending_next_after_delete`).
+- Evidence before (callgrind of the DELETE on main ffb7385aa, per deleted row 2,734): the arm read the rowid
+  through the async `CursorBackend::rowid` (132 a row) although the cursor stands on a table-leaf cell, and
+  `pending_next_after_delete`, a hashbrown `HashSet<i32>`, took the cursor id (insert ~110) for the next `Next` to
+  remove again.
+- Ledger preflight: no entry on the Delete arm's rowid read or on the set's type.
+- Change: the arm takes the rowid from the cell (`CursorBackend::try_table_leaf_rowid`, as lever R's Rowid arm) and
+  keeps the async read for any other position; `pending_next_after_delete` is a `CursorIdSet`, a `SmallVec<[i32;
+  4]>` with the four operations its 29 call sites use, returning what `HashSet`'s do (`remove` takes the id by
+  value, clippy's `trivially_copy_pass_by_ref`; the measured binary had the by-reference form, the only difference).
+- Prediction (recorded before code): DELETE -8M to -13M, UPDATE -2M to -5M. Kill: DELETE down by less than 6M.
+- Result, stock sqlite3 3.46.1 live in the same runs (sc_mut_probe, min of 7, io_uring refused; base main + C + R
+  + S as first built (f0cede81...), lever = base + this diff (cdfe52f9...)): `delete_14pct_300k` 427.6M -> 421.5M
+  (-6.1M, -1.4%; stock 120.7M) in two runs, CPU 114.9 -> 113.0 and 114.4 -> 119.3 ms (no CPU change resolvable);
+  `update_10pct_300k` 651.9M -> 650.3M (-1.6M); the statement-only variants `id % 7` 426.6M -> 420.5M and `id % 14`
+  367.6M -> 365.2M, about 170 a deleted row. Prediction missed low (-6.1M against -8M to -13M); the kill line (under
+  6M) is cleared by 0.1M. Kept as a small, simple change; its share is within the noise of any row's CPU.
+- Test: fsqlite-vdbe `test_cursor_id_set_matches_hash_set` (inserts, repeated inserts, removes of present and
+  absent ids past the inline capacity, membership after each step, against `HashSet`); the DML oracles' consecutive
+  deletes (one_pass_delete_oracle) catch a Next that loses its cursor id.
+- Gate: one gate for levers C, R, S and D, in the lever C entry below. Landed as 899b4c917.
+- Retry / widen: none.
+
+## 2026-11-14 - WIN: VColumn, VNext and an INTEGER MustBeInt run on the synchronous lane (bd-w4pr1.13.21, lever S)
+
+- Target: every row of a virtual-table scan run by bytecode (INSERT ... SELECT from a table-valued function: the
+  scorecard's `bulk_insert_1M_one_txn` and the 300k-row mutation setup), and every `MustBeInt` of an INTEGER (the
+  INTEGER PRIMARY KEY of an INSERT row). Touched: `crates/fsqlite-vdbe/src/engine.rs` (`execute_vcolumn_hot`,
+  `execute_vnext_hot`, the `MustBeInt` / `VColumn` / `VNext` arms of `try_execute_hot_opcode_sync`, the
+  `vtab_lane_error` hand-off read by the main loop's `VColumn` / `VNext` arms).
+- Evidence before (callgrind of the bulk statement on main ffb7385aa): 7 of the 23 opcodes of the row leave the
+  synchronous lane (VColumn, Concat, MustBeInt, Affinity x2, Insert, VNext); each exit returns from
+  `run_hot_opcodes_sync`, takes the main loop's checks, the async-lane test and the big match and re-enters the
+  lane (~85 instructions on the line profile) before the arm's own work; VNext also clones the execution `Cx`.
+- Ledger preflight: no VColumn, VNext or MustBeInt entry in the 2026-05-23..25 hot-dispatch series. The 2026-05-24
+  Concat and Affinity promotions were rejected with a retry condition this lever does not claim, so both stay off
+  the lane.
+- Change: the three arms run on the lane with the main arms' semantics (NULL for a missing / NULL-row / EOF cursor,
+  the same two requested-cancellation loads around each module call, VNext's jump; MustBeInt of an INTEGER only
+  clears the register subtype, every other value takes the main arm). A module error is not reported from the
+  lane: it is stored on the engine and the lane hands the opcode back, so the main arm, which runs next, reports
+  it with the same `vtab_exec_outcome` text and the module call is made once.
+- Prediction (recorded before code): bulk -200M to -320M user instructions, CPU -2% to -4%; the DML rows unchanged
+  within 2M. Kill: bulk down by less than 120M or its median CPU not lower.
+- Result, stock sqlite3 3.46.1 live in the same runs, host thinkstation1 (governor powersave), answers equal
+  stock's; base main + C + R (4b73060e...), lever = base + this diff (f0cede81...): `bulk_insert_1M_one_txn`
+  (bulk_cpu_probe.py, 7 runs, io_uring allowed) 9,149.0M -> 8,670.9M user instructions (-478.1M, -5.2%; 2.19x ->
+  2.08x stock 4,177.5M), CPU 1,113.9 -> 1,057.9 ms (-5.0%), wall 1,112.8 -> 1,062.5 ms (2.71x -> 2.58x stock 411.2
+  ms); the statement alone (INSERT ... SELECT and COMMIT, io_uring refused, 5 interleaved runs) 8,125.7M -> 7,670.1M
+  (-455.6M), CPU 920.3 -> 892.7 ms (stock 3,665.3M, 356.6 ms). The prediction (-200M to -320M) was exceeded: the
+  main loop's VColumn / VNext arms cost more than the ~85-instruction exit estimate. The DML rows moved the other
+  way: `update_10pct_300k` 644.5M -> 652.1M (+7.6M), `delete_14pct_300k` 421.9M -> 427.6M (+5.7M), against the
+  predicted "unchanged within 2M" (missed). Callgrind of the scan-only DELETE puts it in the lane's loop: +19
+  instructions a scanned row (`index_mut` of the register file, which the larger loop no longer inlines, +12; the
+  loop's own code +7). Marking the two module-call helpers `#[inline(never)]` did not remove it (DELETE 421.5M ->
+  422.4M, UPDATE 650.1M -> 650.2M) and cost the bulk statement +20M, so the helpers stay as written. The kill line
+  (bulk under 120M or CPU not lower) was not met; the DML cost is recorded here and is net of lever D in the lane
+  total.
+- Test: fsqlite-vdbe `test_vcolumn_vnext_module_errors_report_once_from_the_main_arm` (a mock module whose
+  column() or next() fails on the second row: the rows before it, the main arm's `ExecOutcome::Error` text, and
+  one call per module operation counted; a lane that reported the error itself or repeated the call fails it; a
+  `MustBeInt` on every scanned INTEGER).
+- Gate: one gate for levers C, R, S and D, in the lever C entry below. Landed as a29756059.
+- Retry condition: none for these arms. The +19 instructions a scanned row the larger lane loop costs a DML scan is
+  worth retrying only with a change that shrinks the loop and is measured on `delete_14pct_300k`'s scan-only
+  variant. Concat and Affinity on the lane stay governed by their 2026-05-24 entries.
+
+## 2026-11-14 - WIN: the scan loop's Rowid reads the leaf cell without the row-decode cache (bd-w4pr1.13.20, lever R)
+
+- Target: every `Rowid` of a storage cursor standing on a table-leaf cell, in the synchronous lane: the scan of
+  `delete_14pct_300k` and `update_10pct_300k` (300k rows each, plus two Rowids per updated row), and any read whose
+  WHERE or projection reads the rowid. Touched: `crates/fsqlite-vdbe/src/engine.rs` (the `Opcode::Rowid` arm of
+  `try_execute_hot_opcode_sync`).
+- Evidence before (callgrind, main ffb7385aa, the DELETE's scan): the arm cost ~194 instructions a scanned row, the
+  largest piece of the 685-a-row scan: `refresh_storage_cursor_first_key_state` ~85 (the position stamp, its
+  compare, `row_decode.invalidate()`, `payload_buf.clear()`, field stores) and the `cached_rowid` store, kept only to
+  keep the row-decode cache coherent for a later reader, around the two varints of the cell (~90).
+- Ledger preflight: 2026-05-25 "`Opcode::Rowid` hot-dispatch removal" (rejected) removed the arm; lever V
+  (2026-11-13) changed its register write. No entry on its cache bookkeeping.
+- Change: the arm reads `CursorBackend::try_table_leaf_rowid` directly and neither consults nor fills the cache.
+  Every reader of the cache (the Column lanes, the INTEGER PRIMARY KEY column, `payload_includes_rowid_alias`,
+  `storage_cursor_cached_rowid`) checks the cursor's position stamp itself first, so none relied on the arm's
+  refresh. A cursor that is not on a table-leaf cell (index, virtual table, in-memory, EOF) still takes the async
+  arm.
+- Prediction (recorded before code): DELETE and UPDATE each -18M to -30M user instructions, the scan-only DELETE -20M
+  to -30M, bulk unchanged. Kill: either row down by less than 12M.
+- Result, stock sqlite3 3.46.1 live in the same runs, host thinkstation1 (governor powersave), binaries main + lever
+  C (1328c6f9..., the base) and main + C + R (4b73060e...), answers equal stock's (sc_mut_probe, min of 7, io_uring
+  refused): `delete_14pct_300k` 453.6M -> 421.9M (-31.7M, -7.0%; 3.76x -> 3.50x stock 120.7M), CPU 122.8 -> 114.0
+  ms (stock 37.8); `update_10pct_300k` 676.8M -> 644.5M (-32.3M, -4.8%; 2.48x -> 2.36x stock 273.4M), CPU 133.5 ->
+  131.6 ms; the scan-only `DELETE FROM m WHERE id % 7 = 7` 222.1M -> 189.7M (-32.4M). io_uring allowed (5 runs):
+  DELETE 467.5M -> 435.8M, CPU 144.7 -> 139.7 ms, wall 184.8 -> 186.4 ms; UPDATE 686.9M -> 656.3M, CPU 169.7 -> 176.3
+  ms, wall 220.9 -> 207.8 ms (ring CPU varies with the ring's worker threads; refused-ring CPU is the repeatable
+  one). Prediction range exceeded by ~2M on each row; the kill line was not met. Stock's `PRAGMA integrity_check` is
+  ok on all 19 files the lever wrote. The bulk row, which runs no Rowid, read +10.9M on the statement alone (8,114.8M
+  -> 8,125.7M, io_uring refused, 5 runs; +0.13%, attributed to the lane loop's code placement, not verified) and
+  +23.6M on the scorecard row (min of 7; main's own minimum ranged 9,450.1M to 9,461.3M over today's four runs).
+  Both are against the "bulk unchanged" prediction.
+- Test: fsqlite-core `one_pass_delete_oracle::rowid_reads_beside_column_reads_match_stock` (Rowid, the INTEGER
+  PRIMARY KEY column and other columns alternating on the same rows, after Next, after in-place and growing
+  rewrites and after deletes, on an IPK table and an implicit-rowid table, `:memory:` and file, direct and
+  prepared, against rusqlite; a Rowid that trusted the cache's rowid without the stamp check returns the previous
+  row's id after Next and fails it).
+- Gate: one gate for levers C, R, S and D, in the lever C entry below. Landed as d5e954e3c.
+- Retry condition: none.
+
+## 2026-11-14 - WIN: `||` of TEXT and INTEGER builds an inline result in place (bd-w4pr1.13.21, lever C)
+
+- Target: every `||` whose operands are valid-UTF-8 TEXT or INTEGER and whose result fits the 23-byte inline
+  `SmallText`; on the scorecard the `'row-' || value` of `bulk_insert_1M_one_txn` and `memory_script_200k`.
+  Touched: `crates/fsqlite-types/src/value.rs` (`SqliteValue::sql_concat`, `concat_operand_utf8`,
+  `SmallText::inline_concat_utf8`, `write_i64_decimal`). Callers: the VDBE `Concat` opcode and the two
+  interpreted evaluators in `connection.rs`, all through `sql_concat`.
+- Evidence before (callgrind of the bulk statement on main ffb7385aa, toggle-collect on the statements,
+  (300k - 200k) / 100k rows): `sql_concat` 603 instructions a row: `Integer::to_string` into a `String`
+  (`spec_to_string` 90 + malloc), a second `String` for the result, `push_str` through `SmallText::as_str`, which
+  re-validates the inline `'row-'` on every call (`from_utf8` 69), `SmallText::from_string` copying the result
+  inline, two frees.
+- Ledger preflight: 2026-05-24 "VDBE `Opcode::Concat` hot-dispatch promotion" (rejected) moved the opcode's
+  dispatch; this lever changes `sql_concat`'s body only. 2026-11-12 bd-w4pr1.13.28 (`length()` on stored bytes) is
+  the same `as_str` re-validation pattern.
+- Change: after the NULL and byte-exact (BLOB / invalid-UTF-8 TEXT) cases, a pair of valid-UTF-8 TEXT (its stored
+  bytes, not re-validated) and INTEGER (its decimal digits written into a 20-byte stack buffer, the bytes
+  `i64::to_string` writes, `i64::MIN` included) whose result is at most `SmallText::INLINE_CAPACITY` bytes is built
+  directly as the inline representation; valid parts concatenate to valid UTF-8 (debug-asserted). REAL operands
+  and longer results keep the `String` path.
+- Prediction (recorded before code): bulk -350M to -500M user instructions, CPU -3% to -5%; DML rows unchanged.
+  Kill: bulk down by less than 200M or its median CPU not lower.
+- Result, stock sqlite3 3.46.1 live in the same runs, host thinkstation1 (governor powersave), binaries main
+  ffb7385aa (sha256 2f75107d...) and main + this diff (1328c6f9...), answers equal stock's:
+  `bulk_insert_1M_one_txn` (bulk_cpu_probe.py, 7 runs, io_uring allowed) 9,450.1M -> 9,119.7M user instructions
+  (-330.4M, -3.5%; 2.26x -> 2.18x stock 4,177.5M), CPU 1,176.5 -> 1,144.8 ms (-2.7%), wall 1,180.2 -> 1,145.2 ms
+  (2.87x -> 2.78x stock 411.5 ms); `memory_script_200k` (11 interleaved runs, :memory:) 4,313.3M -> 4,242.9M
+  (-1.6%), CPU 430.7 -> 428.8 ms (a 5-run pass first read +2.3% CPU at the same instruction drop; the 11-run rerun
+  did not reproduce it); `update_10pct_300k` 676.9M -> 676.8M, `delete_14pct_300k` 453.6M -> 453.6M. The
+  prediction's range was missed low by 20M (-330M against -350M to -500M); the kill line (200M, CPU) was not met.
+  Stock's `PRAGMA integrity_check` is ok on all 7 files the lever wrote, and the 1M rows (id, a, b, typeof(b), c)
+  hash the same on files written by stock, main and the lever.
+- Tests: fsqlite-types `test_write_i64_decimal_matches_to_string` (every power-of-ten edge, both signs, `i64::MIN`
+  / `MAX`, a stride sweep) and `test_sql_concat_inline_path_matches_rendered_bytes` (every pair of TEXT of 0 / 4 /
+  7-multibyte / 21 / 22 / 23 / 24 bytes and invalid UTF-8, INTEGER 0 / 7 / -7 / 12 / MAX / MIN, REAL, BLOB, NULL
+  against bytes rendered without `sql_concat`, and inline storage exactly up to 23 bytes: a version that drops
+  `i64::MIN`'s sign, formats unsigned, swaps the operands or admits 24 bytes inline fails it); fsqlite-core
+  `bd_string_scalar_oracle_probe::concat_over_scanned_rows_matches_rusqlite_oracle` (table columns in `:memory:`
+  and a file: quote / typeof / length / hex of t||n, n||t, n||n, t||t, t||r, r||n, b||n, n||b, an INSERT ... SELECT
+  into a NUMERIC column and an UPDATE s = s || id, against rusqlite).
+- Gate (one gate for levers C, R, S and D together, on ffb7385aa plus the four commits, tree identical to the
+  measured binaries' apart from `CursorIdSet::remove` taking its id by value; rch, 2026-11-14): clippy -D warnings
+  with all targets on fsqlite-types and fsqlite-vdbe clean (the first run found `trivially_copy_pass_by_ref` on
+  `CursorIdSet::remove`, fixed by passing the id by value at its 22 call sites), and on the two touched fsqlite-core
+  test targets clean; fsqlite-types lib 591 pass; fsqlite-vdbe lib 1,248 pass and 1 fail
+  (`codegen::tests::test_codegen_select_count_star_indexed_in_list_uses_index_probe_expansion`, a codegen-only
+  test: red on clean main a3fec6ea6 and in every lane's vdbe lib run since 2026-11-11; not re-run on ffb7385aa
+  itself), goldens 8 pass; fsqlite-core lib 4,180 pass and 2 fail (the t6741 pair); 48 fsqlite-core keeper targets
+  (string / concat / cast / affinity oracles, INSERT ... SELECT one-program, triggers, FK, RETURNING, UPSERT,
+  conflict atomicity, UPDATE / DELETE one-pass, savepoints, rowid / AUTOINCREMENT, generate_series / json_each /
+  pragma table-valued functions, FTS5 / R-tree) pass except the reds known on main: bd-jlbrk's two `bd_i3csr_1`
+  `rowid_replace_preflight_*` tests, bd-d8s37's two `fk_insert_conflict_oracle` upsert tests and the gh516 trio; 8
+  fsqlite targets 97 pass. `bd_2jbl5_update_from_triggers_oracle`'s 972-case test hung in the first run (no output
+  for 15 minutes on vmi1227854 against a usual 47-137 s; cancelled; the same test hung for 90 minutes in another
+  lane's gate today on vmi1293453 and passed on retry there); run alone on the same tree it passed, 3 of 3 in 47.4 s
+  on hz4. After the rebase onto 2bee1f1bc (clean, no conflict) clippy on fsqlite-types / fsqlite-vdbe and the vdbe lib
+  + goldens were run again on the landing tree: clippy clean, fsqlite-vdbe lib 1,249 pass and the same 1 fail, goldens
+  8 pass. Landed as 1fe7bdee3.
+- Retry / widen: none for this step. The bulk row's String8 `'row-'` per row (write_text_to_reg ~98) and the
+  per-row literal loads are the constant-hoisting lever.
+
+## 2026-11-14 - WIN: a WAL commit keeps the main-file size the pager last measured (bd-w4pr1.7, lever C')
+
+- Target: every WAL commit on a file-backed database (the scorecard's `autocommit_5k_inserts`,
+  `txn_1000x10_rows`). Touched: `crates/fsqlite-pager/src/pager.rs`
+  (`finish_authorized_wal_attempt`, and the test
+  `test_named_memory_vfs_wal_commit_records_physical_main_file_size`).
+- Ledger preflight: nothing earlier on this fstat. The other two size/header syscalls on the brief
+  were analysed on bd-w4pr1.7 and left alone. The WAL-length fstat in `WalFile::refresh` is GH#534's
+  unpublished-tail guard, and the WAL-header pread at refresh covers a dead resetter. The
+  wal-index header cannot answer either.
+- Evidence before (strace -f -c, the scorecard's autocommit script at 1,000 and 3,000 commits,
+  difference per commit): 11 statx per commit, stock none. One of them was the main-file fstat
+  `finish_authorized_wal_attempt` made to record `committed_db_file_size_bytes`.
+- Why it can go: a WAL append writes nothing to the main file. Its size changes only with a
+  checkpoint backfill or truncation, or a rollback-mode write, which never reaches this WAL-only
+  path. `committed_db_file_size_bytes` has one reader, the next full refresh's no-change probe
+  (`durable_identity_changed`), and that probe measures the file again. A stale value can only
+  make the probe clear the page cache once more. The published snapshot's `db_file_size_bytes`
+  has no reader outside a test. The commit now keeps the size last measured. The private
+  `:memory:` image keeps its synthetic size, which moves with the commit.
+- Result, stock sqlite3 3.46.1 live in the same runs; binaries a1a5cc9e... (06662b1f9) and
+  500be53f... (06662b1f9 plus this diff); answers equal stock's; stock `integrity_check` ok on all
+  14 candidate files:
+  - strace, three runs: statx per commit 11.01 -> 10.06, 11.06 -> 10.04, 11.04 -> 10.06; the
+    other syscalls within run-to-run noise.
+  - perf stat: `/dev/shm` had hit the user tmpfs quota (errno 122), so these runs used
+    disk-backed work directories. `autocommit_5k_inserts` 921.6M -> 919.7M user instructions
+    (stock 112.5M), CPU best 627.4 -> 610.3 ms, wall best 811.9 -> 782.4 ms (stock 258.5 ms);
+    `txn_1000x10_rows` 582.3M -> 572.9M, CPU best 238.3 -> 228.4 ms (stock 153.9M).
+  - rusage: system time 44.3 -> 42.5 us per commit (stock 12.9 us); user time moved within
+    noise (77.5 -> 80.6 us).
+  - Prediction (registered on bd-w4pr1.7 before code): statx 11 -> 10 per commit, -0.2k to -0.6k
+    user instructions and about -1 us system time per commit. Kill: syscalls per commit not down
+    by 0.9. Cleared (-0.95 to -1.02).
+- Test: `test_named_memory_vfs_wal_commit_records_physical_main_file_size` gains a negative half.
+  After the commit the main file grows (as a checkpoint backfill grows it), and the recorded size
+  must stay the one last measured. The next full refresh (a read-only begin) must then record the
+  grown size, which a pager that never re-measured would fail.
+- Gate (rch, 06662b1f9 plus the change): clippy -D warnings on fsqlite-pager and fsqlite-core
+  `--all-targets` clean; fsqlite-pager lib 1,110 passed, 1 failed (`bd_2jpu6_2` poll_quota, red
+  on main); fsqlite-e2e concurrency and group-commit targets 63 + 53 passed, 1 failed (the
+  `bd_3wop3_1_3` timing assertion, bd-uk9ob); fsqlite-core lib 4,180 passed, 2 failed (the t6741
+  pair, red on main); fsqlite-core WAL, refresh and staleness keepers 14 + 214 + 71; fsqlite WAL
+  keepers 16.
+- Landed as 8f971d9e5 (rebased onto c6f5c57f3). On the rebased tree 3ca3c40a7 (on a3b4ef8d6):
+  clippy clean, fsqlite-pager lib 1,110 passed with the same 1 red. The commits after it on main
+  touch neither fsqlite-pager nor fsqlite-vfs.
+- Retry condition: none for this fstat. The analysis on bd-w4pr1.7 covers the other size and
+  header syscalls: the GH#534 WAL-length check, the dead-resetter header pread, and the path
+  identity probes, which are owner-contract items.
+
+## 2026-11-14 - NOT TAKEN: skipping the per-begin rollback-journal probe in WAL mode (bd-w4pr1.7, lever D)
+
+- Target: the `access(-journal)` call every begin makes in `refresh_runtime_committed_state`
+  (one syscall, about 0.2k user instructions and ~1 us of kernel time per commit on
+  `autocommit_5k_inserts`; stock makes none). Nothing was changed.
+- Stock (SQLite 3.54.1 source): `sqlite3PagerSharedLock` probes for a hot journal and calls
+  `pagerOpenWalIfPresent` only in its `!pagerUseWal(pPager) && eState==PAGER_OPEN` branch; a WAL
+  pager goes straight to `pagerBeginReadTransaction`. That is sound because a WAL-mode connection
+  keeps its main-file SHARED lock between transactions (`pager_unlock` in WAL mode only ends the
+  read transaction). Leaving WAL needs `sqlite3WalClose` to take EXCLUSIVE on the database file
+  (`sqlite3PagerCloseWal` -> `pagerExclusiveLock`), which fails while any other WAL connection is
+  open, in this process too, since stock's inode lock table counts its SHARED. So under an open WAL
+  connection no peer can switch the file out of WAL, no rollback-mode writer exists, and no hot
+  journal can appear.
+- fsqlite: the WAL lifetime claim keeps the kernel SHARED lock, so another process cannot take
+  EXCLUSIVE (the unix.rs wal-lifetime test shows a foreign EXCLUSIVE refused). Within the process
+  it does not: the in-process EXCLUSIVE check refuses only on `n_shared > 1 || n_exclusive > 0`,
+  and an idle attachment counts in `n_wal_lifetime`, not `n_shared` (same test: "idle attachments
+  are not transactions"). `set_journal_mode(Delete)` needs only the in-process maintenance gate's
+  sole-owner upgrade, which an idle connection does not block. It then takes the maintenance fence
+  (EXCLUSIVE), rewrites page 1 to version 1 and retires the WAL. So a same-process peer can leave
+  WAL between this connection's transactions, and its rollback-mode writes can leave a journal
+  behind. The probe runs before the header and path checks that notice the switch; without it, the
+  begin that discovers the switch has no guarantee the journal is looked at before pages are read.
+- Verdict: not taken. The argument holds across processes, not within one.
+- Retry condition: the in-process EXCLUSIVE (or `set_journal_mode` out of WAL) refuses while
+  another handle holds a WAL lifetime claim, as stock does. That would also make an in-process
+  `PRAGMA journal_mode=DELETE` under an open WAL connection busy, as it is in stock, and it is a
+  behaviour decision of its own. After it, the probe is redundant while the begin's handle holds
+  its lifetime claim: about 1 syscall and 0.2k instructions per begin.
+
+## 2026-11-14 - REJECTED: two fewer registry-mutex acquisitions per concurrent transaction (BEGIN seeds the handle cache, lock-free active-session count) (bd-i0tn6 scaling lever 1)
+
+- Target: concurrent writers committing one row per transaction at 8-64 writers (`mt-mvcc-bench
+  --one-row-per-transaction`, separate and shared tables). Touched (reverted):
+  `crates/fsqlite-mvcc/src/begin_concurrent.rs` (`ActiveSessionCount`, an atomic copy of
+  `active.len()` published on every admission and removal), `crates/fsqlite-core/src/connection.rs`
+  (`register_concurrent_session` at the three registration sites seeds `cached_concurrent_handle`
+  under the registration guard; `active_concurrent_txn_count` reads the atomic). Patch:
+  scratchpad `i0_lever1_registry_acquisitions_on_c2f83a761.patch` (session 1f77802a).
+- Ledger preflight: bd-ifgl7 (the per-transaction handle cache this extends) and bd-6hgad (group
+  commit). Nothing earlier removes registry acquisitions.
+- Evidence before (bd-i0tn6 bead comment 2026-11-14, probe build on c2f83a761): five registry
+  acquisitions per transaction (BEGIN registration, the first statement's handle lookup,
+  commit validation, publication, the post-commit auto-checkpoint count). The waits totalled
+  84 us of 635 us per transaction at 8 writers and 752 of 1,438 at 16, about 140 us per
+  acquisition at 16 writers. Holds summed to 35 and 63 us. F wps is flat from 8 to 16 writers.
+- Prediction: separate tables 16w +15% to +30%, 8w +3% to +8%, 1w within 2%, shared 16w +5% to
+  +15%. Kill: 16w separate below 1.08x, 1w or 8w worse than -3%, or a worker failure.
+- Result (mt-mvcc-bench, one row per transaction, 500 rows per writer, 5 rounds, stock live in
+  every run; A = c2f83a761 + bench stage profiler, sha256 2119d428...; B = A + this change,
+  7c5e34e1...; interleaved A B, thinkstation1, 64 threads, powersave, tmpfs, NORMAL). Separate
+  tables, 2 reps, B/A: 1w 1.01x, 2w 0.95x, 4w 1.02x, 8w 1.05x, 16w 1.09x, 32w 0.93x, 64w
+  0.86x. Shared table, 1 rep (the second failed at setup, see below): 4w 1.11x, 8w 0.94x, 16w
+  0.92x, 32w 0.96x. 16w missed the prediction, shared 8w hit the kill line, and 32-64 writers lost
+  in both reps. The first statement stopped queueing (INSERT 728 -> 36 us at 32w, 2,718 -> 124 at
+  64w). But each commit-path hold grew 27-34% (47 -> 59 us at 32w, 81 -> 108 at 64w) and its wait
+  grew from 760 to 1,308 us and from 2,472 to 4,884 us. SSI validation locks every active peer's
+  handle under the registry guard (`HandleView::new` over `iter_active`). With the first-statement
+  wait gone, peers are mid-INSERT on their own handle locks while a validator scans them. The
+  removed waits had been keeping peers off those locks, so taking them out only lengthened the
+  O(N) holds. Worker failures: none.
+- Tests written (in the patch, both pass on B): `test_active_session_count_tracks_admission_and_removal`
+  (mvcc) and `i0tn6_transaction_statements_and_session_count_skip_the_registry_mutex` (core, a
+  statement and the count must finish while another thread holds the registry mutex).
+- Retry condition: after the commit-path validate holds stop locking peer handles or stop scaling
+  with the writer count (bd-15hxt / S4), measured at 32-64 writers; then retry part (b), the
+  lock-free count, on its own first. Not as a standalone patch while validation scans locked peer
+  handles under the guard.
+- Also seen: from 2026-11-14 ~12:25 UTC every tmpfs run failed at stock's first PRAGMA with a
+  disk I/O error, plain sqlite3 included. /dev/shm is mounted `usrquota` and the fleet's uid-1000
+  usage is ~87 GB, so the shared user quota looks exhausted. Runs on /dev/shm are not comparable
+  until it is cleared.
+
+## 2026-11-14 - WIN: the parallel aggregate kernel keeps INTEGER columns as i64 from decode to comparison, sum and min/max (bd-w4pr1.13.11 kernel lever K2)
+
+- Target: the per-row cost of the parallel ungrouped-aggregate kernel on scan_filter_agg
+  (`SELECT count(*), sum(a) FROM t WHERE a > 500;`, 1M rows), where it was x1.15-1.27 stock CPU at
+  8 workers. Touched: `crates/fsqlite-vdbe/src/parallel_aggregate.rs` (`ColumnCell`, `RowScratch`,
+  `Row::cell` / `with_value` / `hold` / `decode`, `Row::eval`, the min/max arms of `scan_leaf`),
+  `crates/fsqlite-vdbe/src/engine.rs` (`SQLITE_AFF_MASK` / `SQLITE_AFF_TEXT` pub(crate)), the
+  oracle file.
+- Ledger preflight: K1 below (the copy cells alone, REJECTED at -12.5 Ir/row) names this as its
+  retry condition; the default-flip entry's kernel profile (evaluating `a > 500` ~269 Ir/row:
+  decode 163, Row::eval 47, compare_for_where 51).
+- Pre-registered on the bead (2026-11-14T10:46Z): -60 to -95 Ir/row at every worker count, CPU at
+  8 workers -4 to -8 ms, serial rows unchanged within 0.2%; kill below -30.
+- Change: K1's Copy cells (NULL / INTEGER / REAL / wide, TEXT and BLOB in a per-column slot), and
+  an INTEGER cell against an INTEGER literal compares the i64 directly when the comparison's
+  affinity is not TEXT (the case `fast_compare_same_storage_class` answers with `a.cmp(b)`; the
+  test is a per-row mask compare of `p5`, not decided once per predicate as the plan said); min
+  and max compare and store an INTEGER against an INTEGER best in place. Every other pair builds
+  the SqliteValue and calls compare_for_where / cmp_binary_in as before.
+- Result (thinkstation1, 64 CPUs, governor powersave, io_uring refused; base 930fd4dc423904a4 =
+  6ae747d6d, K2 88c0dbbbc7c2b1fc = 6ae747d6d + this diff, landed as cb70f9126; stock sqlite3
+  3.46.1 live in the same par_probe run, reps 5; answers equal everywhere): scan_filter_agg at 8
+  workers 635.4M -> 572.4M
+  user instructions (-63.0 Ir/row), CPU 68.0 -> 63.6 ms (stock 53.6; x1.27 -> x1.19), wall 10.7 ->
+  9.1 ms (stock 53.6), 7 helper threads in both. Callgrind exact (2 workers) 635.05M -> 572.04M:
+  compare_for_where off the hot path (51 Ir/row -> 0), Row::eval 268.7 -> 226.7. Serial rows
+  unchanged: scan_filter_agg 1,234.9M, count_star 63.4M, group_by_1000_groups 3,334.0M user
+  instructions in both arms (the serial engine is not touched; their CPU medians moved by up to
+  +-15% with identical instruction counts, run-to-run noise on the busy host).
+- Gate: the oracle file (13 tests; the serial-type test gains the integer-against-TEXT-literal
+  cases `w = '600'`, `z > '5'`, `'5' < z`), the budget test, aggregate_edge_oracle,
+  bd_aggregate_null_and_groupconcat_oracle_probe, implicit_agg_bare_column_gh226_oracle,
+  bd_xmpma_aggregate_absorbing_where, the fsqlite count / min / max oracles, clippy.
+- Verdict: WIN as a self-speedup of the default-on parallel path (MAINTENANCE by the suite's
+  rules; the vs-stock ratio it moves is x1.27 -> x1.19 CPU and x0.20 -> x0.17 wall at 8 workers).
+  The decode itself is now the largest item: Row::cell 152.7 Ir/row on the filter path (call
+  frame and cache check ~43, a drop of decode_scalar_value's Option<SqliteValue> ~10).
+- Retry condition: none needed (kept). Extend to REAL cells (Float against a REAL literal) when a
+  scorecard row filters or aggregates a REAL column on the parallel path.
+
+## 2026-11-14 - REJECTED on its kill lines: the parked-leaf seek pool, limited to programs that write no storage (bd-w4pr1.13.34 retry)
+
+- Target: rowid probes of a small table in join_1M_to_pk_1000. Fresh evidence (callgrind, main
+  70a46a0f3): BtCursor::table_move_to is 1,714 Ir per probe; load_page 441 of it, from 810k loads
+  in 1M probes. Touched (not landed; branch `reject-seekpool-readonly-d2c2b785e` of the
+  frankensqlite-perf5-shm clone): `crates/fsqlite-btree/src/cursor.rs` (the 2026-11-13 pool
+  patch, plus a `park_displaced_leaves` flag, off by default) and `crates/fsqlite-vdbe/src/lib.rs`,
+  `engine.rs` (`VdbeProgram::writes_storage`; the engine allows parking only on read cursors of a
+  program with no write opcode). This was the retry condition of the 2026-11-13 correctness
+  rejection.
+- Prediction: join -300 to -400 per probe; rowid_lookups_200k within +-0.5%. Kill: join drop
+  under 250 per probe, or rowid_lookups_200k +1% or more.
+- Result (perf stat user instructions, io_uring refused, 5 reps repeating to 0.1M, stock sqlite3
+  3.46.1 live, each arm on the database it built, answers equal):
+  - join_1M_to_pk_1000 4,847.8M -> 4,953.9M (+106 per probe);
+  - rowid_lookups_200k 2,956.0M -> 2,999.0M (+1.5%);
+  - scan_filter_agg 636.5M unchanged.
+  Both kill lines are hit. The gate was stopped before its bd_2jbl5 job finished, so this says
+  nothing about the earlier hang.
+- Not attributed: whether the pool rarely hits, or its park / take bookkeeping on every seek costs
+  more than the reload it saves. The decoded-page memo (bd-w4pr1.13.26) already makes a reload
+  cheaper than when the pool was first proposed.
+- Retry condition: a callgrind split on join_1M showing seek-cache hits on a non-current leaf above
+  70% of probes, and park plus take under 100 Ir per seek. Otherwise attack the load itself
+  (get_page on a transaction-cache hit, about 545 per load), not a pool in front of it.
+
+## 2026-11-14 - WIN: an autocommit write commit resets the parked VDBE engine in place instead of dropping it for a fresh one (bd-w4pr1.13.35 lever 6)
+
+- Target: the connection's parked VDBE engine across an autocommit write commit; measured on an
+  autocommit literal INSERT, a prepared autocommit INSERT and `autocommit_5k_inserts`. Touched:
+  `crates/fsqlite-vdbe/src/engine.rs` (`VdbeEngine::reset_for_next_transaction`, the
+  `transaction_state_clear` flag) and `crates/fsqlite-core/src/connection.rs`
+  (`reset_cached_vdbe_engine_for_next_transaction`, the committed-write tail of
+  `resolve_autocommit_txn_with_dirty_table_and_capture_and_cx`).
+- Ledger preflight: no entry on this site. The 2026-07-10 NON-CANDIDATE on caching
+  `opcode_trace_enabled()` concerned the reuse path, where that read never runs; here it ran once
+  per autocommit write, inside every fresh engine.
+- Evidence before (callgrind, symbolized release-perf CLI, autocommit literal INSERT, about 181k Ir
+  per statement): `discard_cached_vdbe_engine` 2,485 (the engine's drop) and the next statement's
+  `VdbeEngine::new_with_execution_cx` 1,846, 418 of it in the opcode-trace env read.
+- Change: the committed-write tail resets the parked engine instead of dropping it. The reset is the
+  existing one without retained cursors or preserved runtime setup, plus the two caches only a fresh
+  engine starts without (`builtin_collations_overridden_cache`, `dirty_root_pages`). Both
+  executors bind a reused engine's runtime state from the connection before any run, so the next
+  statement sees what a fresh engine would bring. A flag, re-armed by every reuse reset, skips the
+  reset for an engine parked across commits that never use it.
+- Two findings on the way, both measured. First, without the flag the prepared direct-insert lane,
+  which parks an engine from setup statements and never runs it, paid a reset at every commit
+  (prepared autocommit INSERT mean +2.3k over three runs; the dropped engine's None had cost
+  nothing). Second, an explicit COMMIT's own discards were changed at first too. There the next
+  BEGIN's memdb reload (`reload_memdb_from_txn_with_mode`, once per explicit transaction) discards
+  the engine anyway, so the reset only added work: callgrind on `txn_1000x10_rows` showed the same
+  1,000 fresh engines plus 1.43M of resets. The landed change leaves the explicit COMMIT's discards
+  as they were.
+- Result (main 4c49baa46 against this commit; binaries fsqlite 1e400a20... / a74aa89f..., probe
+  ed071997... / f21985da...; stock sqlite3 3.46.1 live, answers equal):
+  - callgrind autocommit literal INSERT, three runs per arm: 180,559 / 179,908 / 180,958 ->
+    177,772 / 176,680 / 177,305 (-3.2k);
+  - prepared autocommit INSERT: 159,134 / 160,765 / 159,263 -> 158,541 / 158,809 / 159,435
+    (unchanged);
+  - in-transaction literal INSERT unchanged.
+  - perf stat user instructions, 15 reps interleaved, whose spread is now wide (about 920M to 990M
+    for the base): `autocommit_5k_inserts` min 920.4M -> 903.8M, p25 931.5M -> 917.0M, mean
+    946.9M -> 932.9M (stock 112.3M; 8.43x -> 8.30x). `txn_1000x10_rows` is unchanged (p25
+    578.5M -> 577.6M).
+  - The prediction was -2.0k to -3.5k per autocommit statement and -10M to -17M on the row, with a
+    kill line under 1.5k.
+- Gate (rch, this commit before its rebase onto 6ae747d6d): clippy -D warnings on fsqlite-vdbe
+  and fsqlite-core all targets; --lib of both 5425 passed, 3 failed. The three are red on main:
+  bd-nouem's two test_t6741 join tests and bd-bhalc's
+  test_codegen_select_count_star_indexed_in_list_uses_index_probe_expansion. 48 keeper targets
+  pass (565 tests): prepared reuse and cross-connection staleness (issue #70's
+  cache_staleness_cross_txn_regression among them), track_w_gate, AUTOINCREMENT, collation, time
+  travel, TEMP schema, savepoint / rollback atomicity, busy and concurrent writers, trigger / FK,
+  FTS5 / R-tree, and the fsqlite API batch. The unit test
+  `test_reset_for_next_transaction_leaves_what_a_fresh_engine_brings` checks the reset against a
+  fresh engine and that a reuse re-arms it.
+- Retry condition: the explicit-transaction half waits for the memdb reload at BEGIN. When an
+  explicit COMMIT stops leaving the memdb stale, as the autocommit tail already avoids by advancing
+  `memdb_visible_commit_seq`, extend the reset to `execute_commit_with_cx`'s discards and measure
+  `txn_1000x10_rows`.
+
+## 2026-11-14 - WIN: a begin's refresh signature is the header its reader admission bound (bd-w4pr1.7, lever B)
+
+- Target: every implicit or explicit BEGIN on a file-backed WAL database (the scorecard's
+  `autocommit_5k_inserts`, `txn_1000x10_rows`, `multiproc_8x500`). Touched:
+  `crates/fsqlite-pager/src/pager.rs` (`refresh_runtime_committed_state`,
+  `refresh_committed_state_unless_unchanged`, new `begin_wal_path_identity` and
+  `bound_refresh_signature`, `NativeReaderAttempt::main_wal_lifetime_held`, the premapped-region
+  parameter removed from `acquire_reader_into`, `BeginSignatureObservation` keeps only the `-wal`
+  identity); `crates/fsqlite-core/tests/cache_staleness_cross_txn_regression.rs` (new keeper).
+- Ledger preflight: bd-ih8ak lever 3 (WalRefreshSignature fast path) and its premapped-region
+  follow-up are the closest entries; neither removed the separate observation.
+- Evidence before (callgrind toggle on `refresh_runtime_committed_state`, main 9a372e5ba, N=1000,
+  17.2k per begin; gdb backtraces of every steady-state shm_map): with the header unchanged since
+  this connection's last commit, nothing large is re-derived. The full refresh is skipped, the WAL
+  `NativeReadProof` holds, and the read-mark update and SHARED/read-slot locks are stock's
+  walTryBeginRead protocol. The duplicate was `current_wal_refresh_signature`, which mapped region
+  0 and read and validated the header before admission only to build a "before" signature. The
+  admission then read the same header, locked its slot and revalidated it, and the fast path
+  compared that bound header with the signature.
+- Change: the begin probes only the `-wal` path identity (still once per transaction), and
+  builds its refresh signature from the header the admission bound. It vouches for that header
+  only if the main-file WAL lifetime claim was held at admission, which the attempt records while
+  it holds the file guard, as `observe_vouched_wal_index_header` required. The fast path's
+  test is therefore the admission's own revalidated header. A full refresh stores the bound header,
+  which is exactly the state it adopted. The admission maps region 0 itself, so shm_map/statx
+  counts are unchanged. The standalone refresh (`refresh_published_snapshot`) still observes the
+  header as before.
+- Result, stock sqlite3 3.46.1 live; binaries 1b7cc11a... (main 9a372e5ba) and 9af63344...
+  (9a372e5ba plus this diff); answers equal stock's in every row; stock `integrity_check` ok on all
+  39 candidate files:
+  - Exact (callgrind, N=1000, io_uring refused): `refresh_runtime_committed_state` 17.23k ->
+    14.22k per begin, the implicit begin 28.88k -> 25.79k (-3.1k).
+  - perf stat, stock live: `autocommit_5k_inserts` 944.6M -> 937.7M (7 reps) and 957.0M ->
+    934.9M (9 reps, arms swapped); `auto_scale` 5,000 commits 936.2M -> 918.1M (stock 112.3M).
+    Base itself ranged 936.2M-957.0M across these runs (min-of-reps still carries a time-dependent
+    share of about 2%), so the exact count is the measure. CPU and wall moved within noise (7 reps:
+    565.7 -> 583.1 ms CPU; 9 reps: 579.8 -> 571.2 ms; stock 60-62 ms).
+  - `multiproc_8x500` (7 reps): median 1,083.8M -> 1,054.2M, median CPU 1,149.3 -> 1,114.2 ms,
+    median wall 947.7 -> 971.5 ms (stock 99.0M, 207.0 ms, 164.0 ms).
+  - Prediction (registered on bd-w4pr1.7 before code): -1.5k to -2.5k per commit; exact -3.1k,
+    above the range (the old observation also took the backend read lock and the db-file lock, and
+    the fast path no longer re-reads the bound header through the backend). Kill (< 1.0k) cleared.
+- Test: `autocommit_statements_see_each_peer_commit_and_their_own` (two connections, six rounds:
+  each connection's own autocommit insert and a repeated read take the fast path; the peer's
+  commit between two statements must be seen by the next one, which a begin that skipped the
+  refresh anyway would answer from stale committed state).
+- Gate (rch, 9a372e5ba plus the change): clippy -D warnings on fsqlite-pager and fsqlite-core
+  `--all-targets` clean; fsqlite-pager lib 1,110 passed, 1 failed (`bd_2jpu6_2` poll_quota, red
+  on main); fsqlite-e2e concurrency and group-commit targets 63 + 53 passed, 1 failed (the
+  `bd_3wop3_1_3` `centralized_publication_cost_shrank` timing assertion, which bd-uk9ob records
+  as failing 1 run in 3 on a quiet host and bd-3wop3.1.5 records failing under rch; it failed
+  again alone); fsqlite-core lib 4,175 passed, 2 failed (the t6741 pair, red on main);
+  fsqlite-core WAL, refresh and staleness keepers 14 + 215 + 71 (the new keeper included);
+  fsqlite WAL keepers 16.
+- Landed as 6b7891aeb (rebased onto c2f83a761). On the rebased tree ee5e63f4d (on 7b1a890d9):
+  clippy clean, fsqlite-pager lib 1,110 passed with the same 1 red, and the staleness, path-identity,
+  gh525, gh457 and read-your-own-write keepers 18 passed. The commits after it on main touch
+  neither fsqlite-pager nor fsqlite-vfs.
+- Retry condition: none for this duplicate. What is left in the begin's refresh is the reader
+  admission itself (14.2k): the read-mark update after the connection's own commit (exclusive slot
+  lock, as stock), the read slot, the main-file SHARED snapshot, three header reads/validations
+  and the async lock round trips. Each is under 1.6k; worth a lever only as one redesign of the
+  admission's lock and header round trips, not piecemeal.
+
+## 2026-11-14 - REJECTED: Copy column cells in the parallel aggregate kernel (bd-w4pr1.13.11 kernel lever K1)
+
+- Target: the per-row column decode of the parallel ungrouped-aggregate kernel
+  (`crates/fsqlite-vdbe/src/parallel_aggregate.rs`, `Row::value` / `scan_leaf`), measured on
+  scan_filter_agg (`SELECT count(*), sum(a) FROM t WHERE a > 500;`, 1M rows) at 8 workers, where it
+  is x1.15-1.23 stock CPU. Touched (reverted): `RowScratch`, `Row`, `scan_leaf`, `Row::eval`.
+- Ledger preflight: the default-flip entry below (its kernel profile: 635 Ir/row), the steps 1-3
+  entry. No earlier entry on this kernel's decode.
+- Pre-registered on the bead (2026-11-14T09:37Z) before the change. Line-level callgrind of the
+  2-worker kernel put the rowid-alias verdict and payload-index lines at ~18 Ir/row, so the plan's
+  L1 (cache them per record shape) could not reach its own kill floor and was dropped; K1 aimed at
+  what the lines did show: the per-row `values.fill(None)` over `Vec<Option<SqliteValue>>` with its
+  drop glue (~29 Ir/row), Option handling (~15), SqliteValue construction (~29). Prediction -35 to
+  -60 Ir/row; kill below -18.
+- Change: each plan column of a row cached as a Copy cell (Null / Int / Float / Wide), TEXT and
+  BLOB values in a per-column slot written only when read; comparisons and min/max built the
+  scalar's SqliteValue on the stack and called the same compare_for_where / cmp_binary_in.
+- Result (thinkstation1, 64 CPUs, governor powersave, io_uring refused; base 37650fb1d2d7211d =
+  7b1a890d9, K1 68a3018b1485bbbf = 7b1a890d9 + diff ee0c572f1605eb83; stock sqlite3 3.46.1 live
+  in the same par_probe run, reps 5; answers equal everywhere): scan_filter_agg at 8 workers
+  635.4M -> 622.9M user instructions (-12.5 Ir/row), CPU 65.4 -> 65.8 ms (stock 56.8), wall 8.3 ->
+  9.2 ms (stock 56.7), 7 helper threads in both; callgrind exact 635.05M -> 622.55M. Serial rows
+  unchanged as predicted (scan_filter_agg 1,234.9M, count_star 63.4M, group_by_1000_groups
+  3,334.0M user instructions in both arms). Where it went: the fill and drop glue did disappear
+  (-29), but the stack-built SqliteValue temporaries brought their own `drop_in_place` calls
+  (~10-19 Ir/row) and the comparison closure in `Row::eval` added ~8.
+- Verdict: REJECTED at -12.5 Ir/row against a kill floor of -18; reverted. The new oracle test
+  for serial types 8 and 9 (0 and 1 stored without body bytes) stays, since the shipped kernel's
+  oracle did not cover them.
+- Retry condition: not as a standalone patch. Worth retrying only together with a comparison and
+  min/max path that never builds a SqliteValue for an INTEGER or REAL (lever K2's integer compare),
+  where the temporaries' drop glue disappears too; the kill floor then applies to the pair.
+
+## 2026-11-14 - WIN (default flipped): parallel scans sized by leaf pages under a process-wide helper budget, and fsqlite.parallel_workers defaulting to min(available_parallelism, 8) (bd-w4pr1.13.11)
+
+- Target: the parallel count(*) and ungrouped count/sum/min/max of bd-w4pr1.13.11 steps 1-3
+  (bbd81503d), which only ran under `PRAGMA fsqlite.parallel_workers = N`; this decides whether a
+  user gets them by default. Touched: `crates/fsqlite-btree/src/snapshot_walk.rs`
+  (`LEAF_PAGES_PER_THREAD`, `BtreeSplit::leaf_pages` / `threads_for`, `HelperGrant`,
+  `parallel_helper_budget`, `parallel_helpers_high_water`, `WalkRecord`, `SerialReason`,
+  `take_last_parallel_walk`), `crates/fsqlite-core/src/connection.rs` (`default_parallel_workers`),
+  the oracle file `bd_w4pr1_13_11_parallel_scan_oracle.rs` and the new
+  `bd_w4pr1_13_11_parallel_budget.rs`.
+- Ledger preflight: the steps 1-3 entry below (52df35c25) and its missed prediction (scan_filter_agg
+  at 8 workers costs 1.21x stock CPU). No earlier entry sizes or budgets threads.
+- Change: the split counts the leaves below its frontier (exact when the frontier is leaves,
+  frontier x fanout of the last expanded level otherwise). A statement wants
+  min(parallel_workers, leaf pages / 32) threads, at least 1; wanting 1 runs the serial path, so a
+  one-level tree (up to 63 leaves, e.g. 2,000 rows) starts nothing. The threads beyond the
+  statement's own come from one process-wide budget of available_parallelism helpers, granted by a
+  CAS that never waits: a statement takes what is left, and with nothing left it runs the serial
+  path. The grant is returned when the walk's scope ends. Explicit and concurrent transactions stay
+  serial (unchanged from steps 1-3).
+- Pre-registered on the bead (2026-11-14T04:05Z) before any run: flip only if (a) 2,000-row tables
+  start 0 threads under strace at the new default, (b) every scorecard row without a parallel
+  statement stays within +2% wall of the forced-1 arm with CPU reported for every row, (c) the
+  read / aggregate / snapshot / EXPLAIN / concurrency keepers pass with the default flipped in code,
+  (d) explicit transactions stay serial, (e) 8 connections asking for 64 workers each stay within
+  the budget.
+- Results (host thinkstation1, 64 CPUs online and in affinity, governor powersave, io_uring
+  refused; binary 5f3251ab4c2210dd = 52df35c25 plus this diff, landed as 5f3006612; stock sqlite3
+  3.46.1 live in the same runs):
+  - (a) strace -f clone/clone3 at the default vs forced 1, same database: 2,000 rows 0 helpers for
+    count(*) and for `count(*), sum(a) ... WHERE a > 500`; 20,000 rows 3 helpers (4 threads, as
+    predicted); 1M rows 7 helpers. Default readback 8.
+  - Sizing, 1M rows at 8 workers (perf stat, 5 reps): scan_filter_agg 635.9M instructions, unchanged
+    from steps 1-3; 2,000 rows now serial, CPU 0.6 ms (stock 0.2 ms) where steps 1-3 started 7
+    threads for it.
+  - (b) Rows that start no helper thread (strace classification of every scorecard statement at
+    the default vs forced 1): bulk_insert_1M_one_txn, group_by_1000_groups, rowid_lookups_200k,
+    join_1M_to_pk_1000, order_by_text_limit10, window_row_number, join_no_index_5k_x_5k,
+    autocommit_5k_inserts, txn_1000x10_rows, memory_script_200k, multiproc_8x500. The early passes
+    were noisier than the band: the full scorecard at reps 5 (A/B/A) had multiproc_8x500 at +7.3%,
+    an interleaved ABBA pass at reps 10 had txn_1000x10_rows at +5.5% (A/A +3.1%), a reps-20 pass
+    of two rows had autocommit_5k_inserts at +3.4%, and none of the three reproduced in the next
+    pass. User instructions for the two flagged write rows (perf stat, ABBA, 8 reps): txn
+    +0.08% min / -0.00% median, autocommit -0.44% / -0.12%. The decision used one more pass whose
+    rule was written down before it ran: interleaved ABBA, reps 30, all eleven rows, a row fails
+    when its median wall B/A exceeds +2%. B/A wall (CPU; paired median and its bootstrap 95% CI):
+    autocommit_5k_inserts +0.8% (+0.4%; -0.2% [-1.5, +0.8]), txn_1000x10_rows -1.4% (-1.9%; -0.9%
+    [-3.3, +0.6]), join_1M_to_pk_1000 +0.1% (+0.0%; +0.9% [-1.1, +1.8]), window_row_number +0.7%
+    (+0.6%; +1.0% [-0.2, +1.7]), memory_script_200k -0.7% (-0.6%; -0.3% [-2.1, +0.5]),
+    bulk_insert_1M_one_txn -2.2% (-0.6%; -2.1% [-3.0, -1.4]), group_by_1000_groups -1.0% (-1.0%;
+    -0.6% [-2.2, +2.0]), rowid_lookups_200k -1.9% (-2.0%; -1.1% [-2.7, +0.8]),
+    order_by_text_limit10 -0.3% (-0.3%; -0.4% [-2.1, +0.4]), join_no_index_5k_x_5k +1.1% (+1.0%;
+    +1.8% [-2.3, +4.5], a 22 ms row), multiproc_8x500 +0.3% (-1.9%; -0.6% [-3.7, +1.4]). All
+    answers equal. Rows that go parallel (reps 10, B/A wall / CPU): scan_filter_agg -82.9% /
+    -36.3% (8 threads' kernel spends less CPU than the serial VDBE loop, still x1.23 stock CPU);
+    count_star -65.2% / -26.6%; create_index_int_300k +1.1% / +0.9%, update_10pct_300k -14.7% /
+    -5.5%, delete_14pct_300k +1.0% / +6.4% (each parallel only in its trailing count(*) or sum
+    over 300,000 rows).
+  - (c) with the default flipped in code and no pragma anywhere (pre-rebase tree, 52df35c25 plus
+    this diff): 53 integration targets (aggregate and bare-column oracles, view reads, prepared
+    pragma dispatch, GROUP BY depth, the gh525 / gh457 / gh338 / gh430 / gh409 snapshot and
+    read-your-own-write keepers, live capture, read-only opens, time-travel snapshots, the memory
+    mirror differential, WAL reset with a foreign reader, INDEXED BY, fast-path separation, view
+    flattening, join aggregates, one-pass DELETE, IN-list seeks,
+    agent_swarm_explain_concurrency_contract, concurrent_update_differential_stress,
+    rowid_statement_rewind_concurrent_stress, the fsqlite count / min / max / range oracles,
+    concurrent freelist churn, gh519), fsqlite-core --lib and the vdbe golden_bytecode_snapshots
+    pass apart from four failures already red on main
+    (test_t6741_left_join / simple_inner_join_uses_vdbe_storage_cursors,
+    indexed_group_by_predicates_match_sqlite_without_table_scans, gh19 in
+    wal_reset_with_foreign_reader). After the rebase onto 4c49baa46: clippy, the two
+    bd-w4pr1.13.11 files and the aggregate / EXPLAIN tests that landed meanwhile
+    (join_aggregate_lookup_oracle, conformance_oracle_minmax_rowid_seek, agg_index_range_oracle,
+    in_list_composite_probe_oracle, is_null_index_seek_oracle, minmax_prefix_oracle,
+    or_index_union_oracle, golden_bytecode_snapshots, issue_531_grouped_index_input) all pass,
+    and clippy again after a second rebase onto c5a9af7ae.
+  - (d) `the_default_worker_count_and_explicit_transactions`, no pragma: on a 30,000-row table the
+    aggregate takes the parallel path in autocommit (the negative case), and inside BEGIN, after a
+    DELETE, neither it nor count(*) records a parallel walk; answers equal rusqlite.
+  - (e) `bd_w4pr1_13_11_parallel_budget`: 8 threads, each its own Connection asking for 64 workers,
+    6 rounds of count(*) and the scan_filter_agg shape over 300,000 rows behind a barrier: every
+    answer equals rusqlite, helper high-water <= budget (the rch worker's available_parallelism),
+    and since eight scans of about 50 threads each ask for more than the budget, at least one ran
+    with fewer than 40 workers or serially (the negative case: an unbudgeted walk fails it).
+- Scorecard at the new default (full scorecard, reps 5, stock first and last; wall / CPU,
+  candidate default vs stock): scan_filter_agg 0.020 s / 0.074 s vs 0.061 / 0.060 (x0.33 wall,
+  x1.23 CPU); count_star 0.014 / 0.031 vs 0.019 / 0.018 (x0.73 wall, x1.7 CPU); the mutation rows
+  go parallel only in their trailing count(*) or sum.
+- Verdict: all five held, so the default is min(available_parallelism, 8) and a user gets the
+  parallel count(*) and ungrouped aggregates without a pragma. Wall WIN vs stock on the two read
+  rows that go parallel (scan_filter_agg x0.33, count_star x0.73), still a CPU loss vs stock (x1.23
+  and x1.7); the next lever is the per-row kernel (635 Ir per row, profile on the bead), not more
+  threads.
+- Retry condition: back to a default of 1 if a scorecard row without a parallel statement moves
+  past +2% wall at the default in an interleaved ABBA pass of 30 or more reps, if a keeper shows a
+  parallel walk inside an explicit transaction, or if the helper high-water ever exceeds
+  available_parallelism; revisit LEAF_PAGES_PER_THREAD = 32 when a probe at 20k-200k rows shows
+  wall above the forced-1 arm.
+
+## 2026-11-14 - WIN: a concurrent commit writes without the registry guard and re-takes it only to publish (bd-i0tn6 S2 + S3)
+
+- Target: concurrent writers committing small transactions (`mt-mvcc-bench
+  --one-row-per-transaction`, shared and separate tables, 1-64 writers). Touched:
+  `crates/fsqlite-mvcc/src/begin_concurrent.rs` (publication-pending mark, `PublicationPendingLease`,
+  `pending_publication_blocks` / `has_pending_publication`, publication-epoch condvar, the
+  every-entry history check in the uncontended fast paths, metrics),
+  `crates/fsqlite-core/src/connection.rs` (`lock_registry_for_commit_validation`, the unlocked
+  physical write in `execute_commit_with_cx` and the autocommit commit path,
+  `TimedRegistryCommitGuard` split phases), `crates/fsqlite-e2e/src/bin/mt_mvcc_bench.rs`
+  (`registry_lock_split` line).
+- Ledger preflight: the 2026-07-23 bd-6hgad entry (group commit exists, never coalesces at NORMAL)
+  and the 2026-08-25 bd-i0tn6 decomposition. Nothing rejected covers moving the write outside the
+  guard. On main e1ec6bcc5 the guard was busy 87-92% of wall time from 4 writers on, and the
+  physical write was 71-97% of each hold (bead comment 2026-11-13).
+- Change: a validated concurrent commit on a file-backed database that does not change the
+  schema is marked publication-pending under the guard. It releases the guard, runs `txn.commit`
+  (Busy retry and in-doubt settlement included) unlocked, and re-takes the guard with a blocking lock
+  to drop the mark and finalize. Two things guard the window. A later validator that could form an
+  SSI rw-antidependency with a pending session waits for it, guard released, on a process-wide
+  publication-epoch condvar. A schema change waits until nothing is pending. Write-write and the
+  issue #115 fresh-EOF-page hazard stay with the page locks held until finalize. Schema changes,
+  `:memory:` and serialized commits keep the guard across their write. The pager path, the
+  certificate and the commit-sequence source are unchanged. The first build waited with the
+  busy-retry sleep handoff: on the shared table its waits averaged 0.5-3.3 ms and it was flat to
+  -14% at 2-8 writers. The condvar brought the mean wait to 72-267 us at 2-8 writers.
+- Result (binaries: A = main dad20ea6e + the bd-zsnac fix, mt-mvcc-bench sha256 eca32e64...; B =
+  A + this change, b3e03643...; thinkstation1, Threadripper PRO 5975WX, 64 hardware threads,
+  governor powersave, tmpfs, synchronous=NORMAL, 500 rows per writer, 5 rounds per row, stock
+  SQLite live in every run with its C/C null; interleaved A B; observed OS threads at 64 writers:
+  64 writers + main, about 155 runtime workers, about 65 io_uring kernel workers):
+
+  | writers | separate tables B/A (2 reps) | F/C A -> B | shared table B/A (4 reps) | F/C A -> B |
+  |---|---|---|---|---|
+  | 1 | 0.98x | 0.083 -> 0.073 | 1.03x | 0.080 -> 0.076 |
+  | 2 | 0.98x | 0.131 -> 0.147 | 0.98x | 0.112 -> 0.111 |
+  | 4 | 1.52x | 0.138 -> 0.169 | 1.13x | 0.113 -> 0.141 |
+  | 8 | 2.46x | 0.120 -> 0.266 | 1.42x | 0.113 -> 0.180 |
+  | 16 | 2.86x | 0.087 -> 0.254 | 1.62x | 0.109 -> 0.165 |
+  | 32 | 2.21x | 0.093 -> 0.193 | 1.29x | 0.095 -> 0.137 |
+  | 64 | 1.77x (A: one rep) | 0.061 -> 0.109 | not run | |
+
+  Separate tables, F wps: 4w 5,945 -> 9,026; 8w 4,596 -> 11,290; 16w 3,727 -> 10,662; 32w 3,146 ->
+  6,954; 64w 2,483 -> 4,405. One writer, 2,000 rows, 11 rounds, 3 reps: 5,686 -> 5,562 wps
+  (-2.2%; an earlier session measured -0.2%). Bulk (1,000-row transactions): within the spread.
+  Scorecard rows, stock live, all answers equal stock's: `txn_1000x10_rows` 680.4M -> 682.6M
+  instructions (5 reps); `autocommit_5k_inserts` 1,162.3M -> 1,165.4M (5 reps; a 3-rep run read
+  1,159.1M -> 1,179.9M, inside the run-to-run spread of either arm); `multiproc_8x500` wall 961 ->
+  935 ms, instructions median 1,164.2M -> 1,174.6M.
+  Worker failures: none in any B run (4 shared, 2 separate, bulk, one-writer). One A run (separate
+  tables, 64 writers, host load 9.6) lost a worker that ran out of the shared 11 s retry budget at an
+  INSERT (BusySnapshot); that is the guard-held convoy. Before bd-zsnac the B arm lost a worker
+  in 2 of 4 shared runs; that failure was the ROLLBACK flaw it fixes (7fbb850b7).
+- Decomposition with the change (separate tables): validate 1.5-67 us and publish 2.3-105 us under
+  the guard, the physical write (93-406 us) unlocked. Group commit coalesces: waiter_commits
+  667 / 2,294 / 4,950 of 2,000 / 4,000 / 8,000 at 4 / 8 / 16 writers, where it was 0. The convoy
+  moved: the wait to re-take the guard for publication is 161 us at 16w, 765 us at 32w and 2.6 ms at
+  64w, because both short holds grow with the writer count. Shared-table writers wait for each
+  other's publication (publication waits 314-3,862 per round), because SSI witnesses put the table
+  root in every inserter's read and write sets.
+- Predictions (bead comment before code): separate >= 1.5 / 2.0 / 2.5 / 1.8x at 4 / 8 / 16 / 32
+  writers: met (1.52 / 2.46 / 2.86 / 2.21). Shared >= 1.5x at 8-16 writers: missed at 8 (1.42),
+  met at 16 (1.62). No kill line hit (separate 8w at least 1.5x; 1w within 5%; scorecard within noise).
+- Tests: mvcc unit tests for the mark and lease (token-checked; a stale lease leaves a new owner's
+  mark), the wait relation (rw overlap either way waits; a shared read or a disjoint session does
+  not), the epoch wake-up, and the history check with out-of-order entries. Core deterministic tests
+  through the commit-window hook: a disjoint peer commits while a durable commit waits to publish;
+  a peer that read the unpublished write waits; a CREATE INDEX waits. The issue #115 window and
+  EOF-growth stress keepers pass unchanged.
+- Gate (rch, 7fbb850b7 + S2 + S3): clippy -D warnings on fsqlite-mvcc / core / e2e all targets;
+  fsqlite-mvcc lib 1,676 pass; core keepers 194 + 7, fsqlite 8, fsqlite-e2e concurrent-writer
+  batches 55 + 63 + 36 pass; fsqlite-core lib 4,179 pass with the 2 known t6741 reds. Landed as S2
+  d74a04e46 and S3 a56db2ebe (rebased onto 7b1a890d9). On 4c49baa46, after the statement-savepoint
+  change to connection.rs, clippy and 200 focused core tests passed again.
+- Retry condition (for what is left): the 32-64 writer ceiling is now the two short holds (validate
+  39-67 us and publish 56-105 us at 32-64w). Next is bd-15hxt (SSI history windowing) or S4 (publish a
+  coalesced group under one guard acquisition, bd-6a8a5). The single-writer floor (about 5.6k against
+  stock's 70k) is bd-w4pr1.7.
+
+## 2026-11-14 - WIN: a statement savepoint names itself without format!, takes the cached session handle and skips empty virtual-table levels (bd-w4pr1.13.35 lever 5)
+
+- Target: the internal statement savepoint every statement of an explicit transaction runs in
+  (`with_internal_statement_savepoint_and_cx`); measured on an in-transaction literal INSERT and
+  `txn_1000x10_rows`. Touched: `crates/fsqlite-core/src/connection.rs` (the new
+  `internal_savepoint_name` and `concurrent_handle_for_session`, `next_internal_savepoint_name`,
+  `concurrent_session_handle`, `live_vtab_savepoint_all`, `live_vtab_release_all`).
+- Ledger preflight: skipping the statement savepoint inside a concurrent transaction is not an
+  option (a page lock is taken per page mid-statement, so a Busy mid-split needs the statement
+  rollback; bd-w4pr1.13.35's proof). This cuts what the savepoint costs instead.
+- Evidence before (callgrind, symbolized release-perf CLI of main 52df35c25 plus lever 4, per
+  in-transaction INSERT): `next_internal_savepoint_name` 940 (format! with two u64 Display);
+  the concurrent savepoint 381 in `concurrent_savepoint` plus a registry mutex and SipHash session
+  lookup; pager savepoint 155 and release 351; `statement_snapshot` 179;
+  `live_vtab_savepoint_all` 71 and `live_vtab_release_all` 85 with no virtual table in the
+  transaction. An autocommit literal INSERT and the prepared INSERT lane take no statement
+  savepoint.
+- Change: the name `__fsqlite_stmt_{purpose}_{trace_id}_{suffix}` is written with push_str and
+  itoa (same text; next_trace_id still drawn once per attempt); concurrent_savepoint takes the
+  handle through the per-transaction cache bd-ifgl7 already keeps for VDBE setup and page I/O (a
+  miss still asks the registry; error texts unchanged); the two virtual-table functions return
+  after their level checks when no virtual table has joined the transaction. The pager round-trip
+  is left as it is: its cost is the drop of the journalled before-image and the name String, and
+  cutting those means changing the pager's savepoint API.
+- Result (binaries a4392a27... = lever 4, ab53c7e7... = lever 4 plus this diff; stock sqlite3
+  3.46.1 live, answers equal): callgrind in-transaction INSERT 34,060 -> 33,111 (name 940 -> 243,
+  virtual-table levels 156 -> 53, concurrent savepoint about -100); perf stat user instructions,
+  5 reps interleaved, `txn_1000x10_rows` 630.6M -> 616.5M (stock 153.9M; 4.10x -> 4.01x).
+  Autocommit literal INSERT 183,057 -> 183,493 and prepared txn INSERT 25,514 -> 25,529 (no
+  statement savepoint; within run noise). The prediction was -0.9k to -1.3k per statement with a
+  kill line under 0.6k. A unit test pins the name text against literal strings and the format! it
+  replaces.
+- Gate (this lever and lever 4 below on one tree, rch): clippy -D warnings on fsqlite-core all
+  targets and the prepared-dml-probe bin; fsqlite-core --lib 4178 passed, 2 failed (the
+  test_t6741 join tests, red on main as bd-nouem); 56 keeper targets (prepared reuse, REPLACE /
+  UPSERT, savepoint and statement-rollback, busy and concurrent-writer, trigger and FK, FTS5 /
+  R-tree, fsqlite API) pass except fk_insert_conflict_oracle's two bd-d8s37 tests, red on main.
+- Retry condition: the remaining savepoint cost (pager round-trip about 500, concurrent_savepoint
+  381, snapshot 179 per statement) is worth another pass only together with a pager savepoint API
+  that does not own a name String per savepoint, or when a profile shows the statement savepoint
+  above 5% of an in-transaction statement again.
+
+## 2026-11-14 - WIN: the cached VDBE engine handed over in a Box (bd-w4pr1.13.35 lever 4; retry of the 2026-11-12 rejection)
+
+- Target: every program run through `execute_table_program_with_db` or its exactly-one-row twin in
+  `crates/fsqlite-core/src/connection.rs`. Change: `Connection::cached_vdbe_engine` holds
+  `Option<Box<VdbeEngine>>`, both executors take and return the box, and a fresh engine is boxed
+  once where it is created; the same change as aeaae6a83.
+- Ledger preflight: the 2026-11-12 entry rejected this on a prepared insert_autocommit wall-time
+  reading the bench could not resolve to 1%; its retry condition, an instruction-count A/B of a
+  prepared autocommit INSERT, is met here with `prepared-dml-probe` (new fsqlite-e2e bin: N
+  prepared single-row INSERTs through `fsqlite::blocking` on a WAL file database, the shape of
+  blocking_vs_rusqlite_bench's insert_autocommit / insert_txn rows; cost per execution =
+  (Ir(N_hi) - Ir(N_lo)) / dN).
+- Result (main 52df35c25 against 52df35c25 plus this diff; release-perf with line tables;
+  binaries fsqlite aeb9ea53... / a4392a27..., probe 2053e3ad... / 060260c9...; stock sqlite3
+  3.46.1 live, answers equal): prepared autocommit INSERT (N=800 vs 400), three runs per arm,
+  base 159,500 / 160,733 / 160,069 (mean 160,101), lever 160,704 / 158,412 / 159,214 (mean
+  159,443), so -0.4%, inside the base runs' own 1.2k spread; the prepared INSERT takes the direct
+  lane, which does not use the engine. Prepared txn INSERT 25,828 -> 25,514. Callgrind
+  in-transaction literal INSERT 36,961 -> 34,060, autocommit point SELECT 80,258 -> 77,557. perf
+  stat user instructions, 5 reps interleaved: `txn_1000x10_rows` 648.4M -> 621.9M (stock 153.9M;
+  4.21x -> 4.04x), `autocommit_5k_inserts` 1,138.1M -> 1,134.9M (stock 112.3M). The prediction
+  was -2.0k to -3.0k per in-transaction INSERT, prepared autocommit between -1.5% and +0.5%, with
+  a kill line at +1% on the prepared autocommit INSERT. Gate: with lever 5, above.
+- Retry condition: none needed; a later change that moves the engine by value again should show
+  up as memcpy in the two executor layers on the same callgrind shape.
+
+## 2026-11-14 - WIN: a commit alone on its file skips the group-commit arrival wait (bd-w4pr1.7)
+
+- Target: every WAL commit of a transaction that is the only same-process transaction on its file
+  (the scorecard's `autocommit_5k_inserts`, `txn_1000x10_rows` and each process of
+  `multiproc_8x500`). Touched: `crates/fsqlite-pager/src/pager.rs` (`ArrivalWaitObservation`
+  gains `peers_may_arrive`, `decide_group_commit_arrival_wait` skips with reason
+  `sole_transaction`, `PagerMaintenanceLease::is_sole_transaction`,
+  `SimpleTransaction::group_commit_peers_may_arrive`, a new parameter of
+  `commit_wal_group_commit_with_snapshot`).
+- Ledger preflight: the 2026-09 group-commit entry (line ~26440) found the compat flusher never
+  coalesces under NORMAL sync and that forcing it "would require a deliberate arrival-wait (adds
+  latency to every commit)"; its retry predicate is about adding coalescing, not removing the wait.
+  The 8 us sparse wait came later with bd-1dp9.6.7.9.4 (f4e82a98f). No entry tried skipping it.
+- Evidence before: the attribution posted on bd-w4pr1.7 (2026-11-14) put the arrival wait first at
+  about 36k of 228k user instructions per autocommit commit. The flusher of a batch alone in the
+  queue spun up to `GROUP_COMMIT_SPARSE_ARRIVAL_WAIT` (8 us) on the consolidator lock,
+  `should_flush_now`, `Instant::now`, `cx.checkpoint` and `yield_now` (pager.rs ~24807). The wait is
+  bounded by wall time, so callgrind (190k per statement) under-counts it against perf (228k). An A/B
+  with `FSQLITE_PARALLEL_WAL_MAX_FLUSH_DELAY_MS=0`, which zeroes only this wait's budget, measured
+  225.1k -> 188.8k per commit.
+- Change: the flusher skips the wait when the committing transaction's lease is the only
+  same-process admission on its file's maintenance gate (`active_transactions == 1`, no opener, no
+  maintenance). The gate is identity-bound and shared by every pager of the file in the process,
+  like the group-commit queue, and every writer takes a transaction lease before it can reach the
+  queue, so no batch can arrive. With any other transaction or opener on the gate the policy is
+  unchanged. Durability, publication and batching of multi-writer commits are untouched.
+- Result, stock sqlite3 3.46.1 live in the same runs; binaries 0292302f... (main b68522c70) and
+  2626c63d... (b68522c70 plus this diff, diff sha 0b5e60158ba68687); answers equal stock's in every
+  row; stock `integrity_check` ok on every candidate file (6 DML, 10 txn/autocommit, 9 multiproc):
+  - `txn_row_probe`, 5 reps, load 2.2: `autocommit_5k_inserts` 1,151.6M -> 954.2M user
+    instructions (-39.5k per commit, -17.1%; 10.25x -> 8.49x stock 112.3M), CPU best 657.0 ->
+    576.4 ms (stock 62.5, A/A 1.13), wall best 696.1 -> 612.2 ms (6.84x -> 6.01x stock 101.8);
+    `txn_1000x10_rows` 666.8M -> 633.9M (-4.9%; 4.33x -> 4.12x stock 153.9M), CPU 271.4 -> 235.7
+    ms (stock 33.4, A/A 1.16), wall 311.6 -> 274.9 ms (4.40x -> 3.88x stock 70.9).
+  - `auto_scale` (min of 3): 5,000 commits 1,158.3M -> 944.5M; 1,000 commits 241.7M -> 198.0M;
+    the env-knob control on the base binary in an earlier run, 958.4M against the candidate's
+    947.3M, so the change removes the same wait the knob does.
+  - `mp_probe`, 9 reps, load 2.3: `multiproc_8x500` median 1,175.3M -> 1,046.8M (-10.9%; minimum
+    1,120.9M -> 961.9M), median CPU 1,111.0 -> 1,095.1 ms, median wall 947.9 -> 870.7 ms (stock
+    99.0M, 204.2 ms CPU, 166.8 ms wall); 4,000 rows. A 5-rep run before it had median CPU
+    1,091.9 -> 1,144.0 ms with wall flat (947.8 -> 948.3); the 9-rep run did not reproduce it.
+  - rusage, 9 reps, 5,000 commits: user per commit 87.6 -> 76.2 us, sys 37.6 -> 38.7 us, wall 621
+    -> 573 ms (stock 6.5 + 5.7 us). strace: syscalls per commit unchanged (statx 11.01 / 11.04,
+    fcntl 8.00 / 8.01, pread64 4.12 / 4.52, pwrite64 2.13 / 2.17).
+  - `sc_mut_probe`, 3 reps: `delete_14pct_300k` 470.4M / 470.6M, `update_10pct_300k` 811.9M /
+    811.9M (one commit each; unchanged as predicted).
+  - Prediction (registered on bd-w4pr1.7 before code): autocommit -30k to -37k per commit, CPU and
+    wall -3% to -6%; txn -4% to -6%; multiproc -8% to -14%; DML unchanged. txn, multiproc and DML
+    landed inside; autocommit came in above the range (-39.5k, CPU -12.3%, wall -12.1%): the spin's
+    size varies with host timing, and the knob run that sized it measured 36.3k. Kill (autocommit
+    under 25k per commit, CPU best not lower) cleared.
+- Tests (`pager.rs`): `test_commit_service_policy_sole_transaction_skips_the_arrival_wait` (alone:
+  zero wait, reason `sole_transaction`, low-latency mode; the same queue with a possible peer keeps
+  the 8 us sparse wait; a flushable queue keeps `queue_flushable`);
+  `test_maintenance_lease_sole_transaction_counts_every_same_gate_admission` (a second transaction
+  or an opener on the gate makes it not sole, a transaction on another gate does not, an open
+  lease is never a sole transaction). The four existing commit-service policy tests model
+  possible peers and set `peers_may_arrive: true`.
+- Gate (rch, b68522c70 plus the change): clippy -D warnings on fsqlite-pager and fsqlite-core
+  `--all-targets` clean; fsqlite-pager lib 1,107 passed, 1 failed
+  (`bd_2jpu6_2_dirty_eviction_runs_in_parent_asupersync_region`, poll_quota 96 vs 97, red on main
+  since asupersync 0.6.2); fsqlite-e2e concurrency and group-commit targets 63 + 54
+  (group_commit_durability, correctness_concurrent_writes, mvcc_concurrent_writers, the
+  concurrent writer and DML oracles, concurrent-mode defaults, multiprocess coordination,
+  parallel WAL staging and publication, swarm writers, concurrent checkpoint, MVCC isolation);
+  fsqlite-core lib 4,173 passed, 3 failed (the t6741 pair, red on main, and the bd-gp7t8
+  load-sensitive `test_wait_for_background_repair_inside_runtime_requeues_instead_of_blocking`,
+  6/6 commit_repair async tests passing alone); fsqlite-core WAL and certificate keepers 14 + 214
+  + 71; fsqlite WAL keepers 16.
+- Landed as b3eceb70a (rebased onto 32af77afe; on the rebased tree, 53763578a on 348c164e3:
+  clippy clean, fsqlite-pager lib 1,110 passed with the same 1 red, the first e2e batch 63 passed;
+  the later upstream commits are vdbe and tracker only).
+- Retry condition: none needed for the single-writer case. For a commit with live peers the wait
+  stays; revisit it only with a measured coalescing gain at the target writer count (the 2026-09
+  retry predicate). Next on bd-w4pr1.7, from the same attribution: the implicit BEGIN's committed-
+  state refresh (28.8k), the INSERT execution (36.9k), group-commit completion (14.9k), and the 18.6
+  syscalls per commit stock does not make (about 27 us of kernel time; the shm_map fstat and the
+  path-identity probes need a decision first).
+
+## 2026-11-14 - WIN: a top-level statement keeps its statement future in one box (bd-w4pr1.13.35 lever 3, bd-w4pr1.11)
+
+- Target: the per-statement future allocations of every statement through the dispatcher; measured
+  on an in-transaction literal INSERT, an autocommit point SELECT by rowid (bd-w4pr1.11's shape),
+  `txn_1000x10_rows` and `autocommit_5k_inserts`. Touched: `crates/fsqlite-core/src/connection.rs`
+  (`execute_statement_after_background_status`, `execute_statement_once_after_background_status`,
+  `execute_statement_impl_after_background_status` and the new `execute_statement_impl_body`, the
+  dispatcher's INSERT arm, the new `statement_may_target_attached_schema`).
+- Ledger preflight: bd-uzq54 (2026-08-11) rejected boxing cold branches of the prepared-statement
+  futures; this removes boxes instead. bd-w4pr1.28's `lean_future` keeps boxing in debug builds,
+  where inline futures blow up stack frames.
+- Evidence before (gdb `break malloc if size >= 4096`, symbolized glibc release-perf CLI of main
+  d41ec59eb, per statement = (200 - 100 statements) / 100): an in-transaction INSERT allocated
+  32,320 B (the impl's `Box::pin`), 11,744 B (`once`'s `Box::pin`), 21,640 B (the INSERT arm's
+  `boxed_future`) and a 4,112 B page `Arc`; a point SELECT the same 32,320 + 11,744 B, 13,968 B
+  (the attached-target delegation's `Box::pin`, which answers None for any SELECT) and two 4,096 B
+  buffers. On the shipped musl CLI these sizes are mallocng groups mapped and unmapped per
+  statement (bd-w4pr1.11's diagnosis).
+- Change: `once` is an async fn and the impl's body the async fn `execute_statement_impl_body`;
+  the top-level path awaits both through `lean_future`, inside the `FallbackStatementFuture` box
+  that `execute_statement_after_background_status` already holds and that stays the recursion
+  break. `execute_statement_impl_after_background_status` stays the boxed dyn entry for the calls
+  from inside the dispatch (row replay, triggers, views), so every recursion still passes a dyn box
+  (an unboxed cycle does not compile in release). The INSERT arm awaits its dispatch through
+  `lean_future`. The delegation future is built only for the statement kinds the delegation acts
+  on (CREATE TABLE / INDEX / VIEW / TRIGGER, a schema-qualified INSERT, UPDATE, DELETE, PRAGMA,
+  DROP, ALTER TABLE).
+- Result (binaries 20fd8a8a... = main d41ec59eb; f436fb47... = d41ec59eb plus this diff with the
+  body written as `fn -> impl Future { async move }`, and 0a8d713d... = the landed `async fn`
+  form, which clippy's `manual_async_fn` required; stock sqlite3 3.46.1 live; every answer and the
+  shell output over 768 runs equal): allocations of 4 KiB or more per statement, in-transaction
+  INSERT 4 -> 2 (one 40,288 B future box and the page `Arc`), point SELECT 5 -> 3 (one 40,288 B box
+  and the two buffers), the same in both lever binaries; `strace -c` brk / mmap / munmap counts
+  unchanged and independent of the statement count. Callgrind exact: in-transaction INSERT 37,847
+  -> 36,924 and 36,929 (-0.92k); point SELECT, whose autocommit runs vary about 0.5k for one
+  binary, base 81,691 / 81,325 / 81,891 against the lever 80,776 / 80,480 (-0.9k to -1.4k). perf
+  stat per point SELECT (sel_probe.py, 5 reps): 82.8k -> 81.3k user instructions (3.42x -> 3.36x
+  stock 24.2k). `txn_1000x10_rows`, two runs of 7 interleaved reps: 682.5M -> 679.5M and 687.8M ->
+  676.8M mean (medians -7.9M, -10.4M; 4.45x -> 4.41x stock 153.9M), inside the row's spread;
+  `autocommit_5k_inserts` 1,244.4M -> 1,230.7M and 1,243.3M -> 1,234.4M. Prediction (registered):
+  future boxes 3 -> 1 (met); callgrind -1.0k to -1.6k per INSERT (missed at -0.92k), -0.9k to -1.5k
+  per SELECT (met at the low end); txn row -10M to -16M (not resolved: -7M over 14 reps). Kill lines
+  (under 0.6k per INSERT, boxes not down to one, more mapping syscalls, an answer differing) not
+  met.
+- Tests: `the_attached_target_gate_admits_every_statement_the_delegation_runs` (unit, against an
+  attached database): every statement kind the delegation acts on is admitted by the gate and
+  delegated, and nine kinds the gate now skips (SELECT on aux and main, an unqualified INSERT,
+  BEGIN, COMMIT, SAVEPOINT, RELEASE, ANALYZE aux, EXPLAIN of an aux INSERT) get None from the
+  delegation. The release CLI's trigger recursion up to the depth cap and an FK cascade answer as
+  the base CLI does.
+- Gate (rch, d41ec59eb plus the change): clippy -D warnings on fsqlite-core `--all-targets` clean
+  (and again on the rebased tree); fsqlite-core lib 4,175 pass and 2 fail (the t6741 pair); 40
+  fsqlite-core targets in five batches (view-chain and small-stack, busy-retry, attach, trigger /
+  INSTEAD OF / recursive CTE, savepoint / conflict / RETURNING / literal parameterization, FK /
+  FTS5 / CHECK depth) 205 pass and 3 fail, each red on main: bd-vy10l `gh516_returning_conformance`
+  and `bd_5haia_view_chain_at_nesting_limit_matches_stock_on_2mib_stack` twice (its stock side:
+  the bundled SQLite refuses `SELECT * FROM v999` with "VIEWs and/or subqueries nested too deep"
+  before fsqlite runs); 8 fsqlite targets 121 pass. The tests run with debug assertions, where
+  `lean_future` still boxes, so the release shape is checked by the release CLI: shell output over
+  768 runs, the scorecard rows' answers, and trigger recursion to the depth cap and an FK cascade,
+  all equal to the base CLI.
+- Landed as af3dabe00 (rebased onto 1fa98375c; clippy reran on bbd81503d plus the change, and the
+  two later upstream commits touch fsqlite-vdbe codegen, a fsqlite test and the tracker).
+- Retry condition: none for this. Left: the `FallbackStatementFuture` box itself (40 KB, one per
+  top-level statement); removing it needs the statement attribution it carries to wrap an inline
+  future (structural pinning), worth one more large allocation per statement and the remaining
+  musl group mapping.
+
+## 2026-11-14 - WIN: ungrouped count / sum / min / max over a filtered rowid-table scan run on several threads with mergeable accumulators; `scan_filter_agg` at 8 workers is 0.18x stock's statement wall (bd-w4pr1.13.11, step 3)
+
+- Target: `scan_filter_agg` (`SELECT count(*), sum(a) FROM t WHERE a > 500`, 1M file-backed rows)
+  and every ungrouped full rowid-order scan whose result columns are plain `count(*)`, `count`,
+  `sum`, `min`, `max` of a column or the rowid and whose WHERE is an AND / OR of BINARY
+  column-versus-literal comparisons and `IS [NOT] NULL` (also `SELECT count(*) ... WHERE`), with
+  `PRAGMA fsqlite.parallel_workers = N` > 1 in autocommit. Touched: `crates/fsqlite-vdbe/src/
+  parallel_aggregate.rs` (new: plan types, per-run accumulators, leaf scan, rowid-order merge),
+  `codegen.rs` (`parallel_aggregate_plan`, `parallel_scan_plan`, `parallel_scan_predicate`,
+  attached in `codegen_select_aggregate`'s full-scan branch and `codegen_select_count_star`'s
+  scan; bytecode and EXPLAIN unchanged), `lib.rs` (plan carried by the builder and the
+  program), `engine.rs` (hook after the plan's `OpenRead`: on success write the `ResultRow`
+  registers and jump there; `compare_for_where`; the in-place lane's alias / slot helpers shared
+  as `pub(crate)`).
+- Exactness: an integer sum carries its total and the highest and lowest running total per run;
+  the merge raises `IntegerOverflow` exactly when a rowid-order running total leaves i64; a sum
+  input that is not a stored integer (REAL, or TEXT / BLOB that sum() coerces) declines the plan
+  and the serial loop runs; min / max keep the first row of a tie (strict improvement, runs merged
+  in rowid order); column reads use the in-place lane's rules (rowid alias and short-record alias
+  verdict, record slot map, REAL affinity, ALTER ADD COLUMN defaults) and reassemble overflow
+  payloads per thread; any read or decode failure, a non-UTF-8 database, an application function
+  in the registry or an overridden built-in collation declines; cancellation stops every thread.
+- Result, stock sqlite3 3.46.1 live in the same run (scratchpad `par_probe.py`, ring refused, 5
+  reps, 64 CPUs, powersave; base main 924bf4d62 sha256 3371e8aa, candidate sha256 39beb9d3,
+  same database bytes; threads = clone3 under strace): workers 1: 1,234.9M instr (base 1,237.9M),
+  wall 101.5 ms. Workers 2 / 4 / 8 / 16: wall 28.4 / 16.6 / 9.9 / 5.5 ms against stock 52.4 /
+  52.6 / 54.9 / 54.4; CPU 51.6 / 57.2 / 66.1 / 70.1 ms against serial ~100 and stock ~54;
+  threads +1 / +3 / +7 / +15; user instructions 635M at every count above 1 (stock 499M).
+  `SELECT count(*) FROM t WHERE a > 500`: 9.1 ms at 8 workers against stock 47.0 (serial 81.8).
+  Full scorecard (`user_shape_scorecard.py` with `PRAGMA parallel_workers=8` before every
+  statement, stock first and last, whole-process wall): scan_filter_agg 0.021 s against stock
+  0.059 (base 0.112), count_star 0.014 against 0.020 (base 0.040); every other row within the
+  run's noise of base. At the default (1) the full scorecard is unchanged within noise.
+- Prediction: 8 workers at most 1/5 of stock's wall (met: 0.18x), 2 -> 8 at least 2.5x (met:
+  2.9x), serial within 0.5% (met: -0.24%), CPU-seconds at most stock's (missed: 1.21x stock,
+  0.66x serial fsqlite; the per-row kernel is 635 instructions against stock's 499). Kill (under
+  3x serial at 8 workers, 2 -> 8 under 2x) not met.
+- Found on the way: sharing `payload_rowid_alias_header_verdict` with a second caller made LLVM
+  stop inlining it into the in-place `Column` lane: +9.0M instructions (+0.73%) on serial
+  scan_filter_agg, +12.0M on the count-with-WHERE row. `#[inline(always)]` restored it (verified
+  by the symbol disappearing from the binary and the instruction counts above).
+- Landed: bbd81503d (steps 1, 2 and 3 in one commit; the default stays 1).
+- Tests: `crates/fsqlite-core/tests/bd_w4pr1_13_11_parallel_scan_oracle.rs` (stock-oracle at
+  1/2/4/8 workers: the scorecard shape, mixed storage classes and affinity coercion, an integer
+  sum that overflows only in rowid order (stock raises; summing runs or checking the total would
+  answer MAX) and one that only rowid order keeps in range, rowid alias, ALTER-added short rows,
+  overflow payloads, WITHOUT ROWID / explicit transaction / application function decline, EXPLAIN
+  identical at 1 and 8, a writer committing during 60 parallel aggregates); codegen unit test
+  `bd_w4pr1_13_11_parallel_aggregate_plan_only_for_admitted_shapes`.
+- Retry condition (for wider use): GROUP BY waits for bd-w4pr1.13.8's hash aggregation; REAL
+  sum / avg / total / group_concat stay serial until an order-independent exact result is proven;
+  negated literals, IN lists, parameters and expressions in the WHERE need the predicate
+  evaluator to grow (each with its own oracle cases); the per-row kernel (635 instr) is the next
+  lever for CPU-seconds.
+
+## 2026-11-13 - WIN: `count(*)` reads its committed snapshot on several threads through a Send snapshot page reader and a b-tree split into disjoint subtrees (bd-w4pr1.13.11, steps 1 and 2)
+
+- Target: `count_star` (`SELECT count(*) FROM t`, 1M-row file-backed table held in the WAL),
+  with `PRAGMA fsqlite.parallel_workers = N` (new; default 1). Touched:
+  `crates/fsqlite-vfs` (`VfsFile::positional_reader`), `crates/fsqlite-pager/src/snapshot_reader.rs`
+  (new: `SnapshotPageReader`, `WalSnapshotFrames`), `TransactionHandle::snapshot_page_reader`
+  (`SimpleTransaction`: read-only WAL transaction with nothing written, authoritative page index,
+  backend still pinning the captured snapshot), `WalBackend::pinned_snapshot_frames`
+  (`crates/fsqlite-core/src/wal_adapter.rs`), `crates/fsqlite-btree/src/snapshot_walk.rs` (new:
+  `split_subtrees`, `ParallelWalk`, `count_entries_parallel`), the `Count` opcode
+  (`crates/fsqlite-vdbe/src/engine.rs`), the pragma and the per-statement worker count
+  (`crates/fsqlite-core/src/connection.rs`; 1 inside an explicit transaction).
+- Ledger preflight: 2026-11-10 ASSESSED (dormant vectorized kernels; retry only with a Send snapshot
+  reader and rowid-range splitting, which this is) and 2026-08-17 bd-8euyp (no allocation per page:
+  each thread reads into one reused frame-sized buffer; the WAL page index is the adapter's
+  copy-on-write `Arc`, captured without copying).
+- Result, stock sqlite3 3.46.1 live in the same run (scratchpad `par_probe.py`, ring refused, 5
+  reps, 64 CPUs, powersave; base main 924bf4d62 sha256 3371e8aa, candidate sha256 1fdbada6, same
+  database bytes): workers 1: 63.4M instr for both, wall 27.0 ms (stock 12.5). Workers 2 / 4 / 8 /
+  16: wall 7.7 / 4.1 / 2.3 / 2.2 ms against stock 14.1 / 13.1 / 13.2 / 13.3; CPU 14.6 / 16.0 /
+  17.4 / 22.0 ms against serial 26.2; threads observed (clone3 under strace) +1 / +3 / +7 / +15.
+  `scan_filter_agg` 1,237.9M instr for base and candidate at every worker count (control).
+  Prediction (>= 4x at 8 workers, CPU within 1.3x of serial) met; kill (serial +2% or under 3x)
+  not met.
+- Landed: bbd81503d, together with step 3 (entry above).
+- Tests: `crates/fsqlite-core/tests/bd_w4pr1_13_11_parallel_scan_oracle.rs` (counts equal stock's
+  on a multi-level table, an index whose interior cells are entries, one-leaf and empty tables at
+  1/2/4/8 workers; workers=1 records no walk; an explicit transaction stays serial and sees its
+  own deletes; a writer committing 500-row batches during 60 parallel counts: every answer is a
+  whole number of batches and never goes back; the reader and the walk on a stock-written file,
+  stopping when asked, and a page past the snapshot is an error), pager unit tests for frame
+  resolution, uncommitted frames and wrong-page frames.
+- Retry condition (for wider use): the reader serves only read-only WAL transactions; rollback-
+  journal and `:memory:` databases decline. Extending it needs the db file's shared lock held
+  for the statement (rollback journal) or the memory pager's page images.
+
+## 2026-11-14 - WIN (probe not met): an aggregate over an index range with a residual a composite index holds walks only that index (bd-k96op)
+
+- Target: `count(*) WHERE a > 500 AND b = 3` with t_a and t_ab (201x stock): the residual branch
+  of aggregate_index_range_seek_target took only single-column indexes, so it walked t_a and
+  looked every row up for `b = 3`. Touched: crates/fsqlite-vdbe/src/codegen.rs (the residual
+  branch tries indexes covering the WHERE first when it has residual terms; the range walk
+  applies such a residual from the entry with emit_index_entry_where_filter and stays
+  covering; a wider index is sought with the bound alone).
+- Result (80a94ab35; scratchpad cnt_ab.py, stock live, answers equal; ELF before
+  59cc18d57c4c7ced, after 40e54cbe1be33311; thinkstation1): 201.1x -> 105.3x; sum(c) over a
+  range 4.09x -> 3.94x; other rows unchanged. The 2x probe is missed by the per-entry cost:
+  ~6.2k instructions per index entry against stock's ~59.
+- Retry / next: fill the row image with only the columns the residual names (each index
+  Column ~1.4k) and skip IdxRowid when unused; the rest is per-opcode / per-Column engine
+  cost (bd-w4pr1.13.7, bd-w4pr1.13.4).
+
+## 2026-11-14 - WIN: COUNT(*) over an index range, IS NULL or IS NOT NULL counts whole leaves from the b-tree (bd-2fb53)
+
+- Target: `count(*) WHERE n IS NOT NULL` (read every row, 7.3x stock), `n IS NULL` and `a BETWEEN
+  10 AND 20` (an index walk at ~2.3k instructions per entry, 6x). Stock steps every entry with
+  Next as well. Touched: crates/fsqlite-btree/src/cursor.rs (count_entries_before: a leaf whose
+  last key orders before the bound is added from its cell count, the boundary leaf
+  binary-searched, separators tested one by one, leaves reached via advance_next),
+  crates/fsqlite-types/src/opcode.rs + crates/fsqlite-vdbe/src/engine.rs (Opcode::IdxCountBefore),
+  crates/fsqlite-vdbe/src/codegen.rs (codegen_select_count_star_index_range for a lone COUNT(*)
+  over an exact range, IS NULL or IS NOT NULL).
+- Result (6e66dfd70; scratchpad cnt_ab.py, 200k-row t, stock live, answers equal; ELF before
+  59cc18d57c4c7ced, after 631b8c89affe8939; thinkstation1): IS NOT NULL 7.27x -> 0.20x, IS NULL
+  6.42x -> 0.07x, BETWEEN 6.01x -> 0.21x, `a > 500` 18.85x -> 0.17x, `a < 500` 6.30x -> 0.06x,
+  BINARY text range 6.18x -> 0.07x, REAL range 19.77x -> 0.24x; `a = 5` unchanged (4.98x).
+- Retry / next: an equality or equality prefix (`a = c`, `a = 1 AND b = 2`) as the inclusive
+  range [c, c] where index_range_fast_path_is_safe holds; a NOCASE text range (declined by the
+  range target today); a composite index's leading range with no residual.
+
+## 2026-11-14 - WIN (without statistics): a two-table inner join samples its b-trees to choose the driving table (bd-prkvt)
+
+- Target: `SELECT count(*) FROM p JOIN t ON t.id = p.tid WHERE t.a = 5` without ANALYZE drove
+  from all of p (256.8x stock): bd-9uf3l's swap needs row estimates and kept the written order
+  without sqlite_stat1. Touched: crates/fsqlite-btree/src/cursor.rs (estimate_entry_count,
+  estimate_rows_per_leading_key), crates/fsqlite-core/src/connection.rs (join_row_estimates,
+  btree_join_sample), crates/fsqlite-vdbe/src/codegen.rs (default_rows_per_leading_key).
+- Round 1 LOSS (not landed): the written outer table's b-tree estimate against SQLite's
+  default 10 rows per indexed equality alone, as stock decides without statistics. It swapped
+  `p JOIN t ... WHERE t.flag = 1` (half of t) into 100k index seeks of p: 192,911k ->
+  2,058,207k instructions (1.1x -> 11.2x stock; jss_ab.py, ELF 005d8502801f49f1). Our per-seek
+  cost turns stock's mis-swap into a 10x one.
+- Round 2 COST (not landed): sampling every index of the joined table, every key of the page,
+  fixed the flag row but cost +80..170k instructions on the 10-row q joins.
+- Round 3 (dd4331a1d): sample only indexes led by a column the WHERE/ON names, at most 64 keys
+  of one leftmost-path page (one run over the sample spans the page), and none when the outer
+  table has <= 40 rows. Result (jss_ab.py, stock live, same-base symbolized arm; ELF
+  73344b8ed1cdf333; thinkstation1): 256.8x -> 10.5x (= its t-first spelling), rows 164.7x ->
+  7.5x, rowid pin 786.1x -> 0.5x, flag row unchanged (1.1x), every row unchanged with ANALYZE;
+  q joins within per-process noise (prk_small.py, 11 interleaved rounds).
+- Retry / next: the swap trusts a leftmost-path sample; a key whose leftmost range is dense but
+  whose rest is sparse (or the reverse) is misjudged. Sampling a second path, or the page the
+  bound lands on, is the next step if a real workload shows it.
+
+## 2026-11-14 - WIN (probe not met): an index-equality scan evaluates a residual that reads only index columns from the index entry (bd-y8zgm)
+
+- Target: `SELECT id FROM t WHERE EXISTS (SELECT 1 FROM p WHERE p.tid = t.id) AND t.a = 5`
+  (11.2x stock): the eq-residual scan looked every `a = 5` entry up (SeekRowid, 200 cold leaves)
+  to evaluate a WHERE that reads only t.id. Touched: crates/fsqlite-vdbe/src/codegen.rs
+  (expr_reads_only_index_columns, exists_reads_only_index_columns,
+  emit_index_entry_where_filter: a RegisterRow image of the index's key columns and rowid,
+  evaluated through emit_expr; codegen_select_index_equality_scan uses it when the projection
+  is covered).
+- Result (16c98f4bd; scratchpad cov_ab.py, plangap fixture with ANALYZE, stock live, answers
+  equal; ELF before 4e0567bc1d63a75d, after 59cc18d57c4c7ced; thinkstation1): 11.2x -> 7.9x;
+  NOT EXISTS 10.0x -> 7.0x; row-reading controls unchanged. Probe (6x) missed: what remains per
+  row is the EXISTS probe's index seek into p.
+- Retry / next: drop the EXISTS index probe's unused per-row OpenRead/Close of p's table
+  cursor; let the eq-residual target prefer an index that covers the residual (t_ab over t_a
+  for `a = 7 AND ... b`); the per-seek cost itself is bd-w4pr1.13.15's.
+
+## 2026-11-14 - WIN: an OR index union row from an exactly enforced term skips the WHERE, and from a covering index skips the row lookup (bd-0wwov)
+
+- Target: `SELECT id FROM t WHERE a = 5 OR s = 'k77'` (8.2x stock): bd-e9vgj's MULTI-INDEX OR
+  looked every row up (SeekRowid) and re-applied the whole WHERE in one shared body. Touched:
+  crates/fsqlite-vdbe/src/codegen.rs (codegen_select_or_index_union: `row_exact` past the WHERE
+  for a term with no residual, `row_covered` with resolve_covering_output_sources /
+  emit_covering_output_reads when the term's index holds every output column).
+- Result (a77326088; scratchpad ab2_extra.py, fresh CLI per query, median of 3, stock live in
+  the same run, answers equal; ELF before 467ea6fe5357bc94, after 4e0567bc1d63a75d;
+  thinkstation1): 8.2x -> 3.3x; `count(*) FROM (... a = 5 OR flag = 1)` 2.6x -> 1.9x;
+  `a = 5 OR flag = 1 LIMIT 10` 3.1x -> 1.9x.
+- Retry / next: a term with a residual keeps the lookup and the WHERE; the rowid set still
+  takes an insert for the last term's rows, which no later term can repeat.
+
+## 2026-11-14 - WIN: x IN (SELECT ...) builds its probe set from only the subquery rows its WHERE reaches, and covered outputs read the index (bd-d2jwe)
+
+- Target: `SELECT id FROM t WHERE a IN (SELECT w FROM p WHERE pid < 100)`, the worst ratio left
+  in the 467ea6fe5357bc94 plan-gap sweep (15.4x): the build rewound all of p and filtered
+  `pid < 100` per row. Touched: crates/fsqlite-vdbe/src/codegen.rs
+  (emit_probe_source_walk_start for codegen_select_index_in_subquery_scan and
+  emit_once_materialized_in_probe_source; an index equality-prefix walk of the subquery's table
+  in the scan's build; covering output reads in its probe loop).
+- Result (c352f4093; scratchpad ins_ab.py, stock live; ELF before 467ea6fe5357bc94, after
+  e0de49d03ab6655d; thinkstation1): 15.4x -> 3.8x; BETWEEN 20.0x -> 3.8x; `w = 3 AND pid <
+  1000` 11.8x -> 5.0x; `w = 3` 13.3x -> 7.6x; NOT IN 2.3x -> 2.2x; no-WHERE and
+  indexed-range controls 6.7x -> 6.2x and 14.5x -> 10.9x (covering only).
+- Measured split: the walk alone took the first row to 8.3x; the rest came from the covering
+  read (2,600 outer rows no longer look their table row up).
+- Retry / next: an indexed range in the subquery (`tid < 2000` over p_tid) still scans p; the
+  non-covered IN-subquery output still pays a row lookup per hit.
+
+## 2026-11-14 - WIN (with statistics): an inner join drives from the table its WHERE pins when sqlite_stat1 says that side is smaller (bd-9uf3l retry)
+
+- Target: `SELECT count(*) FROM p JOIN t ON t.id = p.tid WHERE t.a = 5` drove from all of p
+  (246x stock). The unconditional swap was the LOSS entry below. Touched:
+  crates/fsqlite-vdbe/src/codegen.rs (swapped_join_lookup_plan_driving_filtered_side takes
+  Stat1RowEstimates; CodegenContext::stat1_row_estimates), crates/fsqlite-core/src/connection.rs
+  (Stat1Hints replaced by Stat1RowEstimates in an Arc; a join statement's compile passes it).
+- Rule: swap only when stat1's rows per key for the pinned index (one for a rowid) times 4 is
+  under the written outer table's row count; no statistics, no swap.
+- Result (b73d7ba83; scratchpad jss_ab.py, the same fixture without and with ANALYZE, stock live;
+  ELF before c8b948ada3e04c2f, after a02f39873c03c37a; thinkstation1): with ANALYZE 246.4x ->
+  10.4x (equal to the t-first spelling), rows 161.8x -> 7.5x, rowid pin 672.6x -> 0.9x; the
+  10-row outer and the unselective-pin controls keep the written order (1.1x-1.3x). Without
+  ANALYZE every row is unchanged.
+- Retry / next: without statistics the target stays at 257x; it needs a table-size estimate
+  from the b-tree (bd-9uf3l's follow-up bead), not stock's equal-size default.
+
+## 2026-11-14 - WIN (with a measured cost): GROUP BY streams groups in index order and stops at its LIMIT (bd-2mrip; bd-gazf2's file part)
+
+- Target: `SELECT a, max(b) FROM t GROUP BY a ORDER BY a LIMIT 5` sorted every row before its
+  first group (462.5x stock). Touched: crates/fsqlite-vdbe/src/codegen.rs
+  (codegen_select_group_by_aggregate: groups_in_index_order, index_walk_input, the group_row
+  subroutine, covering reads of plain-column aggregate arguments; DESC and permuted keys past
+  the ORDER BY prefix, IN inputs).
+- Result (a2939d952 + 336c3ae9b; scratchpad gb_ab.py, stock live, fresh process per query; ELF
+  before cee8e75bbd884ec8, after efbd4b26c0d05cca; thinkstation1): LIMIT 5 462.5x -> 4.7x;
+  `GROUP BY b, a LIMIT 5` 5,857.5x -> 1.0x with stock's rows; `a > 900` 15.5x -> 5.6x; ranges,
+  equalities and IN inputs 6.9x -> 5.2x, 4.9x -> 4.2x, 3.6x -> 2.7x, 5.2x -> 3.9x.
+- Cost as first landed: a whole-table covering GROUP BY without a LIMIT, which streams over the
+  index, was a little slower than the sorter path: `a, count(*) GROUP BY a` +1.3%,
+  `flag, count(*) GROUP BY flag` +2.3%. The sort was gone, but each row paid a Gosub into the
+  group accumulation and a copy out of its sorter slot; that half of bd-2mrip's probe waited for
+  the follow-up below.
+- Follow-up 25cf1befa removed the cost: the row body jumps into the group accumulation (which
+  returns to the index driver) and the keys stay in their slot registers. `a, count(*) GROUP BY
+  a` 676,257.1k -> 580,089.4k (6.5x -> 5.6x, under the sorter path's 667,648.7k), `flag,
+  count(*)` 665,699.0k -> 569,529.9k, and the other streamed shapes cheaper too (LIMIT 5 4.6x
+  -> 4.0x, `a = 5` 2.6x -> 2.0x, IN 3.9x -> 3.3x); bd-2mrip closed.
+- Found on the way: bd-t92q0 (the in-memory mirror prints `a % 7`'s group as 0.0 where stock
+  prints 0); GROUP BY codegen oracles must compare :memory: rows as sets (the mirror groups
+  there, in key order).
+
+## 2026-11-14 - WIN (probe missed): an aggregate over exactly `col IS NULL` walks the index's leading NULL keys (bd-z62ru)
+
+- Target: `SELECT count(*) FROM t WHERE n IS NULL` scanned the table (32x stock). Touched:
+  crates/fsqlite-vdbe/src/codegen.rs (aggregate_index_is_null_target; the aggregate range walk's
+  NULL-run mode: Rewind, stop at the first non-NULL key; the COUNT(*) gate yields to it).
+- Result (d164c8759; cin_ab.py, 10% NULL, stock live; ELF before c8b948ada3e04c2f, after
+  72e2e6dd61f83bf7): count 32.0x -> 6.3x, max(id) + sum(c) 4.4x -> 2.6x; IS NOT NULL control
+  unchanged. bd-z62ru's probe asks for at most 5x and stays open: the walk costs about 2.3k
+  instructions per NULL entry against stock's 365 (Column, NotNull, AggStep, Next per entry;
+  per-row cost, bd-w4pr1.11 / bd-w4pr1.13.7).
+- Not covered: IS NULL beside other conjuncts (an equality seek elsewhere is usually better, so
+  it declines), after an equality prefix (`a = 5 AND b IS NULL`), non-aggregate SELECTs.
+
+## 2026-11-14 - WIN: MIN/MAX of the rowid WHERE a = ? reads one end of a one-key index's run (bd-zgo8b)
+
+- Target: `SELECT max(id) FROM t WHERE a = ?` (latest row per key) walked the a = ? run.
+  Touched: crates/fsqlite-vdbe/src/codegen.rs (minmax_prefix_seek_plan, codegen_select_minmax_
+  prefix_seek: IdxRowid for a rowid argument over a one-key index).
+- Result (acde6723a; cin_ab.py, stock live; ELF before c8b948ada3e04c2f, after
+  72e2e6dd61f83bf7): min(id) WHERE a = 5 4.2x -> 0.8x, max(id) WHERE s = 'k9' 1.6x -> 0.7x,
+  max(id) WHERE a = 500 4.2x -> 0.7x.
+- Correctness found on the way (fixed in the same commit): the plan never checked that `a = ?`
+  compares under the index key's collation; a NOCASE column under a `COLLATE BINARY` index gave
+  min(v) 20 where stock gives 3.
+
+## 2026-11-14 - WIN: an IN list beside equalities on a composite index probes the whole key prefix (bd-hyoms)
+
+- Target: `a IN (3, 77, 500) AND b = 3` and `a = 5 AND b IN (1, 2, 3)` over INDEX t_ab(a, b)
+  walked the IN column's (or the leading equality's) whole run. Touched:
+  crates/fsqlite-vdbe/src/codegen.rs (index_const_in_list_composite_target, IndexConstInList
+  prefix/suffix, emit_index_const_list_rows; the non-aggregate, aggregate and GROUP BY
+  dispatchers prefer it).
+- Result (a2cfca49e; scratchpad cin_ab.py, 200,000-row file database with ANALYZE, fresh
+  process per query, stock live; ELF before c8b948ada3e04c2f, after 72e2e6dd61f83bf7;
+  thinkstation1): 40.6x -> 2.0x, count 15.7x -> 1.2x, rows 15.6x -> 1.7x, sum 25.6x -> 1.6x,
+  GROUP BY 14.8x -> 1.2x; one-field controls within 9k instructions.
+- Measurement note: the fixture's `SELECT 1` baseline varies by up to 74k instructions per
+  process, so sub-10k deltas on point queries are below the subtraction's noise; an A/A of both
+  CLIs on one database (raw per-process counts, sd about 1.5k) put the combined build's extra
+  plan checks at 2-6k instructions per statement.
+- Next: two IN lists on one index (`a IN (..) AND b IN (..)`, 37.4x) need nested probe loops.
+
+## 2026-11-14 - WIN: an OR of indexed equalities seeks one index per term (bd-e9vgj)
+
+- Target: `SELECT id FROM t WHERE a = 5 OR s = 'k77'` scanned the table (614x stock). Touched:
+  crates/fsqlite-vdbe/src/codegen.rs (or_index_union_terms, codegen_select_or_index_union;
+  offered in the planner's FullTableScan branch and before the final full scan).
+- Result (3f6513ce3; scratchpad ab2_extra.py, stock live, same binaries as above): 614.3x ->
+  8.2x with stock's rows in stock's order. Cost: `a = 5 OR flag = 1 LIMIT 10` 1.6x -> 3.3x
+  (the old full scan met its ten rows among the table's first rows; the union opens two indexes
+  and looks each row up, and now returns stock's rows).
+- Retry / next: aggregates over an OR, IN or range terms, ORDER BY; skipping the RowSet insert
+  for the last term (SQLite's MULTI-INDEX OR tests only) is a cheap follow-up.
+
+## 2026-11-14 - WIN: GROUP BY walks a range on an index's leading key; covering GROUP BY inputs stop needing the MemDatabase (bd-x14us)
+
+- Target: `SELECT a, count(*) FROM t WHERE a < 20 GROUP BY a` scanned the whole table into the
+  grouping sorter (62.6x stock). Touched: crates/fsqlite-vdbe/src/codegen.rs
+  (codegen_select_group_by_aggregate: index_range_input from ordered_scan_key_bounds,
+  covering_count_index for exact ranges, the input index opened before pass 1).
+- Result (1b7e343ed; scratchpad gb_ab.py, 200,000-row file database, each query in a fresh
+  process, stock sqlite3 3.46.1 live in the same run, user instructions, median of 5; ELF
+  before a3282e14591c74ef, after cee8e75bbd884ec8; thinkstation1): `a < 20 GROUP BY a` count
+  192,824.5k -> 21,275.4k (stock 3,080.1k: 62.6x -> 6.9x); sum(c) 198,764.6k -> 58,446.0k
+  (16.7x -> 4.9x); `GROUP BY b` over the range 24.3x -> 3.0x; GH#531's `a = 5` covering count
+  4.4x -> 3.6x; whole-table GROUP BY unchanged. Answers equal.
+- Finding on the way: every covering GROUP BY input program read the index before its OpenRead
+  in program order, so compute_attached_memdb_requirement_reason flagged it and the substrate
+  handed the statement to the in-memory evaluator (GH#531's covering eq/IN count never ran on a
+  file database). An EXPLAIN-only test cannot see this; issue_531_grouped_index_input now asserts
+  attached_memdb_requirement_reason() == None. A :memory: GROUP BY test cannot see the program
+  either (the mirror groups there): oracles for GROUP BY codegen run file-backed in strict mode
+  with a refused-HAVING control.
+- Retry / next: the remaining 6.9x is per-row cost (bd-w4pr1.11); streaming groups in index
+  order is bd-2mrip.
+
+## 2026-11-14 - WIN: count(DISTINCT col) loose-scans its index (bd-fk2wa)
+
+- Target: `SELECT count(DISTINCT a) FROM t` over an index on a walked every entry and counted
+  key changes (196.5x stock, 200,000 rows, 1,000 values). Touched: crates/fsqlite-vdbe/src/
+  codegen.rs codegen_select_count_distinct_index_walk.
+- Lever (37d1381d6): seek past the NULL keys, count a key, try
+  DISTINCT_LOOSE_SCAN_NEXT_PROBES (3) Next steps, then SeekGT past the rest of the run, as the
+  DISTINCT loose scan does. A key a probe step already read is copied, not read again: the first
+  version read it twice and made the all-distinct column 8% slower (5.4x -> 5.8x).
+- Result (scratchpad cdx_ab.py, stock live, ELF before a3282e14591c74ef, after
+  6a91f74ba4190e9b; thinkstation1): 1,000 values 446,992.4k -> 24,325.6k (stock 2,274.9k: 196.5x
+  -> 10.7x); 5,000 values 30.2x -> 7.7x; all distinct 5.4x -> 5.0x; a third NULL 4.3x -> 3.0x.
+- Retry / next: the first row is about one index seek per distinct value (24k instructions
+  against stock's 2.3k), the per-seek cost of bd-w4pr1.11. bd-fk2wa stays open: its probe asks
+  for at most 10x on that row.
+
+## 2026-11-14 - LOSS: an inner join driving from the table its WHERE pins, without row estimates (bd-9uf3l, not landed)
+
+- Target: `SELECT count(*) FROM p JOIN t ON t.id = p.tid WHERE t.a = 5` drives from p (all 50,000
+  rows, a t lookup each) where stock drives from the 200 rows of t with a = 5 (413.7x).
+- Lever (fsq-jsw tree, crates/fsqlite-vdbe/src/codegen.rs, not landed):
+  swapped_join_lookup_plan_driving_filtered_side. For an inner ON join whose written outer table
+  no equality seeks, swap the order when one seeks the other table and the written outer table
+  has a rowid or index lookup on the join key. It was used in codegen_join_select,
+  codegen_join_aggregate_select and join_select_seeks_outer_table.
+- Result, stock sqlite3 3.46.1 live in the same run (ab2_extra.py, joinorder.py; binary
+  4792edea6142761c vs 0802cab15a251861, thinkstation1): the target 203,057k -> 7,056k (14.4x,
+  equal to its t-first spelling). Control: a 10-row q joined to the 200,000-row t,
+  `SELECT count(*) FROM q JOIN t ON t.id = q.tid WHERE t.flag = 1`, 305k (3.0x) -> 1,030,918k
+  (10,095x), and `... WHERE t.a = 5` 302k (3.2x) -> 4,374k (46.3x). The database had ANALYZE
+  statistics, and stock kept q outer.
+- Why: the swap ignores table sizes. Stock's choice without statistics matches the lever's (an
+  indexed equality is assumed selective, and tables equal-sized), but with sqlite_stat1 it
+  knows q has 10 rows.
+- Without statistics (same fixture, no ANALYZE, measured 2026-11-14): stock drives t through
+  t_flag on the control too and costs 72,115k there (730k on the target). The written order
+  runs that control in 305k, 236x under stock, so stock's no-statistics defaults would make the
+  swap fire there and give that margin away.
+- Retry condition: row-count estimates reach the join codegen: sqlite_stat1 when present
+  (Stat1Hints in connection.rs already carries table rows and rows per index key), and when
+  absent an estimate of the table's size from its b-tree (page count or root fan-out), not
+  stock's equal-size default. Swap only when the pinned side's estimate is well below the
+  written outer table's, and re-run both controls above with and without ANALYZE.
+
+## 2026-11-14 - WIN: three plan-gap levers from one sweep: ordered-scan key ranges (bd-dduz1), DISTINCT over a key range (bd-kzfcf), comma joins seek their outer table (bd-61nf7)
+
+- Source: a plan-gap sweep of 40 common single-table and join shapes (scratchpad plangap.py,
+  joinorder.py), 200,000-row file database, stock sqlite3 3.46.1 live in the same run, user
+  instructions per query (perf stat). Engine overhead alone is 2-5x on this host, so a row far
+  above that points at a wrong access path. Answers were compared on every row.
+- bd-dduz1 (a121f252e, crates/fsqlite-vdbe/src/codegen.rs codegen_select_index_ordered_scan,
+  ordered_scan_key_bounds): an ORDER BY served by an index scan ignored a range on the ordered key
+  and walked the index from its start, or the whole equality-prefix block. It now seeks the near
+  bound and leaves past the far bound. `s > 'k4999' ORDER BY s LIMIT 3` 1,829,221k -> 692.5k
+  (stock 59.8k); `a = 77 AND b > 50 ORDER BY b LIMIT 10` 1,848.7k -> 367.9k (stock 78.9k).
+- bd-kzfcf (e2133fe72, distinct_loose_scan_plan's range): `SELECT DISTINCT a ... WHERE a < 20`
+  took the dedup path over a full scan, and its rows came out of stock's order. An exact range
+  on the loose scan's key now bounds the loose scan. 192,038.8k -> 653.8k (stock 116.5k), with
+  rows equal to stock's in order.
+- bd-61nf7 (056a46b60, join_outer_filter_terms): `FROM t, p WHERE t.id = p.tid AND t.a = 5`
+  handed its whole WHERE to the lookup as the join condition, so `t.a = 5` never seeked the
+  outer table. 215,556.6k -> 7,050.4k (stock 490.2k), equal to its ON form (7,058.3k).
+- Binaries: before 0802cab15a251861 (5081a25cf), after a3282e14591c74ef (b68522c70 plus these
+  levers and bd-ti5c9); host thinkstation1.
+- Retry / next: (a) bd-dduz1's first row was still 11.6x after a121f252e: the exclusive bound's
+  40 equal keys were each looked up in the table. The follow-up seeks past them (SeekGT) and past
+  NULL keys, and ends the walk on a NULL bound: 692.5k -> 173.1k (2.9x), and the next-key row
+  367.9k -> 338.5k (4.3x), on the combined binary 4792edea6142761c. The ordered walk is still
+  never covering, where stock reads `s` from the index. (b) Lookup joins cost
+  about 10x stock per outer row whatever the access path (7.8M for 200 outer rows against 730k).
+  Look there before any further join-plan lever (bd-w4pr1.11). (c) Not yet landed from the same
+  sweep: GROUP BY over a range (bd-x14us, 67x), join ORDER BY + LIMIT on the materializing
+  executor (bd-ti5c9, 8,165x), count(DISTINCT) (bd-fk2wa, 196x), GROUP BY in index order
+  (bd-2mrip, 550x). Still open with no lever: OR of two indexed terms (615x), a join driving its
+  unfiltered side (`FROM p JOIN t ... WHERE t.a = 5`, 413x), composite IN plus equality (98x and
+  37x), and IS NULL on an indexed column (33x; no IS NULL index seek exists).
+
+## 2026-11-14 - WIN: new WAL commit certificates carry an XXH3-128 frame digest as record version 5 (bd-w4pr1.7.2)
+
+- Target: every WAL commit and every open that authorizes a certificate (each frame a certificate
+  covers is hashed at commit and again by the next process that authorizes it). Measured on
+  `delete_14pct_300k`, `update_10pct_300k`, `txn_1000x10_rows`, `autocommit_5k_inserts` and
+  `multiproc_8x500`. Touched: `crates/fsqlite-wal/src/parallel_wal.rs` (record version 5,
+  `ParallelWalFramePayloadDigestAlgorithm`, the builder's BLAKE3 / XXH3 states, the record's
+  algorithm), `crates/fsqlite-wal/src/lib.rs`, `crates/fsqlite-wal/src/wal_fec_replay.rs`,
+  `crates/fsqlite-core/src/wal_adapter.rs` (suffix check accepts v4 and v5; the digest is
+  recomputed with the record's algorithm), `README.md` file table.
+- Ledger preflight: no earlier entry changed the digest algorithm; the 2026-11-12 bd-w4pr1.13.17
+  entry made BLAKE3 take whole 16 KiB blocks and recorded BLAKE3 as the remaining cost. The
+  2026-11-13 callgrind attribution of `delete_14pct_300k` (posted on bd-w4pr1.13.20 and
+  bd-w4pr1.7.1) put the BLAKE3 digest at 11.2k instructions per 4 KiB frame (25.4M over the commit's
+  2,260 frames), and the open's authorization of the setup process's 2,262 frames, frame reads
+  included, at 40.6M; the checkpoint's XXH3-128 of a 4,120-byte frame costs 2.84k on the same
+  baseline x86-64 build (SSE2 path).
+- Change: a new record is version 5; its digest is XXH3-128 (streaming `Xxh3Default`) over a
+  domain prefix and the same ordered field stream as v4 (ordinal, page, commit size, payload
+  length, payload), the 16-byte digest little-endian in the record's 32-byte field and 16 zero
+  bytes after it. A v4 record keeps decoding, and every verifier (open-time authorization, the
+  in-doubt reconciliation, WAL-FEC replay) recomputes with the decoded record's algorithm; v2/v3
+  stay legacy (absent). Envelope layout, commit-certificate payload and where the digest is
+  computed are unchanged; the record remembers its version, so a v4 record re-encodes to its v4
+  bytes.
+- Result, stock sqlite3 3.46.1 live in the same runs; binaries 390b9c97... (main 65003d294) and
+  db786817... (65003d294 plus this diff, diff sha 7b21c2e915ef12cc); answers equal stock's in every
+  row; stock `integrity_check` ok on all 10 candidate DML files:
+  - `sc_mut_probe`, minimum of 5, io_uring refused, load 3.0: `delete_14pct_300k` 506.0M ->
+    470.5M user instructions (-35.5M; 4.19x -> 3.90x stock 120.7M), CPU 119.9 -> 113.5 ms (stock
+    36.0); `update_10pct_300k` 847.3M -> 811.9M (-35.4M; 3.10x -> 2.97x stock 273.3M), CPU 145.0
+    -> 136.3 ms (stock 49.7). 4,522 frames hashed per DELETE run: -7.85k per frame.
+  - `txn_row_probe`, 5 reps, load 4.3: `txn_1000x10_rows` 693.8M -> 678.9M (-2.1%; 4.51x ->
+    4.41x stock 153.9M), CPU best 258.7 -> 241.1 ms (stock 33.0, A/A 1.21);
+    `autocommit_5k_inserts` 1,226.6M -> 1,161.5M (-5.3%, -13.0k per commit; 10.92x -> 10.34x
+    stock 112.3M), CPU best 652.9 -> 624.1 ms (stock 64.2, A/A 1.12).
+  - `mp_probe`, 5 reps, load 4.4: `multiproc_8x500` median 1,272.2M -> 1,149.2M (-9.7%; minimum
+    1,198.2M -> 1,116.3M), median CPU 1,202.2 -> 1,105.6 ms (stock 99.0M, 208.8 ms); 4,000 rows.
+  - Prediction (registered on the bead before code): DELETE and UPDATE -32M to -42M, autocommit
+    -5% to -7%, txn -2% to -4%, multiproc -5% to -12%; all five landed inside. Kills: DELETE
+    under 35M or autocommit under 4%. Autocommit cleared by 1.3 points; DELETE cleared by 0.5M,
+    which is narrow: the per-frame saving came in at 7.85k against the 8.2k estimate.
+- Compatibility, checked with both binaries (`x72_updown.py`, `x72_downgrade_copy.py`): a database
+  whose sidecar the old build wrote (202 v4 records) opens with the new build, which appends v5
+  records after them; answers equal stock's and stock `integrity_check` is ok. The old build
+  refuses a database whose sidecar holds v5 records: `WAL file is corrupt: parallel WAL
+  certificate newest record is invalid: unsupported durable certificate record version 5`. Stock
+  reads that database. A copy of it without `-wal-cert` and `-wal-cert-head` (WAL still holding
+  all 300 rows) opened in the old build with every row, and stock's `integrity_check` was ok
+  after the old build wrote to it.
+- Tests (`parallel_wal.rs`): the stream test now checks both algorithms against a reference
+  (BLAKE3 derive-key, and one-shot `xxh3_128` over prefix plus stream) for 91 size and count cases,
+  and fails a digest without the prefix, an XXH3-64 digest, and a moved frame boundary; v5 round
+  trip and authorization; a v4 record assembled field by field the way the old encoder wrote it
+  decodes as v4, re-encodes to the same bytes and authorizes; a flipped payload byte (three
+  positions), the other algorithm's digest, and a record relabeled to the other version with its
+  envelope checksum fixed up all fail to authorize, for both versions; only 4 and 5 are honored.
+- Gate (rch, 65003d294 plus the change): clippy -D warnings on fsqlite-wal, fsqlite-pager and
+  fsqlite-core `--all-targets` clean; fsqlite-wal lib 1,174 passed; fsqlite-wal integration with
+  fault-injection 55 and without 74; fsqlite-pager lib `wal` 102 and
+  `self_alloc_extension_not_conflict` 3; fsqlite-core lib 4,171 passed, 2 failed (the known
+  t6741 pair, red on main); fsqlite-core WAL/certificate keepers 14 + 214 + 70 (bd_ih8ak_*,
+  gh416, gh385, gh384, gh534, wal_cert_sidecar_compaction, wal_fec_commit_pipeline,
+  bulk_import_upsert_text_pk_phantom_pk, readonly_close_no_checkpoint_mutation and the rest of
+  the M6 list) and 8 DML oracle targets 27; fsqlite WAL keepers 16, plus
+  `async_drop_skips_detached_checkpoint` 1 with `async-api`.
+- Landed as d22b2577c (rebased onto 2cd267023; clippy -D warnings on the three crates reran clean
+  on the rebased tree; the upstream commits from 65003d294 to 2cd267023 touch none of the changed
+  files). README file table and CHANGELOG [Unreleased] updated in the same commit.
+- Per commit (callgrind of 2,000 autocommit INSERTs, the digest functions' inclusive counts; the
+  process totals are spin-loop artefacts): about 19.2k before (BLAKE3 update 16.6k, finalize 1.1k,
+  builder 1.5k), about 3.7k after (builder update 3.35k per frame at 1.01 frames per commit,
+  finalize 0.33k).
+- Retry condition: the digest is now about 3.35k per frame. A wider XXH3 loop (AVX2 chosen at run
+  time; the release build is baseline x86-64) is worth trying when the digest is above 3% of
+  `autocommit_5k_inserts` again (about 1.6% now). Moving the digest off the commit's critical
+  path is bd-w4pr1.7.1, which now has about 3.7k per autocommit to move, not 17.6k; its
+  re-measurement is on that bead.
+
+## 2026-11-13 - WIN: the shell reads a one-line plain statement in one pass and asks the dot-command table only about '.' lines (bd-w4pr1.13.35, lever 2)
+
+- Target: every statement line the shell reads (the scorecard's text rows; measured on
+  `txn_1000x10_rows` and `autocommit_5k_inserts`). Touched: `crates/fsqlite-cli/src/main.rs`
+  (`scan_pending_input`, new `lone_plain_statement_scan`, the state machine renamed
+  `scan_pending_input_by_states`; the read loop's dot-command call).
+- Ledger preflight: the 2026-11-12 bd-5310l WIN entry for this scan set its retry line at "the
+  completeness scan above 3% of a statement shape"; it measured 1,920 instructions of a 38,978
+  in-transaction INSERT (4.9%) after lever 1, about 47 a byte of `INSERT INTO e(w,s)
+  VALUES(7,'p-7-3');`. `try_execute_dot_command` cost 529 for a line that is not a dot command
+  (ten '.'-prefixed name tests in an async fn built and polled for every line).
+- Change: `scan_pending_input` first tries one pass that answers only for: after ASCII whitespace
+  one of the four verbs followed by an ASCII byte, no `"`, backtick or `[` anywhere, no `--` or
+  `/*` anywhere (strings included), balanced single quotes, exactly one semicolon outside strings
+  and it is the last significant byte. That input is exactly what the state scan calls complete
+  and lone (no trigger head can follow the verb, no comment or quoted name can arise, and toggling
+  on every `'` gives the doubled-quote rule's inside/outside answer); everything else goes to the
+  unchanged state scan. The read loop calls `try_execute_dot_command` only for a line starting with
+  '.', every one of its arms tests a '.'-prefixed name.
+- Result (binaries 30b8b968... = lever 1's measured binary, c2b7c9a0... = that tree plus this
+  diff; stock sqlite3 3.46.1 live; every answer equal to stock's): exact per in-transaction INSERT
+  (callgrind, N=2000 minus N=1000) 38,978 -> 37,435 (-1,543): the scan 1,920 -> 898 inclusive and
+  the dot-command dispatch 529 -> 0. perf stat, 7 interleaved reps: `txn_1000x10_rows` 689.0M ->
+  675.6M mean (median 687.6M -> 670.5M; 4.48x -> 4.39x stock 153.9M), CPU best 247.6 -> 241.9 ms
+  (stock 33.1 ms, A/A 1.17); `autocommit_5k_inserts` 1,243.3M -> 1,226.7M mean (10,000 + 2,002
+  lines in the txn row and 5,000 in the autocommit row take the change; the autocommit row's
+  spread is about 2%). Prediction (registered): scan -1.4k to -1.7k, dot dispatch -0.45k to
+  -0.55k; kills: scan under 0.7k, dot under 0.2k, total under 1.2k. The dot dispatch met its
+  prediction; the scan missed it (the one-pass check costs about 22 instructions a byte, not the
+  six to eight estimated) but cleared its kill line; total cleared.
+- Behaviour: shell output byte-identical to the lever-1 binary over 768 runs (`cli_modes_diff2.py`:
+  six modes, headers on and off, sixteen script tails, `:memory:` and a file, separate and merged
+  streams). Test `test_lone_plain_statement_scan_agrees_with_the_state_scan_wherever_it_answers`
+  holds the quick answer to the state scan over every sequence of up to five of sixteen pieces
+  joined by a space and up to four joined by nothing (dashes, slashes, stars, stray and doubled
+  quotes, brackets, a comment, a non-ASCII byte), checks the scorecard lines take the quick path,
+  and lists what a careless quick scan would call lone (`'a--b'`, a second statement, a trailing
+  quote or non-ASCII byte, `selectx`).
+- Gate (rch, lever 1 plus the change): clippy -D warnings on fsqlite-cli `--all-targets` clean
+  (and again on the rebased tree); fsqlite-cli tests 84 pass (79 unit, 3 + 2 integration).
+- Landed as ca047f382 (rebased onto 4b8f3e9cb; clippy reran on 36888e0b3 plus the change, the
+  one later upstream commit is tracker and docs only).
+- Retry condition: for a faster quick scan, the 898-instruction one-pass check above 3% of a
+  statement shape (2.4% of this INSERT now), with a class-table or `memchr`-style search over the
+  same refused set and the same test. Next on this bead: the literal scan's per-parameter `to_string` and string copies
+  (about 0.55k per INSERT), the statement savepoint (about 2.5k), the engine handed over by value
+  (about 2.5k; see the 2026-11-12 REJECTED entry for its retry condition).
+
+## 2026-11-13 - WIN: a same-size row rewrite parses its cell without the cell-slot cache (bd-w4pr1.13.20, lever Q)
+
+- Target: every UPDATE row rewritten in place at the same size (the scorecard's
+  `update_10pct_300k`: 30,000 rows). Touched: `crates/fsqlite-btree/src/cursor.rs`
+  (`overwrite_current_table_payload_same_size_no_overflow`).
+- Evidence before (callgrind of the UPDATE): the rewrite spent 24.3M of its 55.4M in `parse_cell_at`,
+  810 instructions per row: a cell-slot cache lookup, the parse, and the insert of a slot keyed by the
+  leaf's current image token, which the rewrite then replaces, so the slot is never read. The leaf
+  delete's uncached parse of the same cell costs 117 (lever C).
+- Change: the cell is parsed with `parse_cell_at_uncached`; the same `CellRef` and the same rowid,
+  overflow, payload-size and bounds checks.
+- Result, stock sqlite3 3.46.1 live in the same run (`sc_mut_probe`, minimum user instructions of
+  7, io_uring refused, load 3.4; binaries 325cb001... base main 7229098de, 4d2bdf32... base + this
+  production diff): `update_10pct_300k` stock 273.4M, base 868.2M (3.18x), lever 847.9M (3.10x):
+  -20.3M, CPU 147.6 -> 135.1 ms (stock 48.1); `delete_14pct_300k` 506.0M -> 505.9M. With io_uring
+  allowed: 879.4M -> 862.4M. Prediction (UPDATE -15M to -22M, DELETE within 2M) met; kill (UPDATE
+  under 10M, DELETE over 3M) not met. Answers equal stock's; stock's `PRAGMA integrity_check` passes on
+  every file the lever wrote.
+- Test: `test_table_overwrite_current_payload_same_size_no_overflow_preserves_cell_shape` gains a
+  refused overwrite for a rowid the cursor is not on (an overwrite that skipped the cell check would
+  write it) and a second rewrite on the image the first one wrote.
+- Gate, on 7229098de plus the change: clippy -D warnings on fsqlite-btree `--all-targets` clean (and
+  on the rebased tree, with the INSERT lane's c3cbcfe9f, where fsqlite-btree lib passes 555);
+  fsqlite-btree lib 554 pass; fsqlite-vdbe lib 1,244 pass and 2 fail (bd-bhalc pair, red on main);
+  fsqlite-core lib 4,170 pass and 2 fail (t6741 pair, red on main); 48 fsqlite-core DML / trigger /
+  FK / RETURNING / savepoint / concurrency targets 223 pass and 1 fails (bd-vy10l, red on main); 8
+  fsqlite DML targets 26 pass. Landed as c99b830e7 (rebased onto e1ec6bcc5).
+- Retry condition: none.
+
+## 2026-11-13 - WIN: an INSERT builds the boxed future of a dispatch check only when the check can act on it (bd-w4pr1.13.35, lever 1)
+
+- Target: per-statement work outside the VDBE program on every INSERT through the dispatcher (text,
+  parameterized literal, prepared re-dispatch), and the view-DML box on every statement; the
+  scorecard rows `txn_1000x10_rows` and `autocommit_5k_inserts`. Touched:
+  `crates/fsqlite-core/src/connection.rs` (`execute_statement_dispatch_impl`),
+  `crates/fsqlite-core/src/connection/insert_batch.rs` (`execute_insert_dispatch`).
+- Evidence before (callgrind, main 0f8b7c7f4, N=2000 minus N=1000 literal INSERTs in one
+  transaction through the CLI, io_uring refused): 41,981 instructions per INSERT (stock about
+  13.7k). Each INSERT heap-allocated and freed six futures for checks that answer "nothing to do"
+  for an ordinary table: delegation to an attached database (`maybe_execute_attached_target_statement`
+  returns a `Pin<Box<dyn Future>>`), the INSTEAD OF view check (`boxed_future`), and `Box::pin` of
+  both FTS5 command forms, the inbound-FK pass over REPLACE victims and the AUTOINCREMENT refresh.
+  The futures are kilobytes, past glibc's tcache sizes, so each paid `_int_malloc` and a merging
+  free; malloc and free together were about 5.3k of the statement.
+- Change: each future is built behind its helper's own first test, which the helper keeps: an
+  INSERT reaches an attached database only through its table's schema qualifier
+  (`attached_target_schema` answers None without one, in the WITH pre-check and the Insert arm);
+  `statement_targets_instead_of_view` (which also spares BEGIN, COMMIT and every other statement the
+  view-DML box); `fts5_insert_uses_command_column`, which both command forms require; a non-empty
+  `last_replace_victims`; `is_autoincrement_table` (`sqlite_sequence` keeps its own branch). The
+  recursion boxes and every other path are unchanged.
+- Not attempted: the bead's first candidate, skipping the statement savepoint for single-row DML
+  that cannot fail part-way. In concurrent mode the Insert opcode takes MVCC page locks page by
+  page as it writes (`SharedTxnPageIo::write_page_internal` -> `concurrent_prepare_write_page`); a
+  split that meets a peer's lock on the parent or a new page fails Busy after the leaf is written,
+  and only the statement savepoint (pager, concurrent write set, bd-8a8pr rowid rewind) undoes that.
+  Stock has no such mid-statement failure, so the proof does not hold.
+- Result (binaries 6d41bf19... = main 0f8b7c7f4, 30b8b968... = 0f8b7c7f4 plus this diff; stock
+  sqlite3 3.46.1 live in the same runs; every answer equal to stock's): exact per in-transaction
+  INSERT 41,981 -> 39,005 (-2,976, -7.1%; allocator internals -2.0k: `_int_malloc` -838,
+  `_int_free_merge_chunk` -357, `__libc_malloc2` -210, `_int_free_maybe_trim` -179,
+  `_int_free_chunk` -174; the skipped helpers' own frames and drops the rest); exact per autocommit
+  INSERT (N=800 minus N=400) 206,539 -> 202,605 (-3,934). perf stat, 7 interleaved reps
+  (`txn_row_probe.py`): `txn_1000x10_rows` 741.2M -> 702.6M mean (min 727.0M -> 690.1M; 4.82x ->
+  4.57x stock 153.9M), CPU best 272.2 -> 267.6 ms (stock 33.1 ms, stock A/A 1.19);
+  `autocommit_5k_inserts` 1,266.9M -> 1,259.4M mean, inside that row's run-to-run spread (base
+  1,239.6M-1,286.1M, lever 1,250.6M-1,268.3M; 11.28x -> 11.21x stock 112.3M), CPU best 649.3 ->
+  625.8 ms (stock 64.0 ms, A/A 1.10). No time ratio is claimed at those A/A values. Prediction -1.6k
+  to -2.4k per INSERT and -16M to -24M on the txn row: both beaten, because the estimate counted
+  the `malloc` entry and not the large-chunk path behind it; kill line (under 1.2k, under 10M) not
+  met.
+- Tests: `crates/fsqlite-core/tests/bd_w4pr1_13_35_insert_dispatch_checks_oracle.rs` runs, against
+  stock on file-backed databases, in autocommit and in one transaction, a statement each check
+  must still catch and a look-alike it must not: `INSERT INTO aux.t` beside main's `t`, an INSERT
+  on a view with an INSTEAD OF trigger, the three-column FTS5 `'delete'` on an external-content
+  table (`'rebuild'` and `'optimize'` in its setup), a plain table whose first column bears the
+  table's name, an OR REPLACE whose victim has an ON DELETE CASCADE child, and AUTOINCREMENT with a
+  deleted high row; each statement's outcome and `changes()` and the dumps are compared.
+- Gate (rch, 0f8b7c7f4 plus the change): clippy -D warnings on fsqlite-core `--all-targets` clean
+  (and again on the rebased tree); 40 fsqlite-core targets in five batches (attach, view / INSTEAD
+  OF / trigger, FTS5 / vtab, FK / REPLACE / AUTOINCREMENT, savepoint / conflict / RETURNING /
+  literal parameterization) 222 pass and 2 fail, and 8 fsqlite targets 117 pass and 1 fails, each
+  red on main with the same message: bd-vy10l `gh516_returning_conformance`, bd-mkon7
+  `review_omitted_rowid_alias_ignores_defaults` (102 where stock gives 101; the base CLI gives 102
+  on the same script) and bd-13m32 `gh294_read_only_namespace_recovery_changes_only_ns_use`;
+  fsqlite-core lib 4,170 pass and 2 fail (the t6741 pair). The new keeper first failed on a
+  difference main already has (after an FTS5 `'rebuild'` or `'optimize'` command fsqlite reports
+  `changes()` 0, stock 1; the base CLI does the same), so those two commands run in its setup.
+- Landed as 920137f76 (rebased onto f4be467d7; clippy reran on 49b67bbb6 plus the change, and
+  the two later upstream commits touch only fsqlite-vdbe codegen, a fsqlite test and this ledger;
+  the measured binaries hold the same production diff).
+- Retry condition: none. Next on this bead, per in-transaction INSERT after this lever (39.0k):
+  the shell's completeness scan (1.9k) and dot-command dispatch (0.5k), the literal scan's
+  per-parameter `to_string` and string copies (about 0.55k), the engine handed over by value
+  (about 2.5k of memcpy, REJECTED 2026-11-12 on a prepared-statement row; retry needs an
+  instruction-count A/B of a prepared autocommit INSERT), and the statement savepoint (about 2.5k).
+
+## 2026-11-13 - WIN: the first open of a file with overflow pages claims the overflow chains instead of re-walking every cell (bd-c83wi)
+
+- Target: the first-open migration pass on a file with overflow pages. The
+  interior-only accounting (bd-6jf9o follow-up) fell back to the full
+  ownership walk there: 238M instructions on a 35 MB stock file whose
+  blobs sit in their own table (stock 1.1M).
+- Lever (eec0a2329): the unowned pages left after interior pages and the
+  freelist can only be overflow pages or orphans. Read the cells that can
+  own a chain (index interior cells, then leaves, smallest tree first),
+  claim each chain under the full walk's rules, and stop once nothing is
+  unowned. Anything unexpected still runs the full walk.
+- Result (fo2_ab.py, stock 3.46.1 live, base 60a894992 vs fix): the
+  bead's file 237.9M / 48 ms -> 21.2M / 17 ms. Worst case, ten 9 KB rows
+  inside the 1M-row table: 213.2M -> 188.0M. The chains are in the
+  largest tree, so its leaves are still read.
+- Retry, for that worst case: a cheaper per-cell scan in this second
+  phase. Decode only the payload-size varint, and read the overflow
+  pointer only when the payload exceeds max-local, instead of
+  CellRef::parse (86 instructions per cell in the 2026-11-13 bd-6jf9o
+  profile). Measure against the worst-case row's 188M.
+
+## 2026-11-13 - WIN: an indexed equality with a rowid range seeks the index bounded by the range, for keyset pages and aggregates (bd-z3a05)
+
+- Target: `WHERE <indexed col> = v AND <rowid range>`, both keyset pagination
+  (`... ORDER BY id LIMIT n`) and aggregates (`sum(c)`, `count(*)`). The
+  rowid-range lanes came first in the heuristic chains, so these walked the
+  rowid slice (usually most of the table) and filtered on the key. Stock
+  plans `SEARCH t USING INDEX t_i (i=? AND rowid>?)`.
+- Lever: when the equality pins every key column, the index's next record
+  field is the rowid, so the key's entries are in rowid order. The walk seeks
+  `(key, floor)` and leaves the block past the ceiling. Three landings:
+  d089d1da8 (non-aggregate, integer-literal bounds), 824547269 (bound
+  parameters in the ordered index scan's probe, under the rowid's affinity),
+  c2ccccb07 (aggregates, when literal equalities pin every key column:
+  `PrefixIndexShape::FullKey`).
+- Result, stock sqlite3 3.46.1 live in the same run, 200,000 rows, user
+  instructions per query. Keyset page `i = 5 AND id > 100000 ORDER BY id
+  LIMIT 20`: 15,675k -> 509k (stock 151k), ks_ab.py. Aggregates (agg_ab.py,
+  200 rows a key): `sum(c) ... id < 150000` 180,640k -> 2,414k (stock 426k);
+  `count(*) ... id > 100000` 81,544k -> 1,594k (stock 75.7k); BETWEEN
+  12,255k -> 333k (stock 79.7k). Every answer equals stock's.
+- The IN-list form landed the same day (5081a25cf): each value's probe
+  carries the rowid floor, and its run ends at the ceiling.
+  `sum(c) WHERE i IN (5, 7) AND id < 150000` went 282,958k -> 4,240k
+  (stock 819k), under its no-range control at 5,002k (in_ab.py).
+- Not done, so retry here first: (a) COUNT(*) is still 21x stock, because
+  stock counts from the index and this walk reads each table row for the
+  residual filter. A covering variant, when the residual is only the rowid
+  range, is bd-qrn03. (b) Parameter bounds in aggregates. The
+  parameter-bound keyset change has plan evidence only, because the CLI
+  arms cannot bind parameters.
+
+## 2026-11-13 - WIN: a leaf delete trusts the pointer order of the image the previous descending delete wrote (bd-w4pr1.13.20, lever P)
+
+- Target: runs of deletes on one table leaf (a scan DELETE removes about 19 rows per leaf on the
+  scorecard's `delete_14pct_300k`). Touched: `crates/fsqlite-btree/src/cursor.rs`
+  (`BtCursor::descending_leaf_image`, `remove_table_cell_from_leaf_deferred`).
+- Evidence before (callgrind of the DELETE on main 0f8b7c7f4, 42,857 deletes on compact leaves of
+  about 150 cells): the compact descending branch was chosen by `cell_ptrs_are_descending` over the
+  whole pointer array on every delete (`ptrs.windows(2).all`, 10.7M + 10.6M in the delete closure,
+  about 500 instructions per row), re-proving what the previous delete on the leaf had produced.
+- Change: that branch's output is compact and still strictly descending (the pointers before the
+  removed one are unchanged; each after it rises by the removed size and stays below its
+  predecessor, because the cell after the removed one ended where the removed one began). The cursor
+  remembers the (page, `PageData::image_token`) it wrote; a delete whose top entry shows exactly that
+  image skips the scan. Any other image (an insert, an overwrite, another branch, another cursor)
+  has another token and is scanned; the no-free-gaps and content-offset tests run every time.
+- Result, stock sqlite3 3.46.1 live in the same run (`sc_mut_probe`, minimum user instructions of
+  7, io_uring refused, load 1.0; binaries 6d41bf19... base main 0f8b7c7f4, 9af6cfb5... base + this
+  production diff): `delete_14pct_300k` stock 120.7M, base 539.5M (4.47x), lever 506.0M (4.19x):
+  -33.5M, CPU 124.6 -> 114.4 ms (stock 36.8); `update_10pct_300k` 868.3M -> 868.2M (stock 273.4M).
+  With io_uring allowed: 554.6M -> 520.9M, CPU 159.9 -> 139.5 ms, wall 223.6 -> 207.5 ms (stock
+  93.7). Prediction (DELETE -15M to -22M) exceeded; kill (DELETE under 10M, UPDATE moving over 3M)
+  not met. Answers equal stock's; stock's `PRAGMA integrity_check` passes on every file the lever
+  wrote.
+- Test: `test_leaf_delete_reuses_the_pointer_order_only_for_the_image_it_wrote` (deletes, then two
+  inserts leaving the lowest cell last and a lower cell's pointer mid-array, then deletes; the page
+  ends byte-equal to a fresh cursor per step, and the remembered image is exactly each descending
+  delete's own). Mutation run: with the verdict keyed on the page number alone the test fails, the
+  delete taking the descending branch on the disturbed leaf and corrupting it ("cell pointer
+  outside the cell content area").
+- Gate, on 0f8b7c7f4 plus the change: clippy -D warnings on fsqlite-btree `--all-targets` clean
+  (again on the rebased tree); fsqlite-btree lib 554 pass; fsqlite-vdbe lib 1,244 pass and 2 fail
+  (bd-bhalc pair, red on main); fsqlite-core lib 4,169 pass and 2 fail (t6741 pair, red on main);
+  the 48 fsqlite-core DML / trigger / FK / RETURNING / savepoint / concurrency targets 223 pass and
+  1 fails (bd-vy10l, red on main); 8 fsqlite DML targets 26 pass. Landed as 2a02e5185 (rebased onto
+  2941aa1e4).
+- Retry condition: none. Seen in the same profile and not taken: 310 deletes on leaves with free
+  space gaps take the general defragmentation (a sort of every cell, about 42k instructions each,
+  13M on the statement).
+
+## 2026-11-13 - WIN: a WHERE comparison on expressions tests NULL in its jump and reads an arithmetic operand's literal from the prologue (bd-w4pr1.13.20, lever G)
+
+- Target: every WHERE comparison neither side of which is a column of the scanned table and one
+  side of which is not a literal (`id % 7 = 0`, `a + 1 > b`, `length(b) = 5`): the scorecard's
+  DELETE and UPDATE rows and SELECT scans with such filters. Touched:
+  `crates/fsqlite-vdbe/src/codegen.rs` (`emit_where_comparison_jump`, new
+  `emit_where_comparison_operand`).
+- Evidence before: `EXPLAIN DELETE FROM m WHERE id % 7 = 0` on main 123e38af3 ran Rowid, Integer 7,
+  Remainder, IsNull, Ne, Next per scanned row; stock runs Rowid, Remainder, Ne with its constants in
+  the Init prologue and the NULL case in Ne's flags. The c1076d876 entry measured the same pair of
+  opcodes (literal load and NULL check) at about 95 instructions per scanned row.
+- Change: no `IsNull` per operand; the inverse comparison carries JUMPIFNULL (0x10) when an operand
+  is not a hoisted literal (both dispatch loops jump when either operand is NULL and NULLEQ is
+  clear; the affinity bits, mask 0x47, do not overlap). An arithmetic operand (+ - * / % & | << >>)
+  whose right side is an INTEGER or REAL literal reads it from the prologue register
+  (`hoisted_literal`, reusing c1076d876's prologue and its later-Init past-end handling unchanged);
+  the arithmetic opcode only reads its operand registers. A left literal is the operation's
+  destination and stays a per-row load. The column arms of `emit_where_filter_with_ctx` are not
+  touched.
+- Result, stock sqlite3 3.46.1 live in the same runs (ring refused; binaries e78a386a... base
+  main 123e38af3, c035173f... base + this production diff): `delete_14pct_300k` (sc_mut_probe, min
+  of 7) stock 120.7M, base 567.9M (4.71x), lever 539.4M (4.47x): -28.5M, CPU 121.6 -> 116.7 ms
+  (stock 35.0); `update_10pct_300k` stock 273.4M, base 897.3M (3.28x), lever 868.1M (3.18x):
+  -29.2M, CPU 144.7 -> 140.4 ms (stock 49.6). With io_uring allowed: 582.4M -> 553.9M and 912.5M ->
+  883.2M. 1M-row reads (stable_probe, 5 reps): `SELECT count(*) FROM t WHERE id % 7 = 0` 775.8M ->
+  680.6M (2.62x -> 2.30x stock, CPU 68.9 -> 64.5 ms); control `scan_filter_agg` 1,237.9M ->
+  1,237.9M. Prediction (DML -25M to -35M each, read row -80M to -110M, control within 2M) met; kill
+  (DML under 15M, read row under 50M, control over 2M) not met. Answers equal stock's; stock's
+  `PRAGMA integrity_check` passes on every file the lever wrote.
+- Tests: `test_codegen_where_expression_comparison_has_no_per_row_null_check_or_literal_load`
+  (no `IsNull` or `Integer` in the DELETE loop, JUMPIFNULL and not NULLEQ on the skip, one prologue
+  load of the divisor; a left literal stays the destination's per-row load, since hoisting it would
+  let the first row overwrite the prologue value); `test_where_expression_comparisons_match_rusqlite`
+  extended with ten arithmetic-with-literal operands (integer, Int64, real, shifts, a zero
+  divisor) against seven others on either side under six operators over rows with NULLs (a fold
+  without the flag lets NULL rows through `<>`), each query run twice, and two UPDATEs whose `<>`
+  must skip NULL rows.
+- Gate, on 123e38af3 plus the change: clippy -D warnings on fsqlite-vdbe `--all-targets` clean (and
+  on the rebased tree, with fsqlite-core's lib tests); fsqlite-vdbe lib 1,244 pass and 2 fail
+  (bd-bhalc pair, red on main); bytecode goldens 8 pass, unchanged (no snapshot has such a
+  comparison: no GOLDEN-CHANGE); fsqlite-core lib 4,169 pass and 2 fail (t6741 pair); 75
+  fsqlite-core targets (every EXPLAIN-reading one plus the DML / trigger / FK / RETURNING /
+  savepoint / concurrency batches) 364 pass and 2 fail, both red on main (bd-vy10l
+  `gh516_returning_conformance`, and `bd_group_by_depth_oracle_probe::indexed_group_by_predicates_match_sqlite_without_table_scans`);
+  63 fsqlite targets (every EXPLAIN-reading one plus three DML oracles) 118 pass. Landed as
+  08b5fa96b (rebased onto 661434190).
+- Retry condition: none. Not done here: the column arms' `IsNull` guards (a column compared with a
+  non-literal value), which change nearly every WHERE's bytecode and its goldens.
+
+## 2026-11-13 - WIN: an append to the cached rightmost leaf changes the transaction's staged image of the leaf in place, with no page copy and no page write (bd-i3csr.4, lever 4.2)
+
+- Target: every row appended past the end of a table within one statement after its first (the
+  cursor's cached rightmost leaf): the scorecard's `bulk_insert_1M_one_txn`, the 300k-row
+  mutation setup, `memory_script_200k`'s load, INSERT ... SELECT copies. Touched:
+  `crates/fsqlite-btree/src/cursor.rs` (`try_append_on_cached_rightmost_leaf`,
+  `try_append_in_staged_image_of_cached_leaf`, `StagedLeafAppend`).
+- Evidence before (callgrind, main f9f4e3a1d + bd-i3csr.3, the bulk statement at 100k and 200k
+  rows, per row = difference / 100k): `try_append_table_leaf_payload_in_place_no_overflow` 2,471
+  instructions a row file-backed and 1,829 in :memory:: the append itself 383, the `PageData`
+  clone handed to the pager (an `Arc<[u8]>` built from the cache's owned 4 KiB, ~680 with its
+  allocation), and `write_page_data` 1,421 file-backed / 766 in memory (the engine's tier-0
+  write, whose MVCC prepare returns at once for a page with a staged write, the pager replacing
+  the staged entry and dropping the previous image, `clear_stale_synthetic_pending_commit_surface`).
+- Change: when the transaction's unpublished staged image of the leaf is the image the cache
+  holds (equal `PageData::image_token`), the cache and the stack's top entry give up their
+  references and the row is appended inside the staged image through
+  `PageWriter::try_mutate_staged_page_data`, the contract bd-w4pr1.13.20 lever F (e7996afb0) uses
+  for deletes and same-size rewrites: the engine admits only a page with a staged write that is
+  not freed, the pager takes the savepoint before-image first and refuses a published image or a
+  recovery barrier, and any other holder keeps its bytes through `as_bytes_mut`'s copy-on-write.
+  The cache then shares the staged image; when the row does not fit, the cache and the stack
+  entry share the unchanged image (same bytes, same token) and the existing overflow / split
+  path runs. A store without staged images, or with a different one, takes the old path.
+- Prediction (recorded before code, perf stat terms): -6% to -12% instructions on the 300k
+  setup, the 1M bulk row -6% to -11% instructions and -3% to -10% CPU, memory_script -2% to -5%,
+  txn / autocommit about unchanged. Kill: under -4% on the 300k setup or the 1M row's median CPU
+  not at least 2% lower.
+- Result, stock sqlite3 3.46.1 live in the same runs, base main 661434190 (01fce8...), lever
+  (661434190 + this diff), every answer equal to stock's: the 300k generate_series setup (io_uring
+  refused, 3 runs) 3,131.3M -> 2,556.3M user instructions (-18.4%; 2.96x -> 2.42x stock
+  1,058.2M), CPU 375 -> 298 ms (-20%); INSERT INTO m2 SELECT * FROM m (300k) 3,614.4M ->
+  3,020.8M (-16.4%), CPU 420 -> 338 ms; the 1M bulk row (5 runs) 11,535.6M -> 9,637.2M
+  (-16.5%), CPU 1,391 -> 1,109 ms (-20%), wall 1,410 -> 1,127 ms (3.36x -> 2.68x stock 420 ms);
+  memory_script_200k 4,660.3M -> 4,390.7M (-5.8%), CPU 466 -> 425 ms. Prediction beaten (the
+  callgrind arithmetic, ~1.9k a row file-backed, held under perf stat: the 4 KiB copy here is a
+  vector loop, not rep movsb). Every 1M-row file both binaries wrote passes stock's
+  `PRAGMA integrity_check`, and the table's rows hash the same as stock's.
+- Rows without the path (one row per statement, or no appends): txn_1000x10_rows -0.8%,
+  autocommit_5k_inserts -1.7%, delete_14pct_300k -3.0%, update_10pct_300k and
+  create_index_int_300k flat; read rows identical instructions under either binary on either
+  arm's database (the same 8,187 pages and freelist). multiproc_8x500 (8 processes x 500
+  autocommit INSERTs, mp_probe.py, 15 interleaved runs): median instructions 1,275.9M ->
+  1,271.2M, CPU +0.5%, wall -1.3%; its minimum swings with lock contention (+/-5% between runs
+  of one binary). Scorecard (2 runs, wall, stock first and last): bulk 1.437 -> 1.190 s (3.43x ->
+  2.84x), memory_script 0.507 -> 0.466 s; rows that read slower there (rowid_lookups +5%,
+  order_by +6%, multiproc +5%, create_index +3%) run identical instructions or, for multiproc,
+  equal medians in the probes above.
+- Tests: fsqlite-btree
+  `test_appends_change_the_staged_rightmost_leaf_in_place_only_when_it_is_the_caches` (3,000
+  appends with variable payloads, overflow chains every 257th row and an insert below the end
+  every 500, through a store that keeps its staged images: every page byte-equal to the
+  copy-and-write path, more than 2,000 appends made in place; a store that offers a different
+  staged image, the page before its last write, is never changed in place).
+- Gate, 661434190 with the change (rch, 2026-11-13): clippy -D warnings with all targets on
+  fsqlite-btree, fsqlite-vdbe and fsqlite-core clean; fsqlite-btree lib 553 pass and 1 fail in
+  the gate run (`test_balance_for_delete_defers_until_leaf_empties`, which reads a global
+  balance counter: alone it passes, and the whole lib then passed twice, 554 of 554; the new test
+  holds the same lock); fsqlite-vdbe lib 1,243 pass and 2 fail (the bd-bhalc pair), goldens 8
+  pass; 54 fsqlite-core targets in 8 batches, bd_2jbl5_update_from_triggers_oracle (the
+  bd-w4pr1.13.34 hang keeper) and the staged-leaf, right-edge append and savepoint keepers first,
+  then INSERT, savepoint / rollback, RETURNING, concurrency and rowid keepers: 365 pass and 5 fail,
+  each red on main: bd-jlbrk's two `rowid_replace_preflight_*` tests, bd-mkon7's
+  `review_omitted_rowid_alias_ignores_defaults`, `gh516_returning_conformance::
+  correlated_returning_unbound_parameters_do_not_alias_frozen_assignments` (the red the
+  e7996afb0 entry names), and `bulk_insert_values_memdb_reload_scaling::
+  read_free_insert_values_streak_defers_memdb_reload_and_stays_correct`, flaky on its global
+  reload counter: 1 failure in 5 parallel runs on main's code path and 1 in 5 with the lever,
+  5 of 5 passing alone (bd-8aqha); fsqlite-core lib 4,169 pass and 2 fail (the t6741 pair).
+- Retry condition: none. Next on the row: the per-statement descent to the rightmost leaf in
+  `allocate_concurrent_storage_rowid` for implicit-rowid INSERT statements (bd-i3csr.4 lever 4.3);
+  the stack-entry rebuild per append (a `cell_pointers` Vec clone); on the txn row, by-value moves
+  in `execute_table_program_with_db` / `_with_cx` (~3.2k per statement) and
+  `next_internal_savepoint_name`'s `format!` (~0.9k per statement).
 
 ## 2026-11-13 - WIN: the scan loop's Remainder of two integers and its Rowid write their register in place (bd-w4pr1.13.20, lever V)
 
@@ -27314,3 +35838,52 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   text), where memchr2's per-call setup is amortized. Measure on such a
   corpus, not on small keyed documents. The real lever is a single-pass
   parser that keeps number spans (bd-oahj7).
+
+## 2026-11-19 — Bounding the COMMIT's db-file handle wait with a per-wait expiry timer (bd-dd5bh v3)
+
+- Context: a correctness fix, not a speed lever. On main a group-commit
+  flush waits for the shared db-file handle (`shared_db_file_write`,
+  `crates/fsqlite-pager/src/pager.rs`) with no bound, so a COMMIT can run
+  past its `busy_timeout`. The parent reproduces this in the cross-process
+  churn shape (two fresh-connection fsqlite loops beside a truncating stock
+  writer): 2 of 100 loops at 8,519 and 6,235 ms. The trace shows the WAL
+  WRITE retries ending inside the 5 s budget, then 3.9 s with no log line
+  before "physical writer flush failed". The fix had a cost guard (probe 4):
+  uncontended autocommit instructions:u within +0.5%.
+- Candidate v3 (never on main; the cross-process lane's scratch
+  `saved/worktree_dd5_final.diff`): `shared_db_file_write_within_budget`
+  polls the fair acquisition first. Only once that has suspended does it read
+  `budget.remaining()` (arming the statement's busy clock) and register an
+  `asupersync::time::sleep(wall_now(), remaining)` expiry, answering `Busy`
+  if the expiry fires first. A request that never reached the append lock
+  releases its obligation without a restore. Earlier variants: v1 (a
+  `try_write` fast path) took the handle ahead of a queued holder and stalled
+  6 of 60 churn loops for 7-15 s; v2 armed the busy clock on every COMMIT and
+  raised instructions.
+- Result: rejected on probe 4. autocommit2000 (2000 autocommit INSERTs, WAL,
+  synchronous=NORMAL), instructions:u, layout-averaged (bd-es2im: K=6
+  shuffled relinks per arm, both arms built in one rch job on vmi1152480,
+  measured on thinkstation1 with governor powersave, stock sqlite3 3.46.1
+  live, answers equal stock's):
+  - R_L 1.0265 (null 1.0134) and 1.0258 (null 0.9899) in two runs;
+  - the earlier direct A/B, with an A/A null within 0.1%: +3.1% and +2.5%;
+  - txn10 was noise-dominated: 1.0087 and 0.9847.
+  The cheapest runs are equal (min 354.9M parent, 354.3M lever) while the
+  median moves (p50 364.0M to 375.8M). So the fixed path cost is near zero,
+  and the lever adds timing-dependent work in more of the runs: about 4,700
+  instructions per commit on average.
+- Lead, not proven: the expiry timer registered each time the handle
+  acquisition suspends. The CLI has no ambient timer driver, so asupersync
+  0.6.2 routes it to its process-global fallback timer: a wheel insert plus a
+  pump-thread unpark, then a cancel when the lock arrives. perf record is
+  capped at 4 kHz here and could not attribute it; gdb on the out-of-line
+  `Sleep::poll_inner` saw 0 hits (inlined); strace -c did not separate the
+  arms.
+- Retry condition: a v4 that registers no timer on any path an uncontended
+  autocommit takes. For example, arm a deadline only after the wait has
+  already lasted a threshold, or reuse a deadline the caller already holds.
+  First name the added instructions by function with callgrind on an
+  uncontended autocommit (v3 against main). Then judge v4 on the same
+  probe 4 (+0.5%, layout-averaged) and probe 3 (no wait past busy_timeout
+  + 1 s in 60 churn loops). If no construction keeps the uncontended path
+  instruction-neutral, bounding the wait is a design question for the owner.

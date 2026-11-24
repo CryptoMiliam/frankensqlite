@@ -75,7 +75,10 @@ pub use types::{FromSql, ToSql};
 /// the same purpose). A rusqlite application's own `cargo test` builds this
 /// crate at opt-level 0, where one statement can need about 2 MiB of stack:
 /// as much as Rust gives every spawned and test thread (bd-w4pr1.28).
-fn block_on<F: Future>(future: F) -> F::Output {
+///
+/// It is public for other synchronous boundaries over [`crate::Connection`],
+/// such as the C ABI shim (bd-zqr9h).
+pub fn block_on<F: Future>(future: F) -> F::Output {
     stacker::maybe_grow(
         BLOCKING_CALL_STACK_RED_ZONE_BYTES,
         BLOCKING_CALL_STACK_SEGMENT_BYTES,
@@ -1525,11 +1528,13 @@ impl Connection {
         let slots = self.slots(sql);
         let stmt = block_on(self.as_async().prepare(sql))?;
         let names = stmt.column_names();
+        let reprepare_count = stmt.reprepare_count();
         Ok(Statement {
             conn: self,
             stmt: Box::new(stmt),
             slots,
             names,
+            reprepare_count,
         })
     }
 
@@ -1567,26 +1572,20 @@ impl Connection {
         self.as_async().last_insert_rowid()
     }
 
-    fn counter(&self, sql: &str) -> u64 {
-        block_on(self.as_async().query_row(sql))
-            .ok()
-            .and_then(|row| match row.get(0) {
-                Some(SqliteValue::Integer(n)) => u64::try_from(*n).ok(),
-                _ => None,
-            })
-            .unwrap_or(0)
-    }
-
-    /// Rows changed by the most recent INSERT, UPDATE or DELETE.
+    /// Rows changed by the most recent INSERT, UPDATE or DELETE: the value
+    /// SQL `changes()` returns, read from the connection's counter
+    /// (bd-e64z4; this ran `SELECT changes()` per call).
     #[must_use]
     pub fn changes(&self) -> u64 {
-        self.counter("SELECT changes()")
+        u64::try_from(self.as_async().last_change_count()).unwrap_or(u64::MAX)
     }
 
-    /// Rows changed by INSERT, UPDATE and DELETE since the connection opened.
+    /// Rows changed by INSERT, UPDATE and DELETE since the connection opened:
+    /// the value SQL `total_changes()` returns, read from the connection's
+    /// counter (bd-e64z4).
     #[must_use]
     pub fn total_changes(&self) -> u64 {
-        self.counter("SELECT total_changes()")
+        u64::try_from(self.as_async().total_change_count()).unwrap_or(u64::MAX)
     }
 
     /// Whether no explicit transaction is open.
@@ -1784,6 +1783,8 @@ impl Drop for Connection {
 trait EngineStatement {
     fn execute(&self, values: &[SqliteValue]) -> Result<usize>;
     fn query(&self, values: &[SqliteValue]) -> Result<Vec<crate::Row>>;
+    fn column_names(&self) -> Vec<String>;
+    fn reprepare_count(&self) -> u64;
 }
 
 impl EngineStatement for crate::PreparedStatement<'_> {
@@ -1794,6 +1795,14 @@ impl EngineStatement for crate::PreparedStatement<'_> {
     fn query(&self, values: &[SqliteValue]) -> Result<Vec<crate::Row>> {
         Ok(block_on(self.query_with_params(values))?)
     }
+
+    fn column_names(&self) -> Vec<String> {
+        Self::column_names(self)
+    }
+
+    fn reprepare_count(&self) -> u64 {
+        Self::reprepare_count(self)
+    }
 }
 
 /// A compiled statement.
@@ -1802,6 +1811,7 @@ pub struct Statement<'conn> {
     stmt: Box<dyn EngineStatement + 'conn>,
     slots: Rc<BindParameterSlots>,
     names: Vec<String>,
+    reprepare_count: u64,
 }
 
 impl fmt::Debug for Statement<'_> {
@@ -1814,10 +1824,23 @@ impl fmt::Debug for Statement<'_> {
 }
 
 impl Statement<'_> {
+    /// Refresh cached column labels if the inner `PreparedStatement`
+    /// transparently re-prepared on a schema or pragma change (bd-w9s20).
+    /// Steady-state cost is a single `u64` equality check.
+    fn sync_metadata_if_reprepared(&mut self) {
+        let current = self.stmt.reprepare_count();
+        if current != self.reprepare_count {
+            self.names = self.stmt.column_names();
+            self.reprepare_count = current;
+        }
+    }
+
     /// Run the statement with `params`; returns the number of rows changed.
     pub fn execute<P: Params>(&mut self, params: P) -> Result<usize> {
         let values = params.bind_to(&self.slots)?;
-        self.stmt.execute(&values)
+        let result = self.stmt.execute(&values);
+        self.sync_metadata_if_reprepared();
+        result
     }
 
     /// Run an INSERT that must insert exactly one row; returns its rowid.
@@ -1831,7 +1854,9 @@ impl Statement<'_> {
     /// Run the query; step through its rows with [`Rows::next`].
     pub fn query<P: Params>(&mut self, params: P) -> Result<Rows<'_>> {
         let values = params.bind_to(&self.slots)?;
-        let rows = self.stmt.query(&values)?;
+        let result = self.stmt.query(&values);
+        self.sync_metadata_if_reprepared();
+        let rows = result?;
         Ok(Rows {
             stmt: self,
             pending: rows.into_iter(),
@@ -2175,7 +2200,9 @@ impl<'conn> Transaction<'conn> {
     pub fn commit(mut self) -> Result<()> {
         // A failed COMMIT (for example, a deferred foreign-key violation)
         // leaves the SQL transaction open. Keep its drop policy armed until
-        // the engine accepts the commit, as rusqlite does.
+        // the engine accepts the commit, as rusqlite does. A BusySnapshot
+        // refusal rolls the transaction back instead; the drop then sees
+        // autocommit and does nothing.
         self.conn.execute_batch("COMMIT")?;
         self.finished = true;
         Ok(())
@@ -2692,6 +2719,69 @@ mod tests {
                 .any(|line| line.contains("ConstraintViolation")),
             "the scenario must exercise a constraint error: {theirs:?}"
         );
+    }
+
+    /// bd-e64z4: `changes()` and `total_changes()` read the connection's
+    /// counters; they ran `SELECT changes()` / `SELECT total_changes()` per
+    /// call. These are the 19 statements of the C API's
+    /// test_changes_and_total_changes_match_stock (bd-zqr9h L2), each run with
+    /// `execute_batch` on stock (rusqlite's bundled SQLite 3.54.1) and on this
+    /// API. After every statement both report the same outcome and the same
+    /// pair. Covered: statements that fail at prepare keep the count (#4,
+    /// #6 and #8; bd-rwo47), a UNIQUE failure part-way through a multi-row
+    /// UPDATE leaves 0 and adds nothing to the total (#11), an UPDATE of no
+    /// rows sets 0 (#13), DDL and SELECT keep the count. The two counters part
+    /// from #10 on, so returning one for the other fails.
+    #[test]
+    fn changes_and_total_changes_match_stock() {
+        let dir = tempfile::tempdir().unwrap();
+        let stock = rusqlite::Connection::open(temp_path(&dir, "stock.db")).unwrap();
+        let ours = Connection::open(temp_path(&dir, "fsqlite.db")).unwrap();
+        let statements = [
+            "CREATE TABLE w(x INTEGER PRIMARY KEY, y UNIQUE)",
+            "INSERT INTO w VALUES (1, 10), (2, 20), (3, 30)",
+            "SELECT count(*) FROM w",
+            "UPDATE nosuch SET x = 1",
+            "SELECT changes()",
+            "UPDATE w SET (x, nope) = (SELECT 1, 2, 3)",
+            "SELECT changes()",
+            "SELEC 1",
+            "SELECT changes()",
+            "UPDATE w SET y = y + 1 WHERE x <= 2",
+            "UPDATE w SET y = 21 WHERE x >= 1",
+            "SELECT changes()",
+            "UPDATE w SET y = y WHERE x = 99",
+            "INSERT INTO w VALUES (4, 40)",
+            "CREATE TABLE z(a)",
+            "SELECT changes()",
+            "DELETE FROM w WHERE x >= 3",
+            "SELECT changes()",
+            "SELECT total_changes()",
+        ];
+        let mut lines = Vec::new();
+        for sql in statements {
+            let theirs = (
+                stock.execute_batch(sql).is_ok(),
+                stock.changes(),
+                stock.total_changes(),
+            );
+            let mine = (
+                ours.execute_batch(sql).is_ok(),
+                ours.changes(),
+                ours.total_changes(),
+            );
+            assert_eq!(mine, theirs, "{sql}");
+            lines.push(mine);
+        }
+        assert_eq!(lines[1], (true, 3, 3));
+        assert_eq!(
+            lines[3],
+            (false, 3, 3),
+            "a prepare-time error keeps the count"
+        );
+        assert_eq!(lines[9], (true, 2, 5));
+        assert_eq!(lines[10], (false, 0, 5), "a failed UPDATE changed nothing");
+        assert_eq!(lines[18], (true, 2, 8));
     }
 
     /// rusqlite code that registers scalar functions, compiled against module
@@ -4011,6 +4101,53 @@ mod tests {
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))
             .unwrap();
         assert_eq!(check, "ok");
+    }
+
+    /// bd-71vt5 (owner decision 2026-11-17): WAL-FEC generation is opt-in, and
+    /// this API has no runtime to run the repair worker on. A default database
+    /// written at `synchronous = FULL` gets no `-wal-fec` or lock file; opting
+    /// in is refused with an error naming the PRAGMA and persists nothing; a
+    /// database opted in elsewhere is refused at open rather than written
+    /// without its repair symbols.
+    #[test]
+    fn wal_fec_is_off_by_default_and_an_opt_in_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir, "fec.db");
+        let sidecar = dir.path().join("fec.db-wal-fec");
+        let lock = dir.path().join("fec.db-wal-fec.lock");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; \
+             CREATE TABLE t(x); INSERT INTO t VALUES (1); INSERT INTO t VALUES (2);",
+        )
+        .unwrap();
+        let budget: i64 = conn
+            .query_row("PRAGMA raptorq_repair_symbols", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(budget, 0);
+        let refused = conn
+            .execute_batch("PRAGMA raptorq_repair_symbols = 2")
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("raptorq_repair_symbols"),
+            "{refused}"
+        );
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 2);
+        drop(conn);
+        assert!(!sidecar.exists() && !lock.exists());
+
+        fsqlite_wal::persist_wal_fec_raptorq_repair_symbols(&sidecar, 2).unwrap();
+        let refused = match Connection::open(&path) {
+            Ok(conn) => conn.execute_batch("PRAGMA journal_mode = WAL").unwrap_err(),
+            Err(error) => error,
+        };
+        assert!(
+            refused.to_string().contains("raptorq_repair_symbols"),
+            "{refused}"
+        );
     }
 
     /// `u64`/`usize` convert with range checks (rusqlite has them only behind

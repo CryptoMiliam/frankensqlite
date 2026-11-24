@@ -610,11 +610,9 @@ fn with_insert_target_shadow_upsert_returning_respects_nested_scopes() {
 
 /// bd-d8fxs keeper: a RETURNING subquery with its own WITH sees that scope.
 /// A nested `WITH t` shadows the statement's CTE `t`, and `q` built over the
-/// outer `t` still reads the CTE. INSERT RETURNING compiles these subqueries
-/// to NULL today (it reads the real table `t` for the shadowing case), so
-/// the keeper is ignored until bd-d8fxs lands; run it with `--ignored`.
+/// outer `t` still reads the CTE. The changed-row projection must preserve
+/// those scopes instead of compiling an unsupported subquery as NULL.
 #[test]
-#[ignore = "bd-d8fxs: INSERT RETURNING evaluates a scalar subquery over a CTE as NULL"]
 fn with_insert_returning_nested_with_scopes_match_stock() {
     asupersync::test_utils::run_test(|| async {
         for prepared in [false, true] {
@@ -649,6 +647,212 @@ fn with_insert_returning_nested_with_scopes_match_stock() {
             );
             assert_cte_dml_state(&f, &r, &label).await;
             f.close().await.unwrap();
+        }
+    });
+}
+
+#[test]
+fn insert_returning_subquery_projection_observes_each_row_before_after_triggers() {
+    asupersync::test_utils::run_test(|| async {
+        let directory = tempfile::tempdir().unwrap();
+        let cases = [
+            ("values", "VALUES(?1,?2),(?1+1,?2+1)", [11, 20, 99], 2),
+            (
+                "select",
+                "SELECT ?1,?2 UNION ALL SELECT ?1+1,?2+1",
+                [11, 20, 99],
+                2,
+            ),
+            ("defaults", "DEFAULT VALUES", [11, 20, 99], 1),
+            (
+                "upsert",
+                "VALUES(?1,?2) ON CONFLICT(k) DO UPDATE SET k=excluded.k+10,v=excluded.v+1",
+                [1, 20, 99],
+                1,
+            ),
+        ];
+        for file_backed in [false, true] {
+            for prepared in [false, true] {
+                for triggers in [false, true] {
+                    for (case, source, params, expected_count) in cases {
+                        let label = format!(
+                            "projection-{case}-file-{file_backed}-prepared-{prepared}-triggers-{triggers}"
+                        );
+                        let path = directory.path().join(format!("{label}.db"));
+                        let f = Connection::open(if file_backed {
+                            path.to_str().unwrap()
+                        } else {
+                            ":memory:"
+                        })
+                        .await
+                        .unwrap();
+                        let r = rusqlite::Connection::open_in_memory().unwrap();
+                        for setup in [
+                            "CREATE TABLE t(k INTEGER PRIMARY KEY, v INTEGER DEFAULT 7)",
+                            "CREATE TABLE audit(n INTEGER)",
+                            "INSERT INTO t VALUES(1,5)",
+                        ] {
+                            f.execute(setup).await.unwrap();
+                            r.execute_batch(setup).unwrap();
+                        }
+                        if triggers {
+                            for setup in [
+                                "CREATE TRIGGER t_before BEFORE INSERT ON t BEGIN \
+                                 INSERT INTO audit VALUES(1); END",
+                                "CREATE TRIGGER t_after AFTER INSERT ON t BEGIN \
+                                 UPDATE t SET v=v+1000 WHERE k=NEW.k; \
+                                 INSERT INTO audit VALUES(2); END",
+                                "CREATE TRIGGER t_updated AFTER UPDATE ON t BEGIN \
+                                 INSERT INTO audit VALUES(3); END",
+                            ] {
+                                f.execute(setup).await.unwrap();
+                                r.execute_batch(setup).unwrap();
+                            }
+                        }
+                        let columns = if case == "defaults" { "" } else { "(k,v)" };
+                        let sql = format!(
+                            "INSERT INTO t{columns} {source} RETURNING k,v, \
+                             (SELECT n FROM (SELECT t.v AS n)), \
+                             (WITH w(n) AS (VALUES(?3)) SELECT n FROM w), \
+                             (SELECT count(*) FROM (SELECT k FROM t) AS q WHERE q.k<=t.k), \
+                             (SELECT count(*) FROM audit WHERE t.k>0)"
+                        );
+                        let expected = cte_dml_stock_rows(&r, &sql, &params);
+                        assert_eq!(expected.len(), expected_count, "stock fixture: {label}");
+                        assert_eq!(
+                            cte_dml_frank_rows(&f, &sql, &params, prepared).await,
+                            expected,
+                            "{label}"
+                        );
+                        for check in [
+                            "SELECT k,v FROM t ORDER BY k",
+                            "SELECT n FROM audit ORDER BY rowid",
+                            "SELECT changes(),total_changes(),last_insert_rowid()",
+                            "PRAGMA integrity_check",
+                        ] {
+                            assert_eq!(
+                                cte_dml_frank_rows(&f, check, &[], false).await,
+                                cte_dml_stock_rows(&r, check, &[]),
+                                "{label}: {check}"
+                            );
+                        }
+                        f.close().await.unwrap();
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn insert_returning_projection_error_rolls_back_rows_and_trigger_effects() {
+    asupersync::test_utils::run_test(|| async {
+        let directory = tempfile::tempdir().unwrap();
+        for file_backed in [false, true] {
+            for prepared in [false, true] {
+                for (explicit_transaction, with_triggers) in
+                    [(false, false), (false, true), (true, false), (true, true)]
+                {
+                    for (case, source) in [
+                        ("one", "VALUES(11,?1)"),
+                        ("many", "VALUES(11,20),(12,?1)"),
+                    ] {
+                        let label = format!(
+                            "projection-error-{case}-file-{file_backed}-prepared-{prepared}-explicit-{explicit_transaction}-triggers-{with_triggers}"
+                        );
+                        let path = directory.path().join(format!("{label}.db"));
+                        let f = Connection::open(if file_backed {
+                            path.to_str().unwrap()
+                        } else {
+                            ":memory:"
+                        })
+                        .await
+                        .unwrap();
+                        let r = rusqlite::Connection::open_in_memory().unwrap();
+                        for setup in [
+                            "CREATE TABLE t(k INTEGER PRIMARY KEY,v INTEGER)",
+                            "CREATE TABLE audit(n INTEGER)",
+                        ] {
+                            f.execute(setup).await.unwrap();
+                            r.execute_batch(setup).unwrap();
+                        }
+                        if with_triggers {
+                            for setup in [
+                                "CREATE TRIGGER t_before BEFORE INSERT ON t BEGIN \
+                                 INSERT INTO audit VALUES(NEW.k); END",
+                                "CREATE TRIGGER t_after AFTER INSERT ON t BEGIN \
+                                 INSERT INTO audit VALUES(-NEW.k); END",
+                            ] {
+                                f.execute(setup).await.unwrap();
+                                r.execute_batch(setup).unwrap();
+                            }
+                        }
+                        if explicit_transaction {
+                            f.execute("BEGIN").await.unwrap();
+                            r.execute_batch("BEGIN").unwrap();
+                        }
+                        f.execute("INSERT INTO t VALUES(1,5)").await.unwrap();
+                        r.execute_batch("INSERT INTO t VALUES(1,5)").unwrap();
+                        let sql = format!(
+                            "INSERT INTO t(k,v) {source} RETURNING k, \
+                             (SELECT abs(n) FROM (SELECT t.v AS n))"
+                        );
+                        let stock_error = {
+                            let mut statement = r.prepare(&sql).unwrap();
+                            let mut rows = statement.query([i64::MIN]).unwrap();
+                            match rows.next() {
+                                Err(error) => error,
+                                Ok(_) => panic!("stock projection must overflow: {label}"),
+                            }
+                        };
+                        assert!(stock_error.to_string().contains("overflow"), "{label}");
+                        let params = [SqliteValue::Integer(i64::MIN)];
+                        let frank_error = if prepared {
+                            f.prepare(&sql)
+                                .await
+                                .unwrap()
+                                .query_with_params(&params)
+                                .await
+                                .unwrap_err()
+                        } else {
+                            f.query_with_params(&sql, &params).await.unwrap_err()
+                        };
+                        assert!(
+                            frank_error.to_string().contains("overflow"),
+                            "{label}: {frank_error}"
+                        );
+                        for check in [
+                            "SELECT k,v FROM t ORDER BY k",
+                            "SELECT n FROM audit ORDER BY rowid",
+                            "PRAGMA integrity_check",
+                        ] {
+                            assert_eq!(
+                                cte_dml_frank_rows(&f, check, &[], false).await,
+                                cte_dml_stock_rows(&r, check, &[]),
+                                "{label}: {check}"
+                            );
+                        }
+                        let later = "INSERT INTO t VALUES(90,90)";
+                        f.execute(later).await.unwrap();
+                        r.execute_batch(later).unwrap();
+                        if explicit_transaction {
+                            f.execute("COMMIT").await.unwrap();
+                            r.execute_batch("COMMIT").unwrap();
+                        }
+                        for check in [
+                            "SELECT k,v FROM t ORDER BY k",
+                            "SELECT n FROM audit ORDER BY rowid",
+                        ] {
+                            assert_eq!(
+                                cte_dml_frank_rows(&f, check, &[], false).await,
+                                cte_dml_stock_rows(&r, check, &[]),
+                                "{label}: after retry: {check}"
+                            );
+                        }
+                        f.close().await.unwrap();
+                    }
+                }
+            }
         }
     });
 }
@@ -877,7 +1081,7 @@ fn dysy4_forward_cte_shadows_outer_table() {
 }
 
 #[test]
-fn dysy4_qualified_cte_collision_keeps_existing_explicit_refusal() {
+fn dysy4_qualified_cte_collision_reads_the_table_like_stock() {
     asupersync::test_utils::run_test(|| async {
         let f = Connection::open(":memory:").await.unwrap();
         let r = rusqlite::Connection::open_in_memory().unwrap();
@@ -885,13 +1089,16 @@ fn dysy4_qualified_cte_collision_keeps_existing_explicit_refusal() {
             f.execute(sql).await.unwrap();
             r.execute_batch(sql).unwrap();
         }
-        // This pre-existing namespace limitation is outside the unqualified
-        // sibling-resolution fix. Do not silently read the CTE as main.a.
+        // A schema-qualified name never names a CTE: q reads the table a, not
+        // the sibling CTE a. fsqlite refused this shape while its catalog
+        // could not keep the two apart (bd-mm6ec); it must never read the
+        // CTE as main.a.
         let sql = "WITH q AS (SELECT v FROM main.a), a(v) AS (VALUES(2)) SELECT v FROM q";
         let stock: i64 = r.query_row(sql, [], |row| row.get(0)).unwrap();
         assert_eq!(stock, 1);
-        let error = f.query(sql).await.expect_err("qualified collision remains unsupported");
-        assert!(matches!(error, fsqlite_error::FrankenError::NotImplemented(_)), "{error}");
+        let got = f.query(sql).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].values(), &[SqliteValue::Integer(stock)]);
         let rows = f.query("SELECT v FROM main.a").await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values(), &[SqliteValue::Integer(stock)]);
@@ -1090,5 +1297,221 @@ fn cte_composition_edges_match_rusqlite_oracle() {
             diffs.len(),
             diffs.join("\n")
         );
+    });
+}
+
+/// bd-tjaw5: exact repro — `WITH c(x) AS (...) INSERT INTO t(k, v) SELECT ...
+/// ON CONFLICT(k) DO UPDATE SET v = excluded.v WHERE excluded.k IN (SELECT x FROM c WHERE x > 1)`
+/// with BEFORE INSERT and AFTER UPDATE triggers on `t`, across `:memory:` and
+/// file-backed databases, direct and prepared execution, repeated runs, and reopen.
+#[test]
+fn bd_tjaw5_with_insert_upsert_where_in_cte_survives_triggers() {
+    asupersync::test_utils::run_test(|| async {
+        let directory = tempfile::tempdir().unwrap();
+        let sql = "WITH c(x) AS (SELECT x FROM src) \
+                   INSERT INTO t(k, v) SELECT x, x * 100 FROM c WHERE true \
+                   ON CONFLICT(k) DO UPDATE SET v = excluded.v \
+                   WHERE excluded.k IN (SELECT x FROM c WHERE x > 1)";
+        for file_backed in [false, true] {
+            for prepared in [false, true] {
+                for triggers in [true, false] {
+                    let label = format!(
+                        "bd_tjaw5-file-{file_backed}-prepared-{prepared}-triggers-{triggers}"
+                    );
+                    let path = directory.path().join(format!("{label}.db"));
+                    let f = Connection::open(if file_backed {
+                        path.to_str().unwrap()
+                    } else {
+                        ":memory:"
+                    })
+                    .await
+                    .unwrap();
+                    let r = rusqlite::Connection::open_in_memory().unwrap();
+                    cte_dml_setup(&f, &r, triggers).await;
+
+                    for execution in 0..2 {
+                        let expected = cte_dml_stock_rows(&r, sql, &[]);
+                        let actual = cte_dml_frank_rows(&f, sql, &[], prepared).await;
+                        assert!(expected.is_empty(), "{label}: UPSERT has no RETURNING");
+                        assert_eq!(actual, expected, "{label}, execution={execution}");
+                        assert_cte_dml_state(&f, &r, &format!("{label} exec={execution}")).await;
+                        if execution == 0 {
+                            assert_eq!(r.changes(), 2, "{label}: stock changes() on first run");
+                        }
+                        let error = f
+                            .query("SELECT x FROM c")
+                            .await
+                            .expect_err("CTE must stay scoped");
+                        assert!(error.to_string().contains("no such table"), "{error}");
+                    }
+                    f.close().await.unwrap();
+                    if file_backed {
+                        let reopened = Connection::open(path.to_str().unwrap()).await.unwrap();
+                        for query in [
+                            "SELECT k,v,note FROM t ORDER BY k",
+                            "SELECT id,msg FROM log ORDER BY id",
+                        ] {
+                            assert_eq!(
+                                cte_dml_frank_rows(&reopened, query, &[], false).await,
+                                cte_dml_stock_rows(&r, query, &[]),
+                                "{label} after reopen: {query}"
+                            );
+                        }
+                        reopened.close().await.unwrap();
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// bd-tjaw5 extended: harder `IN` shapes over CTEs inside `ON CONFLICT DO UPDATE WHERE`
+/// with triggers — `NOT IN`, `ORDER BY / LIMIT`, compound `UNION`, correlated outer
+/// references to `t` and `excluded`, target-shadowing CTE `WITH t(x)`, bare table
+/// shorthand `IN c`, and a `WITHOUT ROWID` target.
+#[test]
+fn bd_tjaw5_with_insert_upsert_where_in_cte_extended_edges() {
+    asupersync::test_utils::run_test(|| async {
+        let directory = tempfile::tempdir().unwrap();
+        let cases: &[(&str, &str)] = &[
+            (
+                "not_in_with_null",
+                "WITH c(x) AS (SELECT x FROM src UNION ALL SELECT NULL) \
+                 INSERT INTO t(k, v) SELECT x, x * 100 FROM src WHERE true \
+                 ON CONFLICT(k) DO UPDATE SET v = excluded.v \
+                 WHERE excluded.k NOT IN (SELECT x FROM c WHERE x > 2)",
+            ),
+            (
+                "order_limit_in_cte",
+                "WITH c(x) AS (SELECT x FROM src) \
+                 INSERT INTO t(k, v) SELECT x, x * 100 FROM c WHERE true \
+                 ON CONFLICT(k) DO UPDATE SET v = excluded.v \
+                 WHERE excluded.k IN (SELECT x FROM c WHERE x > 1 ORDER BY x DESC LIMIT 2)",
+            ),
+            (
+                "compound_union_in_cte",
+                "WITH c(x) AS (SELECT x FROM src) \
+                 INSERT INTO t(k, v) SELECT x, x * 100 FROM c WHERE true \
+                 ON CONFLICT(k) DO UPDATE SET v = excluded.v \
+                 WHERE excluded.k IN (SELECT x FROM c WHERE x = 2 UNION SELECT 99)",
+            ),
+            (
+                "correlated_existing_t_in_cte",
+                "WITH c(x) AS (SELECT x FROM src) \
+                 INSERT INTO t(k, v) SELECT x, x * 100 FROM c WHERE true \
+                 ON CONFLICT(k) DO UPDATE SET v = excluded.v \
+                 WHERE excluded.k IN (SELECT x FROM c WHERE x > t.k - 1 AND x > 1)",
+            ),
+            (
+                "correlated_excluded_in_cte",
+                "WITH c(x) AS (SELECT x FROM src) \
+                 INSERT INTO t(k, v) SELECT x, x * 100 FROM c WHERE true \
+                 ON CONFLICT(k) DO UPDATE SET v = excluded.v \
+                 WHERE t.k IN (SELECT x FROM c WHERE x = excluded.k AND x > 1)",
+            ),
+            (
+                "shadowing_target_cte",
+                "WITH t(x) AS (SELECT x FROM src) \
+                 INSERT INTO t(k, v) SELECT x, x * 100 FROM t WHERE true \
+                 ON CONFLICT(k) DO UPDATE SET v = excluded.v \
+                 WHERE excluded.k IN (SELECT x FROM t WHERE x > 1)",
+            ),
+            (
+                "bare_cte_table_shorthand",
+                "WITH c(x) AS (SELECT x FROM src WHERE x > 1) \
+                 INSERT INTO t(k, v) SELECT x, x * 100 FROM src WHERE true \
+                 ON CONFLICT(k) DO UPDATE SET v = excluded.v \
+                 WHERE excluded.k IN c",
+            ),
+            (
+                "excluded_nonkey_col_in_cte",
+                "WITH c(x) AS (SELECT x FROM src) \
+                 INSERT INTO t(k, v) SELECT x, x * 100 FROM c WHERE true \
+                 ON CONFLICT(k) DO UPDATE SET v = excluded.v \
+                 WHERE excluded.v IN (SELECT x * 100 FROM c WHERE x > 1)",
+            ),
+            (
+                "correlated_excluded_not_in_with_null",
+                "WITH c(x) AS (SELECT x FROM src UNION ALL SELECT NULL) \
+                 INSERT INTO t(k, v) SELECT x, x * 100 FROM src WHERE true \
+                 ON CONFLICT(k) DO UPDATE SET v = excluded.v \
+                 WHERE excluded.k NOT IN (SELECT x FROM c WHERE x IS NULL OR x > t.k)",
+            ),
+        ];
+
+        for &(name, sql) in cases {
+            for file_backed in [false, true] {
+                for prepared in [false, true] {
+                    let label = format!("bd_tjaw5_{name}-file-{file_backed}-prepared-{prepared}");
+                    let path = directory.path().join(format!("{label}.db"));
+                    let f = Connection::open(if file_backed {
+                        path.to_str().unwrap()
+                    } else {
+                        ":memory:"
+                    })
+                    .await
+                    .unwrap();
+                    let r = rusqlite::Connection::open_in_memory().unwrap();
+                    cte_dml_setup(&f, &r, true).await;
+
+                    let expected = cte_dml_stock_rows(&r, sql, &[]);
+                    let actual = cte_dml_frank_rows(&f, sql, &[], prepared).await;
+                    assert_eq!(actual, expected, "{label}");
+                    assert_cte_dml_state(&f, &r, &label).await;
+                    f.close().await.unwrap();
+                }
+            }
+        }
+
+        // WITHOUT ROWID target with BEFORE INSERT + AFTER UPDATE triggers.
+        let wr_sql = "WITH c(x) AS (SELECT x FROM src) \
+                      INSERT INTO wr(k, v) SELECT x, x * 100 FROM c WHERE true \
+                      ON CONFLICT(k) DO UPDATE SET v = excluded.v \
+                      WHERE excluded.k IN (SELECT x FROM c WHERE x > 1)";
+        for file_backed in [false, true] {
+            for prepared in [false, true] {
+                let label = format!("bd_tjaw5_without_rowid-file-{file_backed}-prepared-{prepared}");
+                let path = directory.path().join(format!("{label}.db"));
+                let f = Connection::open(if file_backed {
+                    path.to_str().unwrap()
+                } else {
+                    ":memory:"
+                })
+                .await
+                .unwrap();
+                let r = rusqlite::Connection::open_in_memory().unwrap();
+                for stmt in [
+                    "CREATE TABLE wr(k INTEGER PRIMARY KEY, v INTEGER, note TEXT) WITHOUT ROWID",
+                    "CREATE TABLE src(x INTEGER)",
+                    "CREATE TABLE log(id INTEGER PRIMARY KEY, msg TEXT)",
+                    "INSERT INTO src VALUES (1),(2),(3)",
+                    "INSERT INTO wr VALUES (1,10,'old'),(2,20,'old')",
+                    "CREATE TRIGGER wr_ins BEFORE INSERT ON wr \
+                     WHEN (SELECT count(*) FROM log) >= 0 BEGIN \
+                     INSERT INTO log(msg) VALUES \
+                       ('ins ' || NEW.k || ' seen ' || (SELECT count(*) FROM log)); END",
+                    "CREATE TRIGGER wr_upd AFTER UPDATE ON wr BEGIN \
+                     INSERT INTO log(msg) VALUES ('upd ' || NEW.k || ' ' || NEW.v); END",
+                ] {
+                    f.execute(stmt).await.unwrap();
+                    r.execute_batch(stmt).unwrap();
+                }
+                let expected = cte_dml_stock_rows(&r, wr_sql, &[]);
+                let actual = cte_dml_frank_rows(&f, wr_sql, &[], prepared).await;
+                assert_eq!(actual, expected, "{label}");
+                for check_sql in [
+                    "SELECT changes()",
+                    "SELECT k,v,note FROM wr ORDER BY k",
+                    "SELECT id,msg FROM log ORDER BY id",
+                ] {
+                    assert_eq!(
+                        cte_dml_frank_rows(&f, check_sql, &[], false).await,
+                        cte_dml_stock_rows(&r, check_sql, &[]),
+                        "{label}: {check_sql}"
+                    );
+                }
+                f.close().await.unwrap();
+            }
+        }
     });
 }

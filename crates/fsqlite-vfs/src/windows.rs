@@ -96,8 +96,7 @@ fn blocking_io_offset(offset: u64, total: usize, op: &'static str) -> std::io::R
     })
 }
 
-fn read_owned_at(file: &File, len: usize, offset: u64) -> std::io::Result<(Vec<u8>, usize)> {
-    let mut data = vec![0_u8; len];
+fn read_into_at(file: &File, data: &mut [u8], offset: u64) -> std::io::Result<usize> {
     let mut total = 0_usize;
     while total < data.len() {
         let current = blocking_io_offset(offset, total, "read")?;
@@ -108,6 +107,13 @@ fn read_owned_at(file: &File, len: usize, offset: u64) -> std::io::Result<(Vec<u
             Err(error) => return Err(error),
         }
     }
+    data[total..].fill(0);
+    Ok(total)
+}
+
+fn read_owned_at(file: &File, len: usize, offset: u64) -> std::io::Result<(Vec<u8>, usize)> {
+    let mut data = vec![0_u8; len];
+    let total = read_into_at(file, &mut data, offset)?;
     Ok((data, total))
 }
 
@@ -1561,15 +1567,13 @@ impl Vfs for WindowsVfs {
         Ok(())
     }
 
-    fn sync_parent_directory(&self, _cx: &Cx, _path: &Path) -> Result<()> {
-        // Win32 does not expose a portable fsync-directory operation. SQLite's
-        // own Windows VFS establishes journal create/delete durability through
-        // FlushFileBuffers on the journal handle, which `WindowsFile::sync_all`
-        // performs before this hook is reached. Keep the namespace hook an
-        // explicit no-op rather than attempting FlushFileBuffers on a directory
-        // handle (unsupported on common filesystems and liable to return
-        // ERROR_INVALID_HANDLE).
-        Ok(())
+    fn sync_parent_directory(&self, _cx: &Cx, path: &Path) -> Result<()> {
+        // Attempt a best-effort parent-directory flush after rename-over
+        // commits, WAL/journal creation, and durable deletes. See
+        // `host_fs::sync_directory` for the Win32 contract caveat and
+        // non-NTFS/SMB/ACL fallback behavior.
+        let resolved = resolve_path(path)?;
+        crate::host_fs::sync_parent_directory(&resolved)
     }
 
     fn access(&self, _cx: &Cx, path: &Path, flags: AccessFlags) -> Result<bool> {
@@ -1619,6 +1623,21 @@ pub struct WindowsFile {
 }
 
 impl WindowsFile {
+    /// Synchronous positional read for callers such as the sorter that cannot suspend.
+    pub fn read_at_sync(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        checkpoint_or_abort(cx)?;
+        let total = read_into_at(self.file_ref()?, buf, offset)?;
+        checkpoint_or_abort(cx)?;
+        Ok(total)
+    }
+
+    /// Synchronous positional write that retries interrupted and partial writes.
+    pub fn write_at_sync(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        write_owned_at(self.file_ref()?, buf, offset)?;
+        checkpoint_or_abort(cx)
+    }
+
     fn is_closed(&self) -> bool {
         self.file.is_none() && self.os_locks.is_none()
     }
@@ -6463,6 +6482,29 @@ mod tests {
         assert!(query_output.status.success());
         let stdout = String::from_utf8(query_output.stdout).expect("utf8");
         assert_eq!(stdout.trim(), "4");
+    }
+
+    #[test]
+    fn test_windowsvfs_sync_parent_directory_and_durable_delete() {
+        let cx = Cx::new();
+        let vfs = WindowsVfs::new();
+        let dir = tempdir().expect("temp dir");
+        let file_path = dir.path().join("rename_commit.db");
+        fs::write(&file_path, b"committed").expect("write test file");
+
+        vfs.sync_parent_directory(&cx, &file_path)
+            .expect("sync_parent_directory should succeed for existing parent");
+        vfs.delete(&cx, &file_path, true)
+            .expect("durable delete with sync_dir=true should succeed");
+
+        let missing_parent_file = dir.path().join("missing_subdir").join("orphan.db");
+        let err = vfs
+            .sync_parent_directory(&cx, &missing_parent_file)
+            .expect_err("sync_parent_directory must propagate NotFound for missing parent");
+        assert!(
+            matches!(err, FrankenError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound),
+            "expected Io(NotFound) for missing parent directory, got {err:?}"
+        );
     }
 
     #[test]

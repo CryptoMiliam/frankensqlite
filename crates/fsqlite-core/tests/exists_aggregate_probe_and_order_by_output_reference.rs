@@ -196,6 +196,145 @@ fn exists_does_not_evaluate_its_result_list() {
     });
 }
 
+/// bd-b887p: an EXISTS stops at its subquery's first row, uncorrelated (folded
+/// once) or correlated, so a later row whose WHERE would raise an error is
+/// never evaluated, as in stock. A LIMIT / OFFSET of its own, an aggregate,
+/// GROUP BY / HAVING, a compound, ORDER BY and a join keep their answers.
+#[test]
+fn exists_stops_at_its_first_row() {
+    asupersync::test_utils::run_test(|| async {
+        let past_first = "CASE WHEN x = 2 THEN abs(-9223372036854775807 - 1) ELSE 1 END";
+        assert_matches_sqlite(
+            &format!("SELECT EXISTS (SELECT 1 FROM kx WHERE {past_first})"),
+            &[&["1"]],
+        )
+        .await;
+        assert_matches_sqlite(
+            &format!("SELECT count(*) FROM oc WHERE EXISTS (SELECT 1 FROM kx WHERE {past_first})"),
+            &[&["4"]],
+        )
+        .await;
+        assert_matches_sqlite(
+            &format!(
+                "SELECT count(*) FROM oc WHERE NOT EXISTS (SELECT 1 FROM kx WHERE {past_first})"
+            ),
+            &[&["0"]],
+        )
+        .await;
+        // Correlated: the first row in key or rowid order (x = 1) matches
+        // every outer row, so no plan reaches x = 5 (stock 3.54.1 does reach
+        // it through `k2.x >= oc.z`).
+        assert_matches_sqlite(
+            "SELECT oc.z FROM oc JOIN kx ON kx.x = oc.z WHERE EXISTS \
+             (SELECT 1 FROM kx AS k2 WHERE k2.x <= oc.z \
+             AND CASE WHEN k2.x = 5 THEN abs(-9223372036854775807 - 1) ELSE 1 END) \
+             ORDER BY oc.z",
+            &[&["1"], &["2"]],
+        )
+        .await;
+        for (sql, expected) in [
+            (
+                "SELECT EXISTS (SELECT 1 FROM kx LIMIT 1 OFFSET 2), \
+                 EXISTS (SELECT 1 FROM kx LIMIT 1 OFFSET 3), EXISTS (SELECT 1 FROM kx LIMIT 0)",
+                ["1", "0", "0"].as_slice(),
+            ),
+            (
+                "SELECT EXISTS (SELECT count(*) FROM kx WHERE x > 100), \
+                 EXISTS (SELECT 1 FROM kx WHERE x > 100)",
+                ["1", "0"].as_slice(),
+            ),
+            (
+                "SELECT EXISTS (SELECT x FROM kx GROUP BY x HAVING count(*) > 1), \
+                 EXISTS (SELECT x FROM kx GROUP BY x HAVING count(*) = 1)",
+                ["0", "1"].as_slice(),
+            ),
+            (
+                "SELECT EXISTS (SELECT x FROM kx WHERE x > 4 UNION SELECT z FROM oc WHERE z > 99), \
+                 EXISTS (SELECT t FROM kx ORDER BY t DESC)",
+                ["1", "1"].as_slice(),
+            ),
+            (
+                "SELECT EXISTS (SELECT 1 FROM kx JOIN oc ON oc.z = kx.x WHERE oc.w = 'q')",
+                ["1"].as_slice(),
+            ),
+        ] {
+            assert_matches_sqlite(sql, &[expected]).await;
+        }
+    });
+}
+
+/// bd-b887p: a folded true EXISTS leaves a TRUE literal conjunct, dropped so
+/// the rest of the WHERE keeps its access path; a false one keeps the WHERE
+/// false. Alone, beside other conjuncts, and in a compound arm.
+#[test]
+fn folded_exists_conjuncts_keep_their_answers() {
+    asupersync::test_utils::run_test(|| async {
+        for (sql, expected) in [
+            (
+                "SELECT count(*) FROM oc WHERE z > 1 AND EXISTS (SELECT 1 FROM kx WHERE x = 5)",
+                "2",
+            ),
+            (
+                "SELECT count(*) FROM oc WHERE EXISTS (SELECT 1 FROM kx WHERE x = 5)",
+                "4",
+            ),
+            (
+                "SELECT count(*) FROM oc WHERE z > 1 AND NOT EXISTS (SELECT 1 FROM kx WHERE x = 5)",
+                "0",
+            ),
+            (
+                "SELECT count(*) FROM oc WHERE EXISTS (SELECT 1 FROM kx) AND z IS NULL",
+                "1",
+            ),
+        ] {
+            assert_matches_sqlite(sql, &[&[expected]]).await;
+        }
+        assert_matches_sqlite(
+            "SELECT z FROM oc WHERE EXISTS (SELECT 1 FROM kx) AND z < 3 \
+             UNION ALL SELECT x FROM kx WHERE 1 AND EXISTS (SELECT 1 FROM oc WHERE z = 3) \
+             ORDER BY 1",
+            &[&["1"], &["1"], &["2"], &["2"], &["5"]],
+        )
+        .await;
+    });
+}
+
+/// bd-wp9s1: a scalar subquery reads only its first row, uncorrelated (folded
+/// once) or correlated, so a later row whose WHERE would raise an error is
+/// never evaluated, as in stock. ORDER BY, LIMIT / OFFSET, an aggregate and an
+/// empty subquery keep their answers.
+#[test]
+fn scalar_subquery_reads_only_its_first_row() {
+    asupersync::test_utils::run_test(|| async {
+        let past_first = "CASE WHEN x = 2 THEN abs(-9223372036854775807 - 1) ELSE 1 END";
+        assert_matches_sqlite(
+            &format!("SELECT (SELECT x FROM kx WHERE {past_first})"),
+            &[&["1"]],
+        )
+        .await;
+        assert_matches_sqlite(
+            &format!("SELECT count(*) FROM oc WHERE z = (SELECT x FROM kx WHERE {past_first})"),
+            &[&["1"]],
+        )
+        .await;
+        // Correlated: the first row in key or rowid order (x = 1) qualifies
+        // for every outer row, so no plan reaches x = 5.
+        assert_matches_sqlite(
+            "SELECT z, (SELECT k2.x FROM kx AS k2 WHERE k2.x <= oc.z \
+             AND CASE WHEN k2.x = 5 THEN abs(-9223372036854775807 - 1) ELSE 1 END) \
+             FROM oc WHERE z IS NOT NULL ORDER BY z",
+            &[&["1", "1"], &["2", "1"], &["3", "1"]],
+        )
+        .await;
+        assert_matches_sqlite(
+            "SELECT (SELECT x FROM kx ORDER BY x DESC), (SELECT x FROM kx LIMIT 1 OFFSET 1), \
+             (SELECT count(*) FROM kx), (SELECT x FROM kx WHERE x > 100)",
+            &[&["5", "2", "3", "NULL"]],
+        )
+        .await;
+    });
+}
+
 /// GH#427: a correlated EXISTS in the result list over an aggregate subquery
 /// is true for every outer row, like the WHERE-clause form above.
 #[test]

@@ -61,6 +61,7 @@ const WAL_REPLAY_READ_BYTES: usize = 64 * 1024;
 /// frames returned before a short/torn tail inside one batch.
 struct WalFrameReader {
     frame_size: usize,
+    frames_per_read: usize,
     next_frame: usize,
     end_frame: usize,
     buffer: Vec<u8>,
@@ -75,9 +76,12 @@ impl WalFrameReader {
             .min(end.saturating_sub(start).max(1));
         Self {
             frame_size,
+            frames_per_read,
             next_frame: start,
             end_frame: end,
-            buffer: vec![0; frame_size * frames_per_read],
+            // Allocated by the first read, so a reader over an empty range
+            // allocates nothing.
+            buffer: Vec::new(),
             position: 0,
             available: 0,
         }
@@ -88,6 +92,9 @@ impl WalFrameReader {
             return Ok(None);
         }
         if self.position + self.frame_size > self.available {
+            if self.buffer.is_empty() {
+                self.buffer = vec![0; self.frame_size * self.frames_per_read];
+            }
             // A VFS may cap a read without reaching EOF. Consume every complete
             // frame first, then resume at the next frame boundary. Any partial
             // fragment is reread; only a read shorter than one frame has the
@@ -364,6 +371,56 @@ pub struct WalFile<F: VfsFile> {
     /// last header seen, for its page size; nothing may be appended until a
     /// header is bound again.
     headerless_observation: Option<u64>,
+    /// The previous generation's frames this handle knows lie past its
+    /// prefix (bd-2qo7z). A checkpoint that restarts the WAL in place leaves
+    /// them there until the new generation outgrows them. Recorded when a
+    /// scan of the current generation stops on their salts; while it holds,
+    /// [`Self::refresh`] reads one frame header before it reads a batch
+    /// (bd-w4pr1.7 L1). Without it every refresh and replay batches from its
+    /// first read.
+    stale_tail: Option<StaleTail>,
+    /// Boundary where the last full WAL scan (`open` or `rebuild_state_from_file`)
+    /// stopped before the end of the file (bd-1hi.11). `None` for a clean WAL.
+    last_scan_stop: Option<WalScanStopKind>,
+}
+
+/// Reason a full WAL scan (`open` or `rebuild_state_from_file`) stopped before
+/// the end of the physical WAL file (bd-1hi.11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalScanStopKind {
+    /// Checksum mismatch, zero page number, short frame read, or a partial
+    /// trailing frame containing at least a complete 24-byte frame header.
+    FrameDamage {
+        /// One-based physical WAL frame number at the damage boundary.
+        frame_no: u32,
+    },
+    /// Frame salt differed from the WAL header's current salts. This is normal
+    /// for a stale tail after a checkpoint reset, or can indicate a corrupted
+    /// salt field inside a committed frame of the current generation.
+    SaltMismatch {
+        /// One-based physical WAL frame number where salts diverged.
+        frame_no: u32,
+    },
+}
+
+impl WalScanStopKind {
+    /// One-based physical WAL frame number where the scan stopped.
+    #[must_use]
+    pub const fn frame_no(self) -> u32 {
+        match self {
+            Self::FrameDamage { frame_no } | Self::SaltMismatch { frame_no } => frame_no,
+        }
+    }
+}
+
+/// Where a scan of the current WAL generation found frames of another
+/// generation (bd-2qo7z).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StaleTail {
+    /// The generation whose scan stopped on them.
+    salts: WalSalts,
+    /// Frames the file held when the scan stopped: the stale frames end here.
+    end_frames: usize,
 }
 
 impl<F: VfsFile> WalFile<F> {
@@ -460,8 +517,45 @@ impl<F: VfsFile> WalFile<F> {
         let mut validated_headers = Vec::new();
         let record_headers = self.frame_headers.len() == self.frame_count;
 
-        let mut frames = WalFrameReader::new(frame_size, self.frame_count, available_frames);
-        for frame_index in self.frame_count..available_frames {
+        // A checkpoint that restarts the WAL in place leaves the previous
+        // generation's frames past this generation's end, so until the new
+        // generation outgrows them every refresh finds frames past
+        // `frame_count`. The loop below would read up to
+        // `WAL_REPLAY_READ_BYTES` of them into a zeroed buffer only to stop at
+        // the first one's salts. When a scan of this generation already found
+        // that stale tail ahead of the prefix, read the first frame's header
+        // alone first: when it is whole and its salts are not this
+        // generation's, the loop would accept nothing, so it scans no frame. A
+        // short read or matching salts runs the loop exactly as before
+        // (bd-w4pr1.7). With no stale tail known, the frames past the prefix
+        // are a peer's or a replay's, and the loop reads them in one batch
+        // from the first, with no header read ahead of it (bd-2qo7z).
+        let scan_end = if self.stale_tail_ahead() {
+            let mut first_header = [0u8; WAL_FRAME_HEADER_SIZE];
+            let first_header_read = self
+                .file
+                .read(cx, &mut first_header, self.frame_offset(self.frame_count))
+                .await?;
+            if first_header_read == WAL_FRAME_HEADER_SIZE
+                && WalFrameHeader::from_bytes(&first_header)?.salts != self.header.salts
+            {
+                log_replay_decision(
+                    "refresh_incremental",
+                    self.frame_count.saturating_add(1),
+                    last_commit_count,
+                    "salt_mismatch_stop",
+                );
+                self.frame_count
+            } else {
+                available_frames
+            }
+        } else {
+            self.stale_tail = None;
+            available_frames
+        };
+
+        let mut frames = WalFrameReader::new(frame_size, self.frame_count, scan_end);
+        for frame_index in self.frame_count..scan_end {
             let frame_no = frame_index.saturating_add(1);
             let Some(frame_buf) = frames.next(cx, &self.file).await? else {
                 log_replay_decision(
@@ -481,6 +575,7 @@ impl<F: VfsFile> WalFile<F> {
                     last_commit_count,
                     "salt_mismatch_stop",
                 );
+                self.note_stale_tail(available_frames);
                 break; // End of valid chain for this generation.
             }
 
@@ -724,6 +819,8 @@ impl<F: VfsFile> WalFile<F> {
         // remembered headers belong to the prior view as well.
         self.last_fsynced_frame_count = 0;
         self.frame_headers.clear();
+        self.stale_tail = None;
+        self.last_scan_stop = None;
 
         // A torn read of an in-progress header rewrite is retried (bd-mlz2t).
         let Some((header, header_checksum)) =
@@ -756,16 +853,17 @@ impl<F: VfsFile> WalFile<F> {
 
         let frame_size = self.frame_size();
         let file_size = self.file.file_size(cx)?;
-        let max_frames = usize::try_from(
-            file_size.saturating_sub(u64::try_from(WAL_HEADER_SIZE).unwrap_or(0))
-                / u64::try_from(frame_size).unwrap_or(1),
-        )
-        .unwrap_or(usize::MAX);
+        let data_bytes = file_size.saturating_sub(u64::try_from(WAL_HEADER_SIZE).unwrap_or(0));
+        let frame_size_u64 = u64::try_from(frame_size).unwrap_or(1);
+        let max_frames = usize::try_from(data_bytes / frame_size_u64).unwrap_or(usize::MAX);
+        let partial_tail_bytes = data_bytes % frame_size_u64;
 
         let mut validated_headers = Vec::new();
+        let mut scan_stop = None;
         let mut frames = WalFrameReader::new(frame_size, 0, max_frames);
         for frame_index in 0..max_frames {
             let frame_no = frame_index.saturating_add(1);
+            let frame_no_u32 = u32::try_from(frame_no).unwrap_or(u32::MAX);
             let Some(frame_buf) = frames.next(cx, &self.file).await? else {
                 log_replay_decision(
                     "rebuild",
@@ -773,16 +871,26 @@ impl<F: VfsFile> WalFile<F> {
                     last_commit_count,
                     "truncated_tail_stop",
                 );
+                scan_stop = Some(WalScanStopKind::FrameDamage {
+                    frame_no: frame_no_u32,
+                });
                 break;
             };
 
             let frame_header = WalFrameHeader::from_bytes(&frame_buf[..WAL_FRAME_HEADER_SIZE])?;
             if frame_header.page_number == 0 {
                 log_replay_decision("rebuild", frame_no, last_commit_count, "zero_page_stop");
+                scan_stop = Some(WalScanStopKind::FrameDamage {
+                    frame_no: frame_no_u32,
+                });
                 break;
             }
             if frame_header.salts != self.header.salts {
                 log_replay_decision("rebuild", frame_no, last_commit_count, "salt_mismatch_stop");
+                self.note_stale_tail(max_frames);
+                scan_stop = Some(WalScanStopKind::SaltMismatch {
+                    frame_no: frame_no_u32,
+                });
                 break;
             }
 
@@ -799,6 +907,9 @@ impl<F: VfsFile> WalFile<F> {
                     last_commit_count,
                     "checksum_mismatch_stop",
                 );
+                scan_stop = Some(WalScanStopKind::FrameDamage {
+                    frame_no: frame_no_u32,
+                });
                 break;
             }
 
@@ -817,12 +928,20 @@ impl<F: VfsFile> WalFile<F> {
                 log_replay_decision("rebuild", frame_no, last_commit_count, "accept_non_commit");
             }
         }
+        if scan_stop.is_none()
+            && partial_tail_bytes >= u64::try_from(WAL_FRAME_HEADER_SIZE).unwrap_or(24)
+        {
+            scan_stop = Some(WalScanStopKind::FrameDamage {
+                frame_no: u32::try_from(max_frames.saturating_add(1)).unwrap_or(u32::MAX),
+            });
+        }
 
         self.frame_count = last_commit_count;
         self.running_checksum = last_commit_checksum;
         self.last_commit = last_commit;
         self.frame_headers = validated_headers;
         self.trim_recorded_frame_headers();
+        self.last_scan_stop = scan_stop;
 
         Ok(())
     }
@@ -831,6 +950,25 @@ impl<F: VfsFile> WalFile<F> {
     #[must_use]
     pub fn frame_size(&self) -> usize {
         WAL_FRAME_HEADER_SIZE + self.page_size
+    }
+
+    /// Whether a scan of the current generation found another generation's
+    /// frames that still lie past this handle's prefix (bd-2qo7z): the
+    /// recorded tail is this generation's (a reset or a peer's restart
+    /// changes the salts) and the prefix has not outgrown it.
+    fn stale_tail_ahead(&self) -> bool {
+        self.stale_tail.is_some_and(|tail| {
+            tail.salts == self.header.salts && self.frame_count < tail.end_frames
+        })
+    }
+
+    /// Record that a scan of the current generation stopped on another
+    /// generation's frame, with `end_frames` frames in the file.
+    fn note_stale_tail(&mut self, end_frames: usize) {
+        self.stale_tail = Some(StaleTail {
+            salts: self.header.salts,
+            end_frames,
+        });
     }
 
     /// Byte offset of frame `index` (0-based) within the WAL file.
@@ -918,6 +1056,8 @@ impl<F: VfsFile> WalFile<F> {
             last_fsynced_frame_count: 0,
             unsynced_after_failed_sync: None,
             headerless_observation: Some(next_headerless_observation()),
+            stale_tail: None,
+            last_scan_stop: None,
         }
     }
 
@@ -1034,6 +1174,8 @@ impl<F: VfsFile> WalFile<F> {
             last_fsynced_frame_count: 0,
             unsynced_after_failed_sync: None,
             headerless_observation: None,
+            stale_tail: None,
+            last_scan_stop: None,
         })
     }
 
@@ -1062,8 +1204,9 @@ impl<F: VfsFile> WalFile<F> {
         let file_size = file.file_size(cx)?;
         let data_bytes =
             file_size.saturating_sub(u64::try_from(WAL_HEADER_SIZE).expect("header size fits u64"));
-        let max_frames = usize::try_from(data_bytes / u64::try_from(frame_size).unwrap_or(1))
-            .unwrap_or(usize::MAX);
+        let frame_size_u64 = u64::try_from(frame_size).unwrap_or(1);
+        let max_frames = usize::try_from(data_bytes / frame_size_u64).unwrap_or(usize::MAX);
+        let partial_tail_bytes = data_bytes % frame_size_u64;
 
         let mut running_checksum = header_checksum;
         let mut valid_frames = 0_usize;
@@ -1071,10 +1214,13 @@ impl<F: VfsFile> WalFile<F> {
         let mut last_commit_checksum = header_checksum;
         let mut last_commit = None;
         let mut validated_headers = Vec::new();
+        let mut stale_tail = None;
+        let mut last_scan_stop = None;
         let mut frames = WalFrameReader::new(frame_size, 0, max_frames);
 
         for frame_index in 0..max_frames {
             let frame_no = frame_index.saturating_add(1);
+            let frame_no_u32 = u32::try_from(frame_no).unwrap_or(u32::MAX);
             let Some(frame_buf) = frames.next(cx, &file).await? else {
                 log_replay_decision(
                     "startup_open",
@@ -1082,11 +1228,27 @@ impl<F: VfsFile> WalFile<F> {
                     last_commit_frames,
                     "truncated_tail_stop",
                 );
+                last_scan_stop = Some(WalScanStopKind::FrameDamage {
+                    frame_no: frame_no_u32,
+                });
                 break; // truncated frame
             };
 
-            // Verify salt match.
+            // Verify page number and salt match.
             let frame_header = WalFrameHeader::from_bytes(&frame_buf[..WAL_FRAME_HEADER_SIZE])?;
+            if frame_header.page_number == 0 {
+                warn!(frame_index, "WAL frame zero page number — chain terminated");
+                log_replay_decision(
+                    "startup_open",
+                    frame_no,
+                    last_commit_frames,
+                    "zero_page_stop",
+                );
+                last_scan_stop = Some(WalScanStopKind::FrameDamage {
+                    frame_no: frame_no_u32,
+                });
+                break;
+            }
             if frame_header.salts != header.salts {
                 warn!(frame_index, "WAL frame salt mismatch — chain terminated");
                 log_replay_decision(
@@ -1095,6 +1257,13 @@ impl<F: VfsFile> WalFile<F> {
                     last_commit_frames,
                     "salt_mismatch_stop",
                 );
+                stale_tail = Some(StaleTail {
+                    salts: header.salts,
+                    end_frames: max_frames,
+                });
+                last_scan_stop = Some(WalScanStopKind::SaltMismatch {
+                    frame_no: frame_no_u32,
+                });
                 break; // salt mismatch terminates the chain
             }
 
@@ -1116,6 +1285,9 @@ impl<F: VfsFile> WalFile<F> {
                     last_commit_frames,
                     "checksum_mismatch_stop",
                 );
+                last_scan_stop = Some(WalScanStopKind::FrameDamage {
+                    frame_no: frame_no_u32,
+                });
                 break; // checksum mismatch terminates the chain
             }
 
@@ -1143,6 +1315,13 @@ impl<F: VfsFile> WalFile<F> {
                     "accept_non_commit",
                 );
             }
+        }
+        if last_scan_stop.is_none()
+            && partial_tail_bytes >= u64::try_from(WAL_FRAME_HEADER_SIZE).unwrap_or(24)
+        {
+            last_scan_stop = Some(WalScanStopKind::FrameDamage {
+                frame_no: u32::try_from(max_frames.saturating_add(1)).unwrap_or(u32::MAX),
+            });
         }
 
         debug!(
@@ -1172,6 +1351,8 @@ impl<F: VfsFile> WalFile<F> {
             last_fsynced_frame_count: last_commit_frames,
             unsynced_after_failed_sync: None,
             headerless_observation: None,
+            stale_tail,
+            last_scan_stop,
         })
     }
 
@@ -2790,6 +2971,7 @@ impl<F: VfsFile> WalFile<F> {
         // covered can be read through it.
         self.unsynced_after_failed_sync = None;
         self.headerless_observation = None;
+        self.last_scan_stop = None;
         self.frame_scratch.clear();
         crate::metrics::GLOBAL_WAL_METRICS.set_wal_frames_current(0);
 
@@ -2819,6 +3001,23 @@ impl<F: VfsFile> WalFile<F> {
     /// Return a mutable reference to the underlying VFS file handle.
     pub fn file_mut(&mut self) -> &mut F {
         &mut self.file
+    }
+
+    /// Boundary where the last full scan (`open` or `rebuild_state_from_file`)
+    /// stopped before the physical end of the WAL file (bd-1hi.11).
+    #[must_use]
+    pub const fn last_scan_stop(&self) -> Option<WalScanStopKind> {
+        self.last_scan_stop
+    }
+
+    /// One-based physical frame number where the last full scan stopped on a
+    /// potential damage boundary, or `None` for a clean WAL.
+    #[must_use]
+    pub const fn first_damage_candidate_frame(&self) -> Option<u32> {
+        match self.last_scan_stop {
+            Some(stop) => Some(stop.frame_no()),
+            None => None,
+        }
     }
 }
 
@@ -2941,6 +3140,8 @@ mod tests {
     struct AppendProbeFile {
         inner: <MemoryVfs as Vfs>::File,
         writes: std::sync::Mutex<Vec<(u64, usize)>>,
+        /// (offset, requested length) of every read.
+        reads: std::sync::Mutex<Vec<(u64, usize)>>,
         pending: std::sync::Mutex<Option<(u64, Vec<u8>, VfsWriteCompletion)>>,
         action: AppendProbeAction,
     }
@@ -2950,6 +3151,7 @@ mod tests {
             Self {
                 inner: open_wal_file(vfs, cx),
                 writes: std::sync::Mutex::new(Vec::new()),
+                reads: std::sync::Mutex::new(Vec::new()),
                 pending: std::sync::Mutex::new(None),
                 action: AppendProbeAction::Complete,
             }
@@ -2970,6 +3172,7 @@ mod tests {
 
     impl VfsFile for AppendProbeFile {
         async fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+            self.reads.lock().unwrap().push((offset, buf.len()));
             self.inner.read(cx, buf, offset).await
         }
 
@@ -5645,6 +5848,122 @@ mod tests {
             assert_eq!(header, disk, "frame {index}");
             assert_eq!(writer.read_frame_header(&cx, index).expect("writer"), disk);
         }
+    }
+
+    #[test]
+    fn test_refresh_over_a_restarted_wal_reads_one_frame_header_of_its_stale_tail() {
+        // bd-w4pr1.7: a peer restarts the WAL in place, so the file keeps 20 frames of
+        // the old generation past the new end. A refresh must still absorb the new
+        // generation's commits, and with nothing new it must read one frame header of
+        // the stale tail, not a batch of frames.
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut writer = WalFile::create(&cx, open_wal_file(&vfs, &cx), PAGE_SIZE, 0, test_salts())
+            .expect("create");
+        for page in 1..=20_u8 {
+            let db_size = if page == 20 { 20 } else { 0 };
+            writer
+                .append_frame(&cx, u32::from(page), &sample_page(page), db_size)
+                .expect("append");
+        }
+        let mut reader = WalFile::open(&cx, AppendProbeFile::new(&vfs, &cx)).expect("open reader");
+        assert_eq!(reader.frame_count(), 20);
+
+        let new_salts = WalSalts {
+            salt1: 0x1234_5678,
+            salt2: 0x9ABC_DEF0,
+        };
+        writer.reset(&cx, 1, new_salts, false).expect("reset");
+        writer
+            .append_frame(&cx, 3, &sample_page(30), 3)
+            .expect("first new-generation commit");
+        reader.refresh(&cx).expect("refresh after the reset");
+        assert_eq!(reader.frame_count(), 1);
+
+        // The first frame past the reader's prefix is a peer's new-generation commit.
+        writer
+            .append_frame(&cx, 4, &sample_page(31), 4)
+            .expect("second new-generation commit");
+        reader.refresh(&cx).expect("refresh over the peer's commit");
+        assert_eq!(
+            reader.frame_count(),
+            2,
+            "a refresh must absorb a new-generation commit past its prefix"
+        );
+
+        // Nothing new: the first frame past the prefix is the old generation's.
+        reader.file.reads.lock().unwrap().clear();
+        reader.refresh(&cx).expect("refresh over the stale tail");
+        let frame_size =
+            usize::try_from(PAGE_SIZE).expect("page size fits usize") + WAL_FRAME_HEADER_SIZE;
+        let reads = reader.file.reads.lock().unwrap().clone();
+        assert!(
+            reads.iter().all(|&(_, len)| len < frame_size),
+            "a refresh over a stale tail must not read whole frames: {reads:?}"
+        );
+        assert!(
+            reads.contains(&(reader.frame_offset(2), WAL_FRAME_HEADER_SIZE)),
+            "the refresh must read the header of the first frame past its prefix: {reads:?}"
+        );
+        let mut fresh = WalFile::open(&cx, open_wal_file(&vfs, &cx)).expect("fresh open");
+        assert_eq!(reader.frame_count(), fresh.frame_count());
+        assert_eq!(reader.running_checksum(), fresh.running_checksum());
+        assert_eq!(
+            reader.last_commit_frame(&cx).expect("reader commit"),
+            fresh.last_commit_frame(&cx).expect("fresh commit")
+        );
+        assert_eq!(
+            reader.last_commit_frame(&cx).expect("reader commit"),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn test_refresh_over_a_peers_frames_batches_from_the_first_read() {
+        // bd-2qo7z: with no stale tail known for its generation, a refresh reads a
+        // peer's frames in a batch from the first frame past its prefix, with no
+        // frame-header read ahead of it (wal_reopen's I/O contract). The probe
+        // above is for a stale tail a scan of this generation has already found.
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut writer = WalFile::create(&cx, open_wal_file(&vfs, &cx), PAGE_SIZE, 0, test_salts())
+            .expect("create");
+        let mut reader = WalFile::open(&cx, AppendProbeFile::new(&vfs, &cx)).expect("open reader");
+        assert_eq!(reader.frame_count(), 0);
+        for page in 1..=8_u8 {
+            let db_size = if page == 8 { 8 } else { 0 };
+            writer
+                .append_frame(&cx, u32::from(page), &sample_page(page), db_size)
+                .expect("append");
+        }
+
+        reader.file.reads.lock().unwrap().clear();
+        reader.refresh(&cx).expect("refresh over the peer's frames");
+        assert_eq!(reader.frame_count(), 8);
+        let frame_size =
+            usize::try_from(PAGE_SIZE).expect("page size fits usize") + WAL_FRAME_HEADER_SIZE;
+        let reads = reader.file.reads.lock().unwrap().clone();
+        let first_frame = reader.frame_offset(0);
+        let frame_reads: Vec<(u64, usize)> = reads
+            .iter()
+            .copied()
+            .filter(|&(offset, _)| offset >= first_frame)
+            .collect();
+        assert_eq!(
+            frame_reads.first().map(|&(offset, _)| offset),
+            Some(first_frame),
+            "the first frame read starts at the first frame: {reads:?}"
+        );
+        assert!(
+            frame_reads[0].1 > frame_size,
+            "the first frame read must be a batch, not a header probe: {reads:?}"
+        );
+        let mut fresh = WalFile::open(&cx, open_wal_file(&vfs, &cx)).expect("fresh open");
+        assert_eq!(reader.running_checksum(), fresh.running_checksum());
+        assert_eq!(
+            reader.last_commit_frame(&cx).expect("reader commit"),
+            fresh.last_commit_frame(&cx).expect("fresh commit")
+        );
     }
 
     #[test]

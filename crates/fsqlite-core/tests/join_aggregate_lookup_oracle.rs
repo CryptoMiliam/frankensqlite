@@ -2169,3 +2169,328 @@ mod table_function_visibility_registration {
         });
     }
 }
+
+/// A join written without a constraint (`FROM t, u WHERE u.id = t.a AND t.a = 2`)
+/// is joined by its whole WHERE, so the outer-table equality was never offered
+/// to the outer seek and the outer table was scanned (440x stock on 200k rows).
+/// An inner join's ON terms that the lookup does not consume filter the outer
+/// row as WHERE terms do, so they now seek it too. A LEFT JOIN's ON term does
+/// not filter the outer row (it still comes out, null-extended) and must not
+/// seek; nor may a term under OR.
+#[test]
+fn join_lookups_seek_the_outer_table_by_unconsumed_inner_join_terms() {
+    // (query, must seek the outer index)
+    let cases: &[(&str, bool)] = &[
+        ("SELECT t.id, u.id FROM t, u WHERE u.id = t.a AND t.a = 2 ORDER BY t.id", true),
+        ("SELECT t.id, u.r FROM t, u WHERE u.id = t.a AND t.b = '2' ORDER BY t.id", true),
+        ("SELECT count(*), sum(u.r) FROM t, u WHERE u.id = t.a AND t.a = 2", true),
+        ("SELECT t.id, u.id FROM t, u WHERE t.a = 4 AND u.id = t.a ORDER BY t.id", true),
+        ("SELECT t.id, u.id FROM t JOIN u ON u.id = t.a AND t.a = 2 ORDER BY t.id", true),
+        ("SELECT t.id, u.id FROM t CROSS JOIN u WHERE u.id = t.a AND t.a = 2 ORDER BY t.id", true),
+        ("SELECT t.id, u.id FROM t LEFT JOIN u ON u.id = t.a AND t.a = 2 ORDER BY t.id", false),
+        (
+            "SELECT t.id, u.id FROM t, u WHERE u.id = t.a AND (t.a = 2 OR t.a = 4) ORDER BY t.id",
+            false,
+        ),
+        ("SELECT t.id, u.id FROM t, u WHERE u.id = t.a AND t.a = '2' ORDER BY t.id", false),
+        ("SELECT t.id, u.id FROM t, u WHERE u.id = t.a AND t.a = 9 ORDER BY t.id", true),
+    ];
+    for indexed in [false, true] {
+        asupersync::test_utils::run_test(|| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("join_outer_seek_by_on_terms.db");
+            let f = Connection::open(path.to_str().unwrap()).await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            let indexes: &[&str] = if indexed { INDEXES } else { &[] };
+            for sql in SETUP.iter().chain(indexes) {
+                f.execute(sql).await.unwrap();
+                r.execute(sql, []).unwrap();
+            }
+            for (sql, seeks) in cases {
+                assert_agree(&f, &r, sql, &[], &[]).await;
+                if indexed {
+                    let ops = opcodes(&f, sql).await;
+                    assert_eq!(
+                        ops.iter().any(|op| op == "SeekGE"),
+                        *seeks,
+                        "`{sql}` outer index seek: {ops:?}"
+                    );
+                }
+            }
+            for value in [2_i64, 7] {
+                assert_agree(
+                    &f,
+                    &r,
+                    "SELECT t.id, u.id FROM t, u WHERE u.id = t.a AND t.a = ?1 ORDER BY t.id",
+                    &[SqliteValue::Integer(value)],
+                    &[&value],
+                )
+                .await;
+            }
+        });
+    }
+}
+
+/// bd-9uf3l: an inner join written with its unfiltered table first (`FROM u
+/// JOIN t ON u.id = t.a WHERE t.b = 'k2'`) drove from u, reading all of it and
+/// looking t up per row (413x stock on 200k rows). It drives from t, the table
+/// its WHERE pins, and looks u up, as stock does, when the pinned rows are well
+/// under u's rows, nothing seeks u and u has a rowid or index lookup on the
+/// join key. The row counts come from sqlite_stat1, or without it (bd-prkvt,
+/// 257x stock) from b-tree samples: u's rows, and per index of t its rows per
+/// leading value, or SQLite's default of ten when the sampled keys mostly
+/// differ. A small written outer table (5-row q) and an unselective pin
+/// (`t.f = 1`, half of t, whose index repeats each value across its page)
+/// keep the written order either way. So do a LEFT join, a comma join (stock
+/// never reorders CROSS JOIN, which the parser does not tell from a comma),
+/// `*` (cursor-ordered columns), a written outer table the WHERE already
+/// seeks, and a join key with no lookup on the written outer table. Rows match
+/// stock in order either way.
+#[test]
+fn inner_joins_drive_from_the_table_their_where_pins_by_row_estimates() {
+    // (query, whether it reads the outer table in full `[without, with]`
+    // ANALYZE: `false` drives from the pinned table, `true` keeps the written
+    // outer table as a full scan; `None` checks rows only).
+    let cases: &[(&str, Option<[bool; 2]>)] = &[
+        (
+            "SELECT t.id, u.r FROM u JOIN t ON u.id = t.a WHERE t.b = 'k2' ORDER BY t.id",
+            Some([false, false]),
+        ),
+        (
+            "SELECT count(*), sum(u.r) FROM u JOIN t ON u.id = t.a WHERE t.a = 2",
+            Some([false, false]),
+        ),
+        (
+            "SELECT count(*), max(u.r) FROM u JOIN t ON t.a = u.id WHERE t.b = 'k4'",
+            Some([false, false]),
+        ),
+        (
+            "SELECT t.id, u.a FROM u INNER JOIN t ON u.id = t.a AND t.b = 'k5' ORDER BY t.id",
+            Some([false, false]),
+        ),
+        (
+            "SELECT count(*) FROM u JOIN t ON u.id = t.a WHERE t.id = 9",
+            Some([false, false]),
+        ),
+        // A range on u is no equality seek, so t still drives.
+        (
+            "SELECT t.id, u.r FROM u JOIN t ON u.id = t.a WHERE u.r > 1 AND t.b = 'k2' \
+             ORDER BY t.id",
+            Some([false, false]),
+        ),
+        // A pin matching half of t, and a 5-row written outer table.
+        (
+            "SELECT count(*), sum(u.r) FROM u JOIN t ON u.id = t.a WHERE t.f = 1",
+            Some([true, true]),
+        ),
+        (
+            "SELECT count(*) FROM q JOIN t ON t.id = q.id WHERE t.f = 1",
+            Some([true, true]),
+        ),
+        (
+            "SELECT count(*) FROM q JOIN t ON t.id = q.id WHERE t.b = 'k14'",
+            Some([true, true]),
+        ),
+        (
+            "SELECT t.id, u.r FROM u LEFT JOIN t ON u.id = t.a WHERE t.b = 'k2' ORDER BY t.id",
+            Some([true, true]),
+        ),
+        (
+            "SELECT count(*) FROM u, t WHERE u.id = t.a AND t.b = 'k2'",
+            Some([true, true]),
+        ),
+        (
+            "SELECT * FROM u JOIN t ON u.id = t.a WHERE t.b = 'k2' ORDER BY t.id, u.id",
+            Some([true, true]),
+        ),
+        (
+            "SELECT t.id FROM u JOIN t ON u.a = t.a WHERE t.b = 'k2' ORDER BY t.id",
+            Some([true, true]),
+        ),
+        // The WHERE already seeks u, so u stays outer.
+        (
+            "SELECT t.id, u.r FROM u JOIN t ON u.id = t.a WHERE u.id = 2 AND t.b = 'k2' \
+             ORDER BY t.id",
+            None,
+        ),
+    ];
+    let mut setup = vec![
+        "CREATE TABLE u(id INTEGER PRIMARY KEY, a INTEGER, r REAL)".to_owned(),
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT, f INTEGER)".to_owned(),
+        "CREATE TABLE q(id INTEGER PRIMARY KEY, w INTEGER)".to_owned(),
+        "CREATE INDEX t_a ON t(a)".to_owned(),
+        "CREATE INDEX t_b ON t(b)".to_owned(),
+        "CREATE INDEX t_f ON t(f)".to_owned(),
+    ];
+    for i in 1..=400_i64 {
+        setup.push(format!("INSERT INTO u VALUES ({i}, {}, {}.5)", i % 9, i % 13));
+        setup.push(format!(
+            "INSERT INTO t VALUES ({i}, {i}, 'k{}', {})",
+            i % 100,
+            i % 2
+        ));
+    }
+    for i in 1..=5_i64 {
+        setup.push(format!("INSERT INTO q VALUES ({}, {i})", i * 7));
+    }
+    for analyzed in [false, true] {
+        let setup = setup.clone();
+        asupersync::test_utils::run_test(|| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("join_drives_pinned_table.db");
+            let f = Connection::open(path.to_str().unwrap()).await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            for sql in &setup {
+                f.execute(sql).await.unwrap();
+                r.execute(sql, []).unwrap();
+            }
+            if analyzed {
+                f.execute("ANALYZE").await.unwrap();
+                r.execute_batch("ANALYZE").unwrap();
+            }
+            for (sql, scans_outer) in cases {
+                assert_agree(&f, &r, sql, &[], &[]).await;
+                if let Some(scans_outer) = scans_outer {
+                    let ops = opcodes(&f, sql).await;
+                    assert_eq!(
+                        ops.iter().any(|op| op == "Rewind"),
+                        scans_outer[usize::from(analyzed)],
+                        "`{sql}` full outer scan (analyzed: {analyzed}): {ops:?}"
+                    );
+                }
+            }
+            for value in [2_i64, 6, 999] {
+                assert_agree(
+                    &f,
+                    &r,
+                    "SELECT t.id, u.r FROM u JOIN t ON u.id = t.a WHERE t.a = ?1 ORDER BY t.id",
+                    &[SqliteValue::Integer(value)],
+                    &[&value],
+                )
+                .await;
+            }
+            f.close().await.unwrap();
+        });
+    }
+}
+
+/// bd-w4pr1.12 (lever SL1 v3): a rowid lookup whose target lies on the leaf
+/// the cursor already stands on is answered by the b-tree without a wait
+/// (`BtCursor::try_table_seek_within_leaf`); everything else takes the
+/// general seek. The outer keys step through `u` by a large stride, as
+/// join_1M_to_pk_1000's do, so lookups alternate between the current leaf
+/// and other leaves. They also land on missing rowids inside a leaf (every
+/// 13th row is absent), before the first and past the last row, and key on
+/// NULL, REAL, TEXT and BLOB values.
+const SAME_LEAF_SETUP: &[&str] = &[
+    "CREATE TABLE u(a INTEGER PRIMARY KEY, name TEXT)",
+    "WITH RECURSIVE s(v) AS (SELECT 0 UNION ALL SELECT v + 1 FROM s WHERE v < 2999) \
+     INSERT INTO u SELECT v, 'name-' || v || '-' || substr('abcdefghijklmnopqrstuvwxyz', 1 + v % 26) \
+     FROM s WHERE v % 13 <> 5",
+    "CREATE TABLE t(id INTEGER PRIMARY KEY, a)",
+    "WITH RECURSIVE s(v) AS (SELECT 1 UNION ALL SELECT v + 1 FROM s WHERE v < 6000) \
+     INSERT INTO t SELECT v, (v * 7919) % 3000 FROM s",
+    "INSERT INTO t VALUES (6001, NULL), (6002, -1), (6003, 3000), (6004, 99999), (6005, 17.0), \
+     (6006, 17.5), (6007, '18'), (6008, ' 19 '), (6009, x'3230'), (6010, 2999), (6011, 5), (6012, 0)",
+];
+
+const SAME_LEAF_QUERIES: &[&str] = &[
+    "SELECT count(*), sum(length(u.name)) FROM t JOIN u ON u.a = t.a",
+    "SELECT count(*), sum(t.id), sum(length(u.name)) FROM t JOIN u ON u.a = t.a WHERE t.id > 5980",
+    "SELECT count(*), sum(t.id), sum(u.a) FROM t, u WHERE u.rowid = t.a",
+    "SELECT count(*), count(u.a), sum(t.id) FROM t LEFT JOIN u ON u.a = t.a",
+    "SELECT t.id, u.a, u.name FROM t LEFT JOIN u ON u.a = t.a WHERE t.id > 5995 ORDER BY t.id",
+    "SELECT t.id, (SELECT name FROM u WHERE u.a = t.a) FROM t WHERE t.id > 5990 ORDER BY t.id",
+    "SELECT sum(length(x)) FROM (SELECT (SELECT name FROM u WHERE u.a = t.a) x FROM t)",
+];
+
+/// The negative cases write `u` and then seek it: inside one transaction
+/// after an UPDATE dirtied its leaves, and inside one UPDATE whose subquery
+/// reads the row that statement changed just before, on a leaf it has
+/// dirtied. A fast path that skipped its dirty-leaf check would answer those
+/// from a stale page. Compared with rusqlite, file-backed and in memory, ad
+/// hoc and prepared.
+#[test]
+fn same_leaf_rowid_lookups_match_sqlite_across_leaves_and_after_writes() {
+    for file_backed in [true, false] {
+        asupersync::test_utils::run_test(|| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let path = if file_backed {
+                dir.path()
+                    .join("same_leaf.db")
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                ":memory:".to_owned()
+            };
+            let f = Connection::open(&path).await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            for sql in SAME_LEAF_SETUP {
+                f.execute(sql).await.unwrap();
+                r.execute(sql, []).unwrap();
+            }
+            for sql in SAME_LEAF_QUERIES {
+                assert_agree(&f, &r, sql, &[], &[]).await;
+            }
+            let bounded =
+                "SELECT count(*), sum(length(u.name)) FROM t JOIN u ON u.a = t.a WHERE t.id <= ?1";
+            let stmt = f.prepare(bounded).await.unwrap();
+            for bound in [1_i64, 2, 81, 4000, 6012] {
+                let ours: Vec<Vec<String>> = stmt
+                    .query_with_params(&[SqliteValue::Integer(bound)])
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.values().iter().map(tag_f).collect())
+                    .collect();
+                let theirs: Vec<Vec<String>> = r
+                    .prepare(bounded)
+                    .unwrap()
+                    .query_map([bound], |row| {
+                        Ok((0..2)
+                            .map(|i| tag_r(&row.get::<_, rusqlite::types::Value>(i).unwrap()))
+                            .collect())
+                    })
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect();
+                assert_eq!(
+                    ours, theirs,
+                    "prepared bound {bound}, file-backed {file_backed}"
+                );
+            }
+
+            // Leaves this transaction has written.
+            for sql in ["BEGIN", "UPDATE u SET name = name || '!' WHERE a % 50 = 0"] {
+                f.execute(sql).await.unwrap();
+                r.execute(sql, []).unwrap();
+            }
+            assert_agree(&f, &r, SAME_LEAF_QUERIES[0], &[], &[]).await;
+            assert_agree(&f, &r, SAME_LEAF_QUERIES[5], &[], &[]).await;
+            f.execute("COMMIT").await.unwrap();
+            r.execute("COMMIT", []).unwrap();
+
+            // One statement writes a leaf and then seeks it: row k's subquery
+            // reads row k - 1, which this UPDATE has just changed.
+            let chain = "UPDATE u SET name = coalesce((SELECT p.name FROM u AS p WHERE p.a = u.a - 1), \
+                         'none') || '.' WHERE u.a % 3 <> 0";
+            f.execute(chain).await.unwrap();
+            r.execute(chain, []).unwrap();
+            for sql in [
+                "SELECT count(*), sum(length(name)), max(name), min(name) FROM u",
+                "SELECT a, name FROM u WHERE a < 12 OR a > 2990 ORDER BY a",
+                SAME_LEAF_QUERIES[0],
+            ] {
+                assert_agree(&f, &r, sql, &[], &[]).await;
+            }
+
+            // Non-vacuity: the join looks u up by rowid.
+            let ops = opcodes(&f, SAME_LEAF_QUERIES[0]).await;
+            assert!(
+                ops.iter().any(|op| op == "SeekRowid"),
+                "the join must look u up by rowid: {ops:?}"
+            );
+            f.close().await.unwrap();
+        });
+    }
+}

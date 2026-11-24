@@ -207,9 +207,10 @@ use fsqlite_types::value::{
 };
 use fsqlite_types::{
     CommitSeq, DATABASE_HEADER_SIZE, DatabaseHeader, PageData, PageNumber, RowId, RowIdMode,
-    SchemaEpoch, StrictColumnType, TableId, TextEncoding, WitnessKey,
+    SchemaEpoch, SecureDeleteMode, StrictColumnType, TableId, TextEncoding, WitnessKey,
 };
 
+use crate::temp_store::{TempStoreRuntime, TrackedTempFile};
 use crate::{
     SchemaEvaluationContext, TableIndexMetaMap, VdbeProgram, enter_vdbe_decode_profile_stage,
     enter_vdbe_execute_profile_stage,
@@ -218,6 +219,7 @@ use crate::{
         InsertValueSource, RowidLookupSelectTemplate, SimpleInsertTemplate, try_compile_program,
     },
     opcode_register_spans,
+    parallel_aggregate::{ParallelAggregatePlan, TableShape, run_parallel_aggregate},
 };
 
 const VDBE_EXECUTION_CHECKPOINT_INTERVAL: u64 = 4096;
@@ -292,6 +294,11 @@ const OPFLAG_STAGED_BUILD: u16 = 0x02;
 /// when the new record has the same size (stock `btreeOverwriteCell`) instead
 /// of a delete, a re-seek and an insert per row.
 const OPFLAG_UPDATE_KEEPS_ROWID: u16 = 0x80;
+/// Beside `OPFLAG_UPDATE_KEEPS_ROWID` on an UPDATE's `Delete`: the table has no
+/// UNIQUE index, so the rewrite cannot meet a conflict and nothing will
+/// restore the old row; the `Delete` keeps no copy of its payload
+/// (bd-w4pr1.13.20, lever UR).
+const OPFLAG_UPDATE_NO_RESTORE: u16 = 0x200;
 /// Marks a `Halt(SQLITE_CONSTRAINT)` emitted after a non-mutating UNIQUE
 /// preflight. P4 contains the constraint's column label.
 const OPFLAG_HALT_UNIQUE: u16 = 0x01;
@@ -303,6 +310,10 @@ const OPFLAG_HALT_PRIMARY_KEY: u16 = 0x02;
 /// (SQLITE_CONSTRAINT_PRIMARYKEY) instead of `UniqueViolation`.
 const OPFLAG_IDX_PRIMARY_KEY: u16 = 0x100;
 const STORAGE_CURSOR_LAYOUT_PREFIX_BYTES: usize = 256;
+/// bd-fpr5g: how many retained cursors displaced from their slots the engine
+/// keeps (`VdbeEngine::spare_storage_cursors`). An INSERT whose trigger body
+/// writes two tables, one of them indexed, needs three.
+const MAX_SPARE_STORAGE_CURSORS: usize = 8;
 #[cfg(test)]
 const VDBE_ENGINE_INLINE_SIZE_BUDGET_BYTES: usize = 3 * 1024;
 static BUILTIN_COLLATION_REGISTRY: LazyLock<CollationRegistry> =
@@ -678,14 +689,102 @@ pub struct ReusableTableExecutionState {
 // CREATE TABLE / INSERT / SELECT / UPDATE / DELETE against a lightweight
 // row store without requiring the full B-tree + pager + VFS stack.
 
+/// Location of a spilled `MemRow` record inside its table's VFS temp file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SpilledRowSlice {
+    offset: u64,
+    len: u32,
+}
+
+/// Append-only temporary file holding spilled rows for a `TEMP` or ephemeral
+/// `MemTable` when `PRAGMA temp_store` resolves to `FILE` and resident row
+/// bytes cross the configured byte budget (bd-dwjnq.5).
+struct TempTableSpillFile {
+    handle: Arc<TrackedTempFile>,
+    next_offset: u64,
+}
+
+impl std::fmt::Debug for TempTableSpillFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TempTableSpillFile")
+            .field("next_offset", &self.next_offset)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Per-table spill controller attached only to `TEMP` and ephemeral `MemTable`s.
+#[derive(Debug, Clone)]
+struct TempTableSpillState {
+    runtime: TempStoreRuntime,
+    text_encoding: TextEncoding,
+    file: Arc<Mutex<Option<TempTableSpillFile>>>,
+    resident_bytes: usize,
+    spilled_row_count: usize,
+    recorded_memory_only: bool,
+}
+
+impl TempTableSpillState {
+    fn new(runtime: TempStoreRuntime, text_encoding: TextEncoding) -> Self {
+        Self {
+            runtime,
+            text_encoding,
+            file: Arc::new(Mutex::new(None)),
+            resident_bytes: 0,
+            spilled_row_count: 0,
+            recorded_memory_only: false,
+        }
+    }
+
+    fn read_spilled_values(&self, cx: &Cx, slice: SpilledRowSlice) -> Result<MemRowValues> {
+        if cx.is_cancel_requested() {
+            return Err(FrankenError::Abort);
+        }
+        let handle = {
+            let guard = self
+                .file
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard
+                .as_ref()
+                .map(|file| Arc::clone(&file.handle))
+                .ok_or_else(|| {
+                    FrankenError::internal("spilled TEMP table row missing temp file handle")
+                })?
+        };
+        let mut buf = vec![0u8; slice.len as usize];
+        handle.read_exact_at(cx, slice.offset, &mut buf)?;
+        let mut values = Vec::new();
+        parse_record_into_with_encoding(&buf, &mut values, self.text_encoding).ok_or_else(
+            || FrankenError::DatabaseCorrupt {
+                detail: "malformed spilled TEMP table record".to_owned(),
+            },
+        )?;
+        Ok(values)
+    }
+}
+
+fn estimate_mem_row_values_size(values: &[SqliteValue]) -> usize {
+    let mut size = std::mem::size_of::<MemRow>()
+        .saturating_add(values.len().saturating_mul(std::mem::size_of::<SqliteValue>()));
+    for value in values {
+        match value {
+            SqliteValue::Text(text) => size = size.saturating_add(text.len()),
+            SqliteValue::Blob(bytes) => size = size.saturating_add(bytes.len()),
+            _ => {}
+        }
+    }
+    size
+}
+
 /// A row in an in-memory table: (rowid, column values).
 pub type MemRowValues = Vec<SqliteValue>;
 
-/// A row in an in-memory table: (rowid, column values).
+/// A row in an in-memory table: (rowid, inline values or spilled temp slice).
 #[derive(Debug, Clone, PartialEq)]
 struct MemRow {
     rowid: i64,
     values: MemRowValues,
+    spilled: Option<SpilledRowSlice>,
 }
 
 /// In-memory table storage (Phase 4 backend).
@@ -744,6 +843,7 @@ fn append_unique_constraint_key_component(
     key: &mut Vec<u8>,
     value: &SqliteValue,
     collation: Option<&str>,
+    encoding: TextEncoding,
 ) -> bool {
     if !unique_constraint_collation_is_indexable(collation) {
         return false;
@@ -787,9 +887,12 @@ fn append_unique_constraint_key_component(
                 key.extend_from_slice(&(trimmed.len() as u64).to_le_bytes());
                 key.extend_from_slice(trimmed);
             } else {
+                // BINARY compares stored code units. Distinct UTF-16 sequences
+                // can have the same UTF-8 projection (bd-gz5io).
+                let bytes = text.to_record_text_bytes(encoding);
                 #[allow(clippy::cast_possible_truncation)]
-                key.extend_from_slice(&(text_bytes.len() as u64).to_le_bytes());
-                key.extend_from_slice(text_bytes);
+                key.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+                key.extend_from_slice(&bytes);
             }
         }
         SqliteValue::Blob(bytes) => {
@@ -823,6 +926,22 @@ impl UniqueConstraintState {
             primary_key: false,
         }
     }
+
+    /// Canonical keys describe the built-in comparators, even when an
+    /// application has registered a replacement under the same name.
+    /// Check the live registry on every lookup, since registrations can
+    /// change after the table or index was populated. Continue maintaining
+    /// these keys so a later registry replacement can safely reuse them.
+    fn index_for_registry(
+        &self,
+        registry: &CollationRegistry,
+    ) -> Option<&BTreeMap<Vec<u8>, BTreeSet<i64>>> {
+        self.index.as_ref().filter(|_| {
+            self.collations.iter().all(|collation| {
+                registry.uses_builtin_implementation(collation.as_deref().unwrap_or("BINARY"))
+            })
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -841,13 +960,16 @@ pub struct MemTable {
     /// Next auto-increment rowid.
     next_rowid: i64,
     /// UNIQUE constraints tracked for MemDatabase-side enforcement. Builtin
-    /// collations (`BINARY`, `NOCASE`, `RTRIM`) use canonical byte-key
-    /// indexes; other collations fall back to an exact row scan through the
-    /// shared collation registry. Shared copy-on-write like `rows`.
+    /// collations (`BINARY`, `NOCASE`, `RTRIM`) have canonical byte-key
+    /// indexes. Application collations, including replacements of built-in
+    /// names, use an exact row scan. Shared copy-on-write like `rows`.
     unique_constraints: Arc<Vec<UniqueConstraintState>>,
-    /// Shared collation registry consulted when a UNIQUE constraint uses a
-    /// non-builtin collation that cannot be normalized into a byte key.
+    /// Shared collation registry consulted before trusting canonical UNIQUE
+    /// keys and for exact comparisons when an application comparator is active.
     collation_registry: Arc<Mutex<CollationRegistry>>,
+    /// Optional VFS temp-file spill controller (attached only to `TEMP` and
+    /// ephemeral tables; `None` for ordinary main-DB mirrors).
+    temp_spill: Option<TempTableSpillState>,
 }
 
 impl MemTable {
@@ -859,7 +981,220 @@ impl MemTable {
             next_rowid: 1,
             unique_constraints: Arc::new(Vec::new()),
             collation_registry: Arc::new(Mutex::new(CollationRegistry::new())),
+            temp_spill: None,
         }
+    }
+
+    /// Attach live `PRAGMA temp_store` runtime policy to a `TEMP` or ephemeral
+    /// table so rows spill to a VFS temp file once resident bytes cross the
+    /// configured budget in `FILE` mode, or enforce `hard_heap_limit` in
+    /// `MEMORY` mode.
+    pub fn configure_temp_spill(
+        &mut self,
+        runtime: TempStoreRuntime,
+        text_encoding: TextEncoding,
+    ) {
+        self.temp_spill = Some(TempTableSpillState::new(runtime, text_encoding));
+    }
+
+    /// Whether any rows in this table currently reside in a spilled temp file.
+    #[must_use]
+    pub fn has_spilled_rows(&self) -> bool {
+        self.temp_spill
+            .as_ref()
+            .is_some_and(|spill| spill.spilled_row_count > 0)
+    }
+
+    /// Read row values at `pos`, transparently loading from the temp spill file
+    /// if the row was evicted from memory.
+    fn read_row_values_at(&self, cx: &Cx, pos: usize) -> Result<Option<Cow<'_, [SqliteValue]>>> {
+        let Some(row) = self.rows.get(pos) else {
+            return Ok(None);
+        };
+        self.read_row_values(cx, row).map(Some)
+    }
+
+    fn read_row_values<'a>(&self, cx: &Cx, row: &'a MemRow) -> Result<Cow<'a, [SqliteValue]>> {
+        if let Some(slice) = row.spilled {
+            let spill = self.temp_spill.as_ref().ok_or_else(|| {
+                FrankenError::internal("spilled MemRow present without TempTableSpillState")
+            })?;
+            return Ok(Cow::Owned(spill.read_spilled_values(cx, slice)?));
+        }
+        Ok(Cow::Borrowed(row.values.as_slice()))
+    }
+
+    /// Read row values by `rowid`, transparently loading from the temp spill file
+    /// when spilled.
+    fn read_row_values_by_rowid(
+        &self,
+        cx: &Cx,
+        rowid: i64,
+    ) -> Result<Option<Cow<'_, [SqliteValue]>>> {
+        let Some(pos) = self.find_by_rowid(rowid) else {
+            return Ok(None);
+        };
+        self.read_row_values_at(cx, pos)
+    }
+
+    /// Materialize all `(rowid, values)` pairs (inline and spilled) for
+    /// connection-local TEMP table snapshotting across schema reloads.
+    pub fn snapshot_all_rows_owned(&self, cx: &Cx) -> Result<Vec<(i64, MemRowValues)>> {
+        let mut out = Vec::with_capacity(self.rows.len());
+        for (pos, row) in self.rows.iter().enumerate() {
+            if let Some(values) = self.read_row_values_at(cx, pos)? {
+                out.push((row.rowid, values.into_owned()));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Insert a row while enforcing this table's attached `TempStoreRuntime`
+    /// policy (spill to VFS temp file in `FILE` mode, hard heap check in
+    /// `MEMORY` mode, `Cx` cancellation check).
+    pub fn insert_checked<V>(&mut self, cx: &Cx, rowid: i64, values: V) -> Result<()>
+    where
+        V: Into<MemRowValues>,
+    {
+        if cx.is_cancel_requested() {
+            return Err(FrankenError::Abort);
+        }
+        let values = values.into();
+        let row_bytes = estimate_mem_row_values_size(&values);
+        if let Some(spill) = self.temp_spill.as_mut() {
+            if !spill.runtime.is_file_backed() {
+                if !spill.recorded_memory_only {
+                    spill.recorded_memory_only = true;
+                    spill.runtime.stats().record_memory_only_allocation();
+                }
+                let projected = spill.resident_bytes.saturating_add(row_bytes);
+                spill.runtime.check_memory_limit(projected)?;
+                spill.resident_bytes = projected;
+                self.insert(rowid, values);
+                return Ok(());
+            }
+        }
+        self.insert(rowid, values);
+        let should_spill = if let Some(spill) = self.temp_spill.as_mut() {
+            spill.resident_bytes = spill.resident_bytes.saturating_add(row_bytes);
+            spill.resident_bytes >= spill.runtime.budget_bytes()
+        } else {
+            false
+        };
+        if should_spill {
+            self.spill_resident_rows_to_temp_file(cx)?;
+        }
+        Ok(())
+    }
+
+    /// Flush all inline row payloads in this `TEMP`/ephemeral table into its
+    /// VFS temporary spill file and release their in-memory heap buffers.
+    fn spill_resident_rows_to_temp_file(&mut self, cx: &Cx) -> Result<()> {
+        if cx.is_cancel_requested() {
+            return Err(FrankenError::Abort);
+        }
+        let (runtime, text_encoding, file_slot) = match self.temp_spill.as_ref() {
+            Some(spill) if spill.runtime.is_file_backed() => (
+                spill.runtime.clone(),
+                spill.text_encoding,
+                Arc::clone(&spill.file),
+            ),
+            _ => return Ok(()),
+        };
+
+        let mut created_new_file = false;
+        let (handle, start_offset) = {
+            let mut guard = file_slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if guard.is_none() {
+                let opened = runtime.create_temp_file(cx, "temp_table")?;
+                *guard = Some(TempTableSpillFile {
+                    handle: opened,
+                    next_offset: 0,
+                });
+                created_new_file = true;
+            }
+            let file = guard.as_ref().expect("temp table spill file initialized");
+            (Arc::clone(&file.handle), file.next_offset)
+        };
+
+        let mut cursor_offset = start_offset;
+        let mut pending_slices: Vec<(usize, SpilledRowSlice)> = Vec::new();
+        let mut write_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+        let mut write_buf_offset = start_offset;
+        let mut total_written: u64 = 0;
+
+        let write_result: Result<()> = (|| {
+            for (idx, row) in self.rows.iter().enumerate() {
+                if row.spilled.is_some() {
+                    continue;
+                }
+                if cx.is_cancel_requested() {
+                    return Err(FrankenError::Abort);
+                }
+                let encoded = encode_record_with_encoding(&row.values, text_encoding);
+                let encoded_len = u32::try_from(encoded.len()).map_err(|_| FrankenError::TooBig)?;
+                let row_offset = cursor_offset;
+                write_buf.extend_from_slice(&encoded);
+                cursor_offset = cursor_offset.saturating_add(u64::from(encoded_len));
+                total_written = total_written.saturating_add(u64::from(encoded_len));
+                pending_slices.push((
+                    idx,
+                    SpilledRowSlice {
+                        offset: row_offset,
+                        len: encoded_len,
+                    },
+                ));
+                if write_buf.len() >= 64 * 1024 {
+                    handle.write_at(cx, write_buf_offset, &write_buf)?;
+                    write_buf_offset = write_buf_offset.saturating_add(write_buf.len() as u64);
+                    write_buf.clear();
+                }
+            }
+            if !write_buf.is_empty() {
+                handle.write_at(cx, write_buf_offset, &write_buf)?;
+                write_buf.clear();
+            }
+            Ok(())
+        })();
+
+        if let Err(err) = write_result {
+            if created_new_file {
+                let mut guard = file_slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _ = guard.take();
+                drop(guard);
+                let _ = handle.close_with_cx(cx);
+            }
+            return Err(err);
+        }
+        if pending_slices.is_empty() {
+            return Ok(());
+        }
+
+        {
+            let mut guard = file_slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(file) = guard.as_mut() {
+                file.next_offset = cursor_offset;
+            }
+        }
+
+        let spilled_now = pending_slices.len();
+        let rows = self.rows_mut();
+        for (idx, slice) in pending_slices {
+            rows[idx].values = Vec::new();
+            rows[idx].spilled = Some(slice);
+        }
+        if let Some(spill) = self.temp_spill.as_mut() {
+            spill.resident_bytes = 0;
+            spill.spilled_row_count = spill.spilled_row_count.saturating_add(spilled_now);
+            spill.runtime.stats().record_temp_table_spill(total_written);
+        }
+        Ok(())
     }
 
     /// Mutable access to the rows, copying them first if a snapshot shares them.
@@ -880,18 +1215,19 @@ impl MemTable {
     }
 
     /// Register a group of columns that together form a UNIQUE constraint.
-    pub fn add_unique_column_group(&mut self, cols: Vec<usize>) {
-        self.add_unique_column_group_with_collations(cols, Vec::new());
+    pub fn add_unique_column_group(&mut self, cx: &Cx, cols: Vec<usize>) -> Result<()> {
+        self.add_unique_column_group_with_collations(cx, cols, Vec::new())
     }
 
     /// Register a group of columns that together form a UNIQUE constraint
     /// with explicit per-column collation metadata.
     pub fn add_unique_column_group_with_collations(
         &mut self,
+        cx: &Cx,
         cols: Vec<usize>,
         collations: Vec<Option<String>>,
-    ) {
-        self.add_unique_column_group_labeled(cols, collations, None, false);
+    ) -> Result<()> {
+        self.add_unique_column_group_labeled(cx, cols, collations, None, false)
     }
 
     /// As [`Self::add_unique_column_group_with_collations`], plus the qualified
@@ -903,25 +1239,28 @@ impl MemTable {
     /// violation is SQLITE_CONSTRAINT_PRIMARYKEY rather than _UNIQUE.
     pub fn add_unique_column_group_labeled(
         &mut self,
+        cx: &Cx,
         cols: Vec<usize>,
         collations: Vec<Option<String>>,
         label: Option<String>,
         primary_key: bool,
-    ) {
+    ) -> Result<()> {
         let mut constraint = UniqueConstraintState::new(cols, collations, label);
         constraint.primary_key = primary_key;
         if let Some(index) = constraint.index.as_mut() {
             for row in self.rows.iter() {
                 if let Some(key) = Self::unique_key_for_constraint(
-                    &row.values,
+                    &self.read_row_values(cx, row)?,
                     &constraint.columns,
                     &constraint.collations,
+                    self.unique_key_encoding(),
                 ) {
                     index.entry(key).or_default().insert(row.rowid);
                 }
             }
         }
         self.unique_constraints_mut().push(constraint);
+        Ok(())
     }
 
     /// Remove one matching UNIQUE constraint from the in-memory table.
@@ -963,57 +1302,69 @@ impl MemTable {
     /// installed constraint; custom collations use the exact comparison path.
     pub fn unique_column_group_is_valid(
         &self,
+        cx: &Cx,
         cols: &[usize],
         collations: &[Option<String>],
-    ) -> bool {
+    ) -> Result<bool> {
         // Normalization only; validity does not depend on the label.
         let constraint = UniqueConstraintState::new(cols.to_vec(), collations.to_vec(), None);
-        if constraint.index.is_some() {
-            let mut seen = HashSet::new();
-            for row in self.rows.iter() {
-                if let Some(key) = Self::unique_key_for_constraint(
-                    &row.values,
-                    &constraint.columns,
-                    &constraint.collations,
-                ) && !seen.insert(key)
-                {
-                    return false;
-                }
-            }
-            return true;
-        }
-
         let registry = self
             .collation_registry
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if constraint.index_for_registry(&registry).is_some() {
+            let mut seen = HashSet::new();
+            for row in self.rows.iter() {
+                let row_values = self.read_row_values(cx, row)?;
+                if let Some(key) = Self::unique_key_for_constraint(
+                    &row_values,
+                    &constraint.columns,
+                    &constraint.collations,
+                    self.unique_key_encoding(),
+                ) && !seen.insert(key)
+                {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
+
         for (idx, row) in self.rows.iter().enumerate() {
-            if self.rows[idx + 1..].iter().any(|other| {
-                Self::unique_constraint_matches_row(
-                    &row.values,
-                    &other.values,
+            let row_values = self.read_row_values(cx, row)?;
+            for other in &self.rows[idx + 1..] {
+                let other_values = self.read_row_values(cx, other)?;
+                if Self::unique_constraint_matches_row(
+                    &row_values,
+                    &other_values,
                     &constraint.columns,
                     &constraint.collations,
                     &registry,
-                )
-            }) {
-                return false;
+                    self.unique_key_encoding(),
+                ) {
+                    return Ok(false);
+                }
             }
         }
-        true
+        Ok(true)
     }
 
     /// Find rows that conflict with `new_values` on any UNIQUE constraint.
     /// Returns the rowids of all conflicting rows.
-    pub fn find_unique_conflicts(&self, new_values: &[SqliteValue]) -> Vec<i64> {
+    pub fn find_unique_conflicts(&self, cx: &Cx, new_values: &[SqliteValue]) -> Result<Vec<i64>> {
         let mut conflicts = BTreeSet::new();
         let mut collations = None;
         for constraint in self.unique_constraints.iter() {
-            if let Some(index) = &constraint.index {
+            let registry = collations.get_or_insert_with(|| {
+                self.collation_registry
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            });
+            if let Some(index) = constraint.index_for_registry(registry) {
                 if let Some(key) = Self::unique_key_for_constraint(
                     new_values,
                     &constraint.columns,
                     &constraint.collations,
+                    self.unique_key_encoding(),
                 ) && let Some(rowids) = index.get(&key)
                 {
                     conflicts.extend(rowids.iter().copied());
@@ -1021,24 +1372,21 @@ impl MemTable {
                 continue;
             }
 
-            let registry = collations.get_or_insert_with(|| {
-                self.collation_registry
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-            });
             for row in self.rows.iter() {
+                let row_values = self.read_row_values(cx, row)?;
                 if Self::unique_constraint_matches_row(
-                    &row.values,
+                    &row_values,
                     new_values,
                     &constraint.columns,
                     &constraint.collations,
                     registry,
+                    self.unique_key_encoding(),
                 ) {
                     conflicts.insert(row.rowid);
                 }
             }
         }
-        conflicts.into_iter().collect()
+        Ok(conflicts.into_iter().collect())
     }
 
     /// bd-towj6: the label of the first UNIQUE constraint `new_values` violates.
@@ -1049,41 +1397,48 @@ impl MemTable {
     /// success path. Returns `None` when the conflicting constraint was
     /// registered without a label, leaving the caller's previous wording in
     /// place. The flag is whether that constraint is the table's PRIMARY KEY.
-    #[must_use]
-    pub fn find_unique_conflict_label(&self, new_values: &[SqliteValue]) -> Option<(&str, bool)> {
+    pub fn find_unique_conflict_label(&self, cx: &Cx, new_values: &[SqliteValue]) -> Result<Option<(&str, bool)>> {
         let mut collations = None;
         for constraint in self.unique_constraints.iter() {
-            let violated = if let Some(index) = &constraint.index {
+            let registry = collations.get_or_insert_with(|| {
+                self.collation_registry
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            });
+            let violated = if let Some(index) = constraint.index_for_registry(registry) {
                 Self::unique_key_for_constraint(
                     new_values,
                     &constraint.columns,
                     &constraint.collations,
+                    self.unique_key_encoding(),
                 )
                 .is_some_and(|key| index.contains_key(&key))
             } else {
-                let registry = collations.get_or_insert_with(|| {
-                    self.collation_registry
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                });
-                self.rows.iter().any(|row| {
-                    Self::unique_constraint_matches_row(
-                        &row.values,
+                let mut found = false;
+                for row in self.rows.iter() {
+                    let row_values = self.read_row_values(cx, row)?;
+                    if Self::unique_constraint_matches_row(
+                        &row_values,
                         new_values,
                         &constraint.columns,
                         &constraint.collations,
                         registry,
-                    )
-                })
+                        self.unique_key_encoding(),
+                    ) {
+                        found = true;
+                        break;
+                    }
+                }
+                found
             };
             if violated {
-                return constraint
+                return Ok(constraint
                     .label
                     .as_deref()
-                    .map(|label| (label, constraint.primary_key));
+                    .map(|label| (label, constraint.primary_key)));
             }
         }
-        None
+        Ok(None)
     }
 
     /// Allocate a new unique rowid.
@@ -1136,32 +1491,70 @@ impl MemTable {
         }
         let new_keys = self.unique_keys_for_values(&values);
         if self.rows.last().is_none_or(|row| row.rowid < rowid) {
-            self.rows_mut().push(MemRow { rowid, values });
+            self.rows_mut().push(MemRow {
+                rowid,
+                values,
+                spilled: None,
+            });
             self.insert_unique_keys(rowid, &new_keys);
             return;
         }
         // Replace if rowid already exists (UPSERT semantics).
         match self.rows.binary_search_by_key(&rowid, |r| r.rowid) {
             Ok(idx) => {
-                let old_values = {
-                    let row = &mut self.rows_mut()[idx];
-                    std::mem::replace(&mut row.values, values)
-                };
-                self.remove_unique_entries(rowid, &old_values);
+                let old = std::mem::replace(&mut self.rows_mut()[idx], MemRow { rowid, values, spilled: None });
+                if old.spilled.is_some() && let Some(spill) = self.temp_spill.as_mut() {
+                    spill.spilled_row_count = spill.spilled_row_count.saturating_sub(1);
+                }
+                self.forget_unique_row(&old);
                 self.insert_unique_keys(rowid, &new_keys);
             }
             Err(idx) => {
-                self.rows_mut().insert(idx, MemRow { rowid, values });
+                self.rows_mut().insert(
+                    idx,
+                    MemRow {
+                        rowid,
+                        values,
+                        spilled: None,
+                    },
+                );
                 self.insert_unique_keys(rowid, &new_keys);
             }
         }
+    }
+
+    /// Hydrate any spilled rows inline and detach the VFS spill controller so a
+    /// read-only snapshot (such as `:memory:` time-travel capture) never pins a
+    /// live `TrackedTempFile` handle after the live `TEMP` table is dropped or
+    /// `PRAGMA temp_store` changes mode.
+    fn detach_temp_spill_for_snapshot(&mut self, cx: &Cx) -> Result<()> {
+        self.hydrate_all_spilled_rows(cx)?;
+        self.temp_spill = None;
+        Ok(())
     }
 
     /// Delete a row by rowid. Returns true if a row was found and deleted.
     pub fn delete_by_rowid(&mut self, rowid: i64) -> bool {
         if let Ok(idx) = self.rows.binary_search_by_key(&rowid, |r| r.rowid) {
             let row = self.rows_mut().remove(idx);
-            self.remove_unique_entries(row.rowid, &row.values);
+            let now_empty = self.rows.is_empty();
+            if let Some(spill) = self.temp_spill.as_mut() {
+                if row.spilled.is_some() {
+                    spill.spilled_row_count = spill.spilled_row_count.saturating_sub(1);
+                }
+                if now_empty {
+                    spill.resident_bytes = 0;
+                    spill.spilled_row_count = 0;
+                    if Arc::strong_count(&spill.file) == 1 {
+                        let mut guard = spill
+                            .file
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let _ = guard.take();
+                    }
+                }
+            }
+            self.forget_unique_row(&row);
             true
         } else {
             false
@@ -1174,6 +1567,17 @@ impl MemTable {
         match Arc::get_mut(&mut self.rows) {
             Some(rows) => rows.clear(),
             None => self.rows = Arc::new(Vec::new()),
+        }
+        if let Some(spill) = self.temp_spill.as_mut() {
+            spill.resident_bytes = 0;
+            spill.spilled_row_count = 0;
+            if Arc::strong_count(&spill.file) == 1 {
+                let mut guard = spill
+                    .file
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _ = guard.take();
+            }
         }
         if self
             .unique_constraints
@@ -1210,7 +1614,8 @@ impl MemTable {
     /// appending `default_val` for any missing trailing columns.
     /// Used after ALTER TABLE ADD COLUMN to make pre-existing rows
     /// visible with the new column's default value.
-    pub fn pad_rows_to_column_count(&mut self, target_cols: usize, default_val: &SqliteValue) {
+    pub fn pad_rows_to_column_count(&mut self, cx: &Cx, target_cols: usize, default_val: &SqliteValue) -> Result<()> {
+        self.hydrate_all_spilled_rows(cx)?;
         self.num_columns = target_cols;
         for row in self.rows_mut() {
             while row.values.len() < target_cols {
@@ -1218,6 +1623,7 @@ impl MemTable {
             }
         }
         self.rebuild_unique_indexes();
+        Ok(())
     }
 
     /// bd-01uq7: store computed VIRTUAL generated values in `column`, keyed by
@@ -1225,9 +1631,11 @@ impl MemTable {
     /// padded by ALTER TABLE ADD COLUMN).
     pub fn materialize_column_values(
         &mut self,
+        cx: &Cx,
         column: usize,
         values: impl IntoIterator<Item = (i64, SqliteValue)>,
-    ) {
+    ) -> Result<()> {
+        self.hydrate_all_spilled_rows(cx)?;
         for (rowid, value) in values {
             if let Ok(idx) = self.rows.binary_search_by_key(&rowid, |r| r.rowid)
                 && let Some(cell) = self.rows_mut()[idx].values.get_mut(column)
@@ -1236,6 +1644,7 @@ impl MemTable {
             }
         }
         self.rebuild_unique_indexes();
+        Ok(())
     }
 
     /// Remove one declared column from every materialized row.
@@ -1243,7 +1652,8 @@ impl MemTable {
     /// TEMP tables use `MemTable` as their authoritative storage.  Keep the
     /// table's direct UNIQUE-constraint column positions aligned with the
     /// rewritten row image when `ALTER TABLE ... DROP COLUMN` removes a slot.
-    fn remove_column_from_rows(&mut self, removed_slot: usize) {
+    fn remove_column_from_rows(&mut self, cx: &Cx, removed_slot: usize) -> Result<()> {
+        self.hydrate_all_spilled_rows(cx)?;
         self.num_columns = self.num_columns.saturating_sub(1);
         for row in self.rows_mut() {
             if removed_slot < row.values.len() {
@@ -1258,6 +1668,37 @@ impl MemTable {
             }
         }
         self.rebuild_unique_indexes();
+        Ok(())
+    }
+
+    /// Hydrate any spilled rows back into inline storage before an in-place
+    /// schema rewrite (`ALTER TABLE ADD/DROP COLUMN`).
+    fn hydrate_all_spilled_rows(&mut self, cx: &Cx) -> Result<()> {
+        if !self.has_spilled_rows() {
+            return Ok(());
+        }
+        // Preserve all spill locations until every read has succeeded. A failed
+        // or cancelled read must leave the old row image available for retry.
+        let spill = self.temp_spill.as_ref().expect("has_spilled_rows");
+        let mut loaded = Vec::with_capacity(spill.spilled_row_count);
+        let mut hydrated_bytes = 0usize;
+        for (pos, row) in self.rows.iter().enumerate() {
+            if let Some(slice) = row.spilled {
+                let values = spill.read_spilled_values(cx, slice)?;
+                hydrated_bytes = hydrated_bytes.saturating_add(estimate_mem_row_values_size(&values));
+                loaded.push((pos, values));
+            }
+        }
+        let rows = self.rows_mut();
+        for (pos, values) in loaded {
+            rows[pos].values = values;
+            rows[pos].spilled = None;
+        }
+        if let Some(state) = self.temp_spill.as_mut() {
+            state.spilled_row_count = 0;
+            state.resident_bytes = state.resident_bytes.saturating_add(hydrated_bytes);
+        }
+        Ok(())
     }
 
     /// Find a row by rowid. Returns the index.
@@ -1349,6 +1790,14 @@ impl MemTable {
         self.rows.iter().map(|r| (r.rowid, r.values.as_slice()))
     }
 
+    /// Iterate all rows as `(rowid, Cow<[SqliteValue]>)`, transparently
+    /// reading spilled `TEMP` rows from their spill file when needed.
+    pub fn iter_rows_cow<'a>(&'a self, cx: &'a Cx) -> impl Iterator<Item = Result<(i64, Cow<'a, [SqliteValue]>)>> + 'a {
+        self.rows
+            .iter()
+            .map(move |row| self.read_row_values(cx, row).map(|values| (row.rowid, values)))
+    }
+
     /// Insert a row with an explicit rowid (for loading from file).
     ///
     /// This is the public entry point used by the compat persistence
@@ -1360,10 +1809,17 @@ impl MemTable {
         self.insert(rowid, values);
     }
 
+    fn unique_key_encoding(&self) -> TextEncoding {
+        self.temp_spill
+            .as_ref()
+            .map_or(TextEncoding::Utf8, |spill| spill.text_encoding)
+    }
+
     fn unique_key_for_constraint(
         values: &[SqliteValue],
         columns: &[usize],
         collations: &[Option<String>],
+        encoding: TextEncoding,
     ) -> Option<Vec<u8>> {
         let mut key = Vec::with_capacity(columns.len() * 8);
         for (position, &col_idx) in columns.iter().enumerate() {
@@ -1372,7 +1828,7 @@ impl MemTable {
                 return None;
             }
             let collation = collations.get(position).and_then(|c| c.as_deref());
-            if !append_unique_constraint_key_component(&mut key, value, collation) {
+            if !append_unique_constraint_key_component(&mut key, value, collation, encoding) {
                 return None;
             }
         }
@@ -1385,6 +1841,7 @@ impl MemTable {
         columns: &[usize],
         collations: &[Option<String>],
         registry: &CollationRegistry,
+        encoding: TextEncoding,
     ) -> bool {
         for (position, &col_idx) in columns.iter().enumerate() {
             let Some(existing_value) = existing_values.get(col_idx) else {
@@ -1396,16 +1853,18 @@ impl MemTable {
             if existing_value.is_null() || new_value.is_null() {
                 return false;
             }
-            let collation = collations.get(position).and_then(|c| c.as_deref());
-            // UNIQUE-constraint duplicate detection is an equality test, which is
-            // encoding-invariant (a == b in UTF-8 iff in UTF-16), so the DB
-            // encoding is irrelevant here (bd-bld9w.4).
+            // The implicit collation is BINARY, which applications may also
+            // replace. Use the registry-aware comparator for that default.
+            let collation = collations
+                .get(position)
+                .and_then(|c| c.as_deref())
+                .unwrap_or("BINARY");
             if cmp_values_collated(
                 existing_value,
                 new_value,
-                collation,
+                Some(collation),
                 registry,
-                TextEncoding::Utf8,
+                encoding,
             ) != Ordering::Equal
             {
                 return false;
@@ -1414,10 +1873,28 @@ impl MemTable {
         true
     }
 
+    fn forget_unique_row(&mut self, row: &MemRow) {
+        if row.spilled.is_none() {
+            self.remove_unique_entries(row.rowid, &row.values);
+        } else if self.unique_constraints.iter().any(|constraint| constraint.index.is_some()) {
+            // Rollback must be able to discard a spilled replacement after I/O
+            // failed. Its rowid already exists in the in-memory UNIQUE indexes.
+            for constraint in self.unique_constraints_mut() {
+                if let Some(index) = &mut constraint.index {
+                    index.retain(|_, rowids| {
+                        rowids.remove(&row.rowid);
+                        !rowids.is_empty()
+                    });
+                }
+            }
+        }
+    }
+
     fn remove_unique_entries(&mut self, rowid: i64, values: &[SqliteValue]) {
         if self.unique_constraints.iter().all(|constraint| constraint.index.is_none()) {
             return;
         }
+        let encoding = self.unique_key_encoding();
         for constraint in self.unique_constraints_mut() {
             let Some(index) = constraint.index.as_mut() else {
                 continue;
@@ -1426,6 +1903,7 @@ impl MemTable {
                 values,
                 &constraint.columns,
                 &constraint.collations,
+                encoding,
             ) else {
                 continue;
             };
@@ -1450,6 +1928,7 @@ impl MemTable {
                         values,
                         &constraint.columns,
                         &constraint.collations,
+                        self.unique_key_encoding(),
                     )
                 })
             })
@@ -1471,13 +1950,16 @@ impl MemTable {
         if self.unique_constraints.iter().all(|constraint| constraint.index.is_none()) {
             return;
         }
+        debug_assert!(!self.has_spilled_rows(), "DDL hydrates before rebuilding UNIQUE indexes");
+        let rows_ref = Arc::clone(&self.rows);
+        let encoding = self.unique_key_encoding();
         let constraints = Arc::make_mut(&mut self.unique_constraints);
         for constraint in constraints.iter_mut() {
             if let Some(index) = constraint.index.as_mut() {
                 index.clear();
             }
         }
-        for row in self.rows.iter() {
+        for row in rows_ref.iter() {
             for constraint in constraints.iter_mut() {
                 let Some(index) = constraint.index.as_mut() else {
                     continue;
@@ -1486,6 +1968,7 @@ impl MemTable {
                     &row.values,
                     &constraint.columns,
                     &constraint.collations,
+                    encoding,
                 ) {
                     index.entry(key).or_default().insert(row.rowid);
                 }
@@ -1568,6 +2051,167 @@ type SorterBlob = smallvec::SmallVec<[u8; SORTER_BLOB_INLINE_LEN]>;
 /// A sorter row's decoded sort key. A one-column key stays inside the row.
 type SorterKeyValues = smallvec::SmallVec<[SqliteValue; 1]>;
 
+/// The records a sorter holds before it looks for repeated ones
+/// (bd-w4pr1.13.8, lever G3). A smaller sorter never pays for the search.
+const SORTER_RUNS_FIRST_CHECK: usize = 4096;
+
+/// How a sorter's rows stand for the records inserted into it (bd-w4pr1.13.8,
+/// lever G3).
+///
+/// A GROUP BY whose aggregates read only its keys inserts records that are
+/// exactly their keys: a million-row table grouped into a thousand groups
+/// sorted a million copies of a thousand records. While `Collecting`, a row
+/// stands for `counts[i]` records that are byte for byte `rows[i]`. That gives
+/// the sort's answer as long as two records with equal keys are always the
+/// same bytes: copies of one record cannot be told apart, so every arrangement
+/// of the inserted records sorts to the same sequence of bytes, the distinct
+/// rows in key order with each emitted `counts[i]` times. Keys are equal here
+/// only as the comparator finds them equal: NULL, INTEGER by value, TEXT and
+/// BLOB by bytes, with no collation on any key. A REAL key (1 = 1.0 and
+/// -0.0 = 0.0 compare equal in different bytes) or equal keys in different
+/// bytes turn the runs back into rows ([`SorterCursor::expand_runs`]).
+#[derive(Clone)]
+enum SorterRuns {
+    /// One row per record; at [`SORTER_RUNS_FIRST_CHECK`] records the sorter
+    /// decides whether to collect runs.
+    Undecided,
+    /// One row per record until `ResetSorter`.
+    Off,
+    /// `rows[i]` stands for `counts[i]` identical records, and no two rows have
+    /// equal keys. `index` holds `(hash of the key, row)` for every row; the
+    /// hash starts from `seed`, drawn from `hasher`'s random state.
+    Collecting {
+        index: hashbrown::HashTable<(u64, usize)>,
+        seed: u64,
+        hasher: hashbrown::DefaultHashBuilder,
+        counts: Vec<u64>,
+        /// Records inserted while collecting, counted from the first check.
+        records: u64,
+        /// The record count at which compression is checked next.
+        next_check: u64,
+    },
+    /// Sorted: `rows[i]` stands for `counts[i]` identical records.
+    Sorted { counts: Vec<u64> },
+}
+
+/// What [`SorterCursor::collect_record`] did with a record.
+enum RunInsert {
+    /// The record joined a run or started one.
+    Taken,
+    /// As `Taken`, and the runs no longer compress the records 2x.
+    TakenBelowCompression,
+    /// The record cannot join runs; it is handed back to be inserted as a row.
+    Declined(SorterKeyValues, SorterBlob),
+}
+
+/// One step of [`sorter_run_key_hash`]: `state` and `word` folded through a
+/// 64x64 -> 128-bit multiply, whose two halves mix every input bit into both
+/// the high bits (the table's tags) and the low bits (its buckets).
+#[inline(always)]
+#[allow(clippy::cast_possible_truncation)]
+fn sorter_run_hash_mix(state: u64, word: u64) -> u64 {
+    let product = u128::from(state ^ word) * u128::from(0x9E37_79B9_7F4A_7C15_u64);
+    (product as u64) ^ ((product >> 64) as u64)
+}
+
+/// The hash of a sort key for [`SorterRuns::Collecting`], or `None` for a key
+/// that cannot be collected (one holding a REAL). `seed` is the sorter's own
+/// random start; TEXT and BLOB bytes go through `hasher`. A one-INTEGER key,
+/// the common GROUP BY key, costs one multiply.
+#[inline(always)]
+fn sorter_run_key_hash(
+    seed: u64,
+    hasher: &hashbrown::DefaultHashBuilder,
+    values: &[SqliteValue],
+) -> Option<u64> {
+    use std::hash::BuildHasher;
+    if let [SqliteValue::Integer(n)] = values {
+        return Some(sorter_run_hash_mix(seed ^ 1, u64::from_ne_bytes(n.to_ne_bytes())));
+    }
+    let mut state = seed;
+    for value in values {
+        state = match value {
+            SqliteValue::Null => sorter_run_hash_mix(state, 0x6E75_6C6C),
+            SqliteValue::Integer(n) => {
+                sorter_run_hash_mix(state ^ 1, u64::from_ne_bytes(n.to_ne_bytes()))
+            }
+            SqliteValue::Text(text) => {
+                sorter_run_hash_mix(state ^ 2, hasher.hash_one(text.as_bytes_direct()))
+            }
+            SqliteValue::Blob(bytes) => sorter_run_hash_mix(state ^ 3, hasher.hash_one(&**bytes)),
+            SqliteValue::Float(_) => return None,
+        };
+    }
+    Some(state)
+}
+
+/// Whether two collectable sort keys are equal as the sorter's comparator
+/// finds them with no collation: NULL with NULL, INTEGER by value, TEXT and
+/// BLOB by bytes, and the same number of key values.
+#[inline(always)]
+fn sorter_run_keys_equal(lhs: &[SqliteValue], rhs: &[SqliteValue]) -> bool {
+    if let ([SqliteValue::Integer(lhs)], [SqliteValue::Integer(rhs)]) = (lhs, rhs) {
+        return lhs == rhs;
+    }
+    lhs.len() == rhs.len()
+        && lhs.iter().zip(rhs).all(|pair| match pair {
+            (SqliteValue::Null, SqliteValue::Null) => true,
+            (SqliteValue::Integer(lhs), SqliteValue::Integer(rhs)) => lhs == rhs,
+            (SqliteValue::Text(lhs), SqliteValue::Text(rhs)) => {
+                lhs.as_bytes_direct() == rhs.as_bytes_direct()
+            }
+            (SqliteValue::Blob(lhs), SqliteValue::Blob(rhs)) => lhs == rhs,
+            _ => false,
+        })
+}
+
+/// Whether `ops` can position sorter `cursor_id` without sorting it: an
+/// unsorted `Rewind` reads the records in insertion order, which runs do not
+/// keep. `Last` and `Prev` are counted too, though they do not move a sorter
+/// today.
+fn program_reads_sorter_unsorted(ops: &[VdbeOp], cursor_id: i32) -> bool {
+    ops.iter().any(|op| {
+        op.p1 == cursor_id && matches!(op.opcode, Opcode::Rewind | Opcode::Last | Opcode::Prev)
+    })
+}
+
+/// A set of cursor ids, for the few cursors a program holds at once.
+///
+/// It replaces a `HashSet<i32>` whose two hashed probes per deleted row (the
+/// `Delete`'s insert, ~110 instructions, and the next `Next`'s remove) cost
+/// more than a linear scan of a handful of ids (bd-w4pr1.13.20, lever D). The
+/// operations return what `HashSet`'s do.
+#[derive(Debug, Default)]
+struct CursorIdSet(smallvec::SmallVec<[i32; 4]>);
+
+impl CursorIdSet {
+    /// Add `id`; `false` when it was already present.
+    fn insert(&mut self, id: i32) -> bool {
+        if self.0.contains(&id) {
+            return false;
+        }
+        self.0.push(id);
+        true
+    }
+
+    /// Remove `id`; `false` when it was absent.
+    fn remove(&mut self, id: i32) -> bool {
+        let Some(at) = self.0.iter().position(|&held| held == id) else {
+            return false;
+        };
+        self.0.swap_remove(at);
+        true
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
 /// Cursor state for sorter opcodes (`SorterOpen`, `SorterInsert`, ...).
 ///
 /// Supports external merge sort: when in-memory rows exceed `spill_threshold`
@@ -1588,18 +2232,35 @@ struct SorterCursor {
     /// encoding (UTF-16 code-unit order on a UTF-16 database) — bd-bld9w.4.
     /// `Utf8` (the default) keeps the previous canonical-UTF-8 byte order.
     text_encoding: TextEncoding,
-    /// Inserted records.
+    /// Inserted records, or runs of identical records (see `runs`).
     rows: Vec<SorterRow>,
+    /// Whether `rows` stand for one record each or for runs of them
+    /// (bd-w4pr1.13.8, lever G3).
+    runs: SorterRuns,
+    /// Whether this sorter may collect runs at all: no top-N bound and no
+    /// collation on any key. `ResetSorter` starts it `Undecided` again.
+    runs_allowed: bool,
     /// Current position after `SorterSort`/`SorterNext`.
     position: Option<usize>,
+    /// How many more times the row at `position` is emitted before the next
+    /// row: its run's count less the copies already emitted. Always 0 unless
+    /// `runs` is `Sorted`.
+    copies_left: u64,
     /// Position for which the lazy output decode cache is currently valid.
     cached_row_position: Option<usize>,
     /// Sorter-owned decode/materialization scratch for the current output row.
     cached_row_decode: RowDecodeScratch,
     /// Estimated bytes consumed by `rows` (approximate).
     memory_used: usize,
-    /// Memory limit before spilling to disk (default 100 MiB).
+    /// Memory limit before spilling to disk (governed by `PRAGMA temp_store`
+    /// and active temporary memory budgets).
     spill_threshold: usize,
+    /// Active `PRAGMA temp_store` runtime policy and VFS temp-file backend.
+    temp_store: TempStoreRuntime,
+    /// Caller execution context for cancellation-checked temp file I/O.
+    cx: Cx,
+    /// Whether this sorter has already recorded a memory-only allocation.
+    recorded_memory_only: bool,
     /// Sorted runs that have been spilled to disk.
     spill_runs: Vec<SpillRun>,
     /// Keep only the best N rows during insertion when ORDER BY is paired with
@@ -1687,61 +2348,46 @@ fn bloom_hash(val: &SqliteValue) -> u64 {
 }
 
 /// Approximate page size for spill accounting.
-///
-/// Used only for counting pages written during sorter spill operations.
-/// Ideally this would come from the database's actual page size, but the
-/// sorter runs at the VDBE level where the page size is available via
-/// `self.page_size`. For now, use the default. The spill page count metric
-/// is informational — it does not affect correctness.
-#[cfg(not(target_arch = "wasm32"))]
 const SORTER_SPILL_PAGE_SIZE: usize = fsqlite_types::limits::DEFAULT_PAGE_SIZE as usize;
 
-/// A sorted run that has been flushed to a temporary file.
+/// A sorted run that has been flushed to a tracked VFS temporary file.
 ///
 /// Each run stores length-prefixed serialized records in sorted order.
 /// Format per record: `[u32-le length][serialized record bytes]`.
 #[derive(Debug, Clone)]
 struct SpillRun {
-    /// Path to the temporary file containing serialized sorted records.
-    path: std::path::PathBuf,
+    /// Tracked VFS temporary file handle (delete-on-close).
+    file: Arc<TrackedTempFile>,
     /// Number of records in this run (used for merge accounting).
     #[allow(dead_code)]
     record_count: u64,
-    /// Total bytes written (used for page accounting).
-    #[allow(dead_code)]
+    /// Total bytes written (used for page accounting and bounded read-back).
     bytes_written: u64,
 }
 
 impl SorterCursor {
-    #[cfg(test)]
-    fn new(
-        key_columns: usize,
-        sort_key_orders: Vec<SortKeyOrder>,
-        collations: Vec<Option<String>>,
-    ) -> Self {
-        Self::with_collation_registry(
-            key_columns,
-            sort_key_orders,
-            collations,
-            Arc::new(Mutex::new(CollationRegistry::new())),
-            None,
-            TextEncoding::Utf8,
-        )
-    }
-
-    fn with_collation_registry(
+    #[allow(clippy::too_many_arguments)]
+    fn with_collation_registry_and_temp_store(
         key_columns: usize,
         mut sort_key_orders: Vec<SortKeyOrder>,
         collations: Vec<Option<String>>,
         collation_registry: Arc<Mutex<CollationRegistry>>,
         top_n_limit: Option<usize>,
         text_encoding: TextEncoding,
+        temp_store: TempStoreRuntime,
+        cx: Cx,
     ) -> Self {
         let key_columns = key_columns.max(1);
         if sort_key_orders.len() < key_columns {
             sort_key_orders.resize(key_columns, SortKeyOrder::Asc);
         }
         sort_key_orders.truncate(key_columns);
+        let runs_allowed = top_n_limit.is_none() && collations.iter().all(Option::is_none);
+        let spill_threshold = if temp_store.is_file_backed() {
+            temp_store.budget_bytes().max(1)
+        } else {
+            usize::MAX
+        };
         Self {
             key_columns,
             sort_key_orders,
@@ -1749,11 +2395,21 @@ impl SorterCursor {
             collation_registry,
             text_encoding,
             rows: Vec::new(),
+            runs: if runs_allowed {
+                SorterRuns::Undecided
+            } else {
+                SorterRuns::Off
+            },
+            runs_allowed,
             position: None,
+            copies_left: 0,
             cached_row_position: None,
             cached_row_decode: RowDecodeScratch::default(),
             memory_used: 0,
-            spill_threshold: SORTER_DEFAULT_SPILL_THRESHOLD,
+            spill_threshold,
+            temp_store,
+            cx,
+            recorded_memory_only: false,
             spill_runs: Vec::new(),
             top_n_limit,
             next_source_sequence: 0,
@@ -1892,8 +2548,14 @@ impl SorterCursor {
 
     /// Insert a row and spill to disk if memory exceeds the threshold.
     fn insert_record(&mut self, values: SorterKeyValues, blob: SorterBlob) -> Result<()> {
+        if self.cx.is_cancel_requested() {
+            return Err(FrankenError::Abort);
+        }
         if self.top_n_limit == Some(0) {
             return Ok(());
+        }
+        if !self.rows_are_records() {
+            return self.insert_record_with_runs(values, blob);
         }
 
         let new_row_size = Self::estimate_row_size(&values, &blob);
@@ -1901,11 +2563,9 @@ impl SorterCursor {
             // Rejection and replacement begin only once the heap reaches
             // `limit`, and the heap never shrinks afterward. Therefore
             // `len() < limit` proves that the retained prefix is still complete.
-            #[cfg(not(target_arch = "wasm32"))]
-            let can_downgrade_before_discarding = self.rows.len() < limit
+            let can_downgrade_before_discarding = self.temp_store.is_file_backed()
+                && self.rows.len() < limit
                 && self.memory_used.saturating_add(new_row_size) >= self.spill_threshold;
-            #[cfg(target_arch = "wasm32")]
-            let can_downgrade_before_discarding = false;
             if can_downgrade_before_discarding {
                 // The heap may have reordered equal-key rows. Restore scan
                 // order before handing the complete input prefix to the stable
@@ -1926,7 +2586,17 @@ impl SorterCursor {
                 if self.rows.len() < limit {
                     self.rows.push(new_row);
                     self.sift_top_n_heap_up(self.rows.len() - 1, &coll_guard);
-                    self.memory_used += new_row_size;
+                    self.memory_used = self.memory_used.saturating_add(new_row_size);
+                    self.temp_store
+                        .stats()
+                        .record_sorter_memory(self.memory_used as u64);
+                    if !self.temp_store.is_file_backed() {
+                        if !self.recorded_memory_only {
+                            self.recorded_memory_only = true;
+                            self.temp_store.stats().record_memory_only_allocation();
+                        }
+                        self.temp_store.check_memory_limit(self.memory_used)?;
+                    }
                     self.invalidate_output_row_cache();
                     return Ok(());
                 }
@@ -1937,6 +2607,12 @@ impl SorterCursor {
                         Self::estimate_row_size(&removed_row.values, &removed_row.blob);
                     self.memory_used = self.memory_used.saturating_sub(removed_size);
                     self.memory_used = self.memory_used.saturating_add(new_row_size);
+                    self.temp_store
+                        .stats()
+                        .record_sorter_memory(self.memory_used as u64);
+                    if !self.temp_store.is_file_backed() {
+                        self.temp_store.check_memory_limit(self.memory_used)?;
+                    }
                     self.sift_top_n_heap_down(0, &coll_guard);
                     self.invalidate_output_row_cache();
                 }
@@ -1944,7 +2620,24 @@ impl SorterCursor {
             }
         }
 
-        self.memory_used += new_row_size;
+        self.push_record(values, blob, new_row_size)
+    }
+
+    /// Append a record as one row and spill if memory exceeds the threshold.
+    #[inline(always)]
+    fn push_record(
+        &mut self,
+        values: SorterKeyValues,
+        blob: SorterBlob,
+        row_size: usize,
+    ) -> Result<()> {
+        if self.cx.is_cancel_requested() {
+            return Err(FrankenError::Abort);
+        }
+        self.memory_used = self.memory_used.saturating_add(row_size);
+        self.temp_store
+            .stats()
+            .record_sorter_memory(self.memory_used as u64);
         self.rows.push(SorterRow {
             values,
             blob,
@@ -1952,20 +2645,368 @@ impl SorterCursor {
         });
         self.invalidate_output_row_cache();
 
-        if self.memory_used >= self.spill_threshold {
+        if !self.temp_store.is_file_backed() {
+            if !self.recorded_memory_only {
+                self.recorded_memory_only = true;
+                self.temp_store.stats().record_memory_only_allocation();
+            }
+            self.temp_store.check_memory_limit(self.memory_used)?;
+        } else if self.memory_used >= self.spill_threshold {
             self.spill_to_disk()?;
         }
         Ok(())
     }
 
-    /// Sort the in-memory rows, write them to a temp file, and clear them.
-    #[cfg(not(target_arch = "wasm32"))]
-    fn spill_to_disk(&mut self) -> Result<()> {
-        use std::io::Write;
+    /// [`Self::insert_record`] for a sorter whose rows stand for runs
+    /// (bd-w4pr1.13.8, lever G3). Kept out of line so the insert of a sorter
+    /// with one row per record pays one test for it. A sorter with runs has
+    /// no top-N bound, so a record that does not join them is a plain append.
+    #[inline(never)]
+    fn insert_record_with_runs(&mut self, values: SorterKeyValues, blob: SorterBlob) -> Result<()> {
+        if self.cx.is_cancel_requested() {
+            return Err(FrankenError::Abort);
+        }
+        if matches!(self.runs, SorterRuns::Collecting { .. }) {
+            match self.collect_record(values, blob) {
+                RunInsert::Taken => {}
+                RunInsert::TakenBelowCompression => self.expand_runs(),
+                RunInsert::Declined(values, blob) => {
+                    self.expand_runs();
+                    let row_size = Self::estimate_row_size(&values, &blob);
+                    return self.push_record(values, blob, row_size);
+                }
+            }
+            self.temp_store
+                .stats()
+                .record_sorter_memory(self.memory_used as u64);
+            if !self.temp_store.is_file_backed() {
+                if !self.recorded_memory_only {
+                    self.recorded_memory_only = true;
+                    self.temp_store.stats().record_memory_only_allocation();
+                }
+                self.temp_store.check_memory_limit(self.memory_used)?;
+            } else if self.memory_used >= self.spill_threshold {
+                self.spill_to_disk()?;
+            }
+            return Ok(());
+        }
+        // An insert after the sort: rows go back to one per record, in the
+        // order the sort gave them, as a sorter without runs holds them.
+        self.expand_runs();
+        let row_size = Self::estimate_row_size(&values, &blob);
+        self.push_record(values, blob, row_size)
+    }
 
+    /// Insert a record from a `SorterInsert` of `ops`, the program that owns
+    /// sorter `cursor_id`; at [`SORTER_RUNS_FIRST_CHECK`] records an
+    /// `Undecided` sorter decides whether it collects runs
+    /// ([`Self::start_runs`]).
+    fn insert_program_record(
+        &mut self,
+        values: SorterKeyValues,
+        blob: SorterBlob,
+        ops: &[VdbeOp],
+        cursor_id: i32,
+    ) -> Result<()> {
+        self.insert_record(values, blob)?;
+        if matches!(self.runs, SorterRuns::Undecided) && self.rows.len() >= SORTER_RUNS_FIRST_CHECK
+        {
+            self.start_runs(!program_reads_sorter_unsorted(ops, cursor_id));
+        }
+        Ok(())
+    }
+
+    /// Decide, once, whether an `Undecided` sorter collects runs: it does when
+    /// `program_allows` (no unsorted read of this sorter in its program), it
+    /// has neither spilled nor been positioned, no record so far has a REAL
+    /// key, any two with equal keys are the same bytes, and they hold at most
+    /// half as many distinct records as records. The first record of each
+    /// key keeps its place, its later copies become its count. Otherwise the
+    /// sorter keeps one row per record, unchanged.
+    fn start_runs(&mut self, program_allows: bool) {
+        self.runs = SorterRuns::Off;
+        if !program_allows || !self.spill_runs.is_empty() || self.position.is_some() {
+            return;
+        }
+        let hasher = hashbrown::DefaultHashBuilder::default();
+        let seed = {
+            use std::hash::BuildHasher;
+            hasher.hash_one(SORTER_RUNS_FIRST_CHECK)
+        };
+        let rows = &self.rows;
+        let mut index: hashbrown::HashTable<(u64, usize)> = hashbrown::HashTable::new();
+        // The row each row repeats: itself for the first record of a key.
+        let mut first_of: Vec<usize> = Vec::with_capacity(rows.len());
+        for (at, row) in rows.iter().enumerate() {
+            let Some(hash) = sorter_run_key_hash(seed, &hasher, &row.values) else {
+                return;
+            };
+            let found = index
+                .find(hash, |&(entry_hash, first)| {
+                    entry_hash == hash && sorter_run_keys_equal(&rows[first].values, &row.values)
+                })
+                .map(|&(_, first)| first);
+            let first = match found {
+                Some(first) if rows[first].blob == row.blob => first,
+                Some(_) => return,
+                None => {
+                    index.insert_unique(hash, (hash, at), |&(entry_hash, _)| entry_hash);
+                    at
+                }
+            };
+            first_of.push(first);
+        }
+        let records = rows.len();
+        if index.len().saturating_mul(2) > records {
+            return;
+        }
+        // Keep each first record; its copies become its count. `slot_of` maps
+        // a first record's place in `rows` to its place in `kept`.
+        let mut slot_of: Vec<usize> = vec![usize::MAX; records];
+        let mut kept: Vec<SorterRow> = Vec::with_capacity(index.len());
+        let mut counts: Vec<u64> = Vec::with_capacity(index.len());
+        for (at, row) in std::mem::take(&mut self.rows).into_iter().enumerate() {
+            let first = first_of[at];
+            if first == at {
+                slot_of[at] = kept.len();
+                kept.push(row);
+                counts.push(1);
+            } else {
+                counts[slot_of[first]] += 1;
+                self.memory_used = self
+                    .memory_used
+                    .saturating_sub(Self::estimate_row_size(&row.values, &row.blob));
+            }
+        }
+        for entry in index.iter_mut() {
+            entry.1 = slot_of[entry.1];
+        }
+        self.rows = kept;
+        let records = records as u64;
+        self.runs = SorterRuns::Collecting {
+            index,
+            seed,
+            hasher,
+            counts,
+            records,
+            next_check: records.saturating_mul(2),
+        };
+        self.invalidate_output_row_cache();
+    }
+
+    /// Add one record to a `Collecting` sorter: to the run of its key when it
+    /// is that run's bytes, as a new run when its key has none. A REAL key, or
+    /// a key whose run holds other bytes, is handed back without changing
+    /// anything. At each doubling of the record count the runs must still
+    /// compress the records 2x.
+    fn collect_record(&mut self, values: SorterKeyValues, blob: SorterBlob) -> RunInsert {
+        let SorterRuns::Collecting {
+            index,
+            seed,
+            hasher,
+            counts,
+            records,
+            next_check,
+        } = &mut self.runs
+        else {
+            return RunInsert::Declined(values, blob);
+        };
+        let Some(hash) = sorter_run_key_hash(*seed, hasher, &values) else {
+            return RunInsert::Declined(values, blob);
+        };
+        let rows = &mut self.rows;
+        let found = index
+            .find(hash, |&(entry_hash, slot)| {
+                entry_hash == hash && sorter_run_keys_equal(&rows[slot].values, &values)
+            })
+            .map(|&(_, slot)| slot);
+        match found {
+            Some(slot) => {
+                if rows[slot].blob != blob {
+                    return RunInsert::Declined(values, blob);
+                }
+                counts[slot] += 1;
+            }
+            None => {
+                let slot = rows.len();
+                self.memory_used += Self::estimate_row_size(&values, &blob);
+                rows.push(SorterRow {
+                    values,
+                    blob,
+                    source_sequence: 0,
+                });
+                index.insert_unique(hash, (hash, slot), |&(entry_hash, _)| entry_hash);
+                counts.push(1);
+            }
+        }
+        *records += 1;
+        if *records < *next_check {
+            return RunInsert::Taken;
+        }
+        *next_check = next_check.saturating_mul(2);
+        if (rows.len() as u64).saturating_mul(2) > *records {
+            RunInsert::TakenBelowCompression
+        } else {
+            RunInsert::Taken
+        }
+    }
+
+    /// Turn runs back into one row per record, each run's copies beside it
+    /// (any arrangement of identical records sorts the same), and keep one
+    /// row per record until `ResetSorter`. A sorted sorter keeps its place:
+    /// the row it is on, at the copy it has reached.
+    fn expand_runs(&mut self) {
+        let counts = match std::mem::replace(&mut self.runs, SorterRuns::Off) {
+            SorterRuns::Collecting { counts, .. } | SorterRuns::Sorted { counts } => counts,
+            other => {
+                self.runs = other;
+                return;
+            }
+        };
+        let position = self.position.map(|pos| {
+            let before: u64 = counts[..pos].iter().sum();
+            before + (counts[pos] - 1 - self.copies_left)
+        });
+        self.copies_left = 0;
+        let records: u64 = counts.iter().sum();
+        if records != self.rows.len() as u64 {
+            let mut expanded: Vec<SorterRow> =
+                Vec::with_capacity(usize::try_from(records).unwrap_or(self.rows.len()));
+            for (row, count) in std::mem::take(&mut self.rows).into_iter().zip(counts) {
+                if count > 1 {
+                    let size = Self::estimate_row_size(&row.values, &row.blob);
+                    for _ in 1..count {
+                        self.memory_used = self.memory_used.saturating_add(size);
+                        expanded.push(row.clone());
+                    }
+                }
+                expanded.push(row);
+            }
+            self.rows = expanded;
+        }
+        self.position = position.and_then(|pos| usize::try_from(pos).ok());
+        self.invalidate_output_row_cache();
+    }
+
+    /// Sort runs of distinct keys with their counts. Keys are distinct, so
+    /// the order is the same under any sort; one INTEGER key sorts by the
+    /// key (a DESC key as its complement), anything else by the comparator.
+    fn sort_runs(
+        key_columns: usize,
+        sort_key_orders: &[SortKeyOrder],
+        collations: &[Option<String>],
+        collation_registry: &CollationRegistry,
+        text_encoding: TextEncoding,
+        rows: &mut Vec<SorterRow>,
+        counts: Vec<u64>,
+    ) -> Vec<u64> {
+        let descending = matches!(
+            sort_key_orders.first(),
+            Some(SortKeyOrder::Desc | SortKeyOrder::DescNullsFirst)
+        );
+        let integer_key = |row: &SorterRow| match row.values.first() {
+            Some(SqliteValue::Integer(key)) if key_columns == 1 => {
+                Some(if descending { !*key } else { *key })
+            }
+            _ => None,
+        };
+        let mut runs: Vec<(SorterRow, u64)> = std::mem::take(rows).into_iter().zip(counts).collect();
+        if runs.iter().all(|(row, _)| integer_key(row).is_some()) {
+            runs.sort_unstable_by_key(|(row, _)| integer_key(row));
+        } else {
+            runs.sort_by(|(lhs, _), (rhs, _)| {
+                compare_sorter_rows(
+                    &lhs.values,
+                    &rhs.values,
+                    key_columns,
+                    sort_key_orders,
+                    collations,
+                    collation_registry,
+                    text_encoding,
+                )
+            });
+        }
+        let (sorted, counts): (Vec<SorterRow>, Vec<u64>) = runs.into_iter().unzip();
+        *rows = sorted;
+        counts
+    }
+
+    /// The runs' counts, leaving `runs` `Off`; `None` when rows are records.
+    fn take_run_counts(&mut self) -> Option<Vec<u64>> {
+        match std::mem::replace(&mut self.runs, SorterRuns::Off) {
+            SorterRuns::Collecting { counts, .. } | SorterRuns::Sorted { counts } => Some(counts),
+            other => {
+                self.runs = other;
+                None
+            }
+        }
+    }
+
+    /// Whether every row is one record (no runs), as code that reads `rows`
+    /// directly, such as the index bulk load, needs.
+    const fn rows_are_records(&self) -> bool {
+        matches!(self.runs, SorterRuns::Undecided | SorterRuns::Off)
+    }
+
+    /// Copies of the row at `at` emitted after its first: its run's count
+    /// less one.
+    fn copies_after(&self, at: usize) -> u64 {
+        match &self.runs {
+            SorterRuns::Sorted { counts } => counts.get(at).map_or(0, |count| count - 1),
+            _ => 0,
+        }
+    }
+
+    /// Position at the first record; `false` when there is none.
+    fn position_at_first(&mut self) -> bool {
+        if self.rows.is_empty() {
+            self.position = None;
+            self.copies_left = 0;
+            false
+        } else {
+            self.position = Some(0);
+            self.copies_left = self.copies_after(0);
+            true
+        }
+    }
+
+    /// Advance to the next record: another copy of the current row while its
+    /// run has copies left, else the next row; `false` past the last.
+    fn advance(&mut self) -> bool {
+        let Some(pos) = self.position else {
+            return false;
+        };
+        if self.copies_left > 0 {
+            self.copies_left -= 1;
+            return true;
+        }
+        let next = pos + 1;
+        if next < self.rows.len() {
+            self.position = Some(next);
+            self.copies_left = self.copies_after(next);
+            true
+        } else {
+            self.position = None;
+            false
+        }
+    }
+
+    /// Sort the in-memory rows, write them to a tracked VFS temp file, and clear them.
+    fn spill_to_disk(&mut self) -> Result<()> {
+        if self.cx.is_cancel_requested() {
+            return Err(FrankenError::Abort);
+        }
+        if !self.temp_store.is_file_backed() {
+            self.spill_threshold = usize::MAX;
+            return self.temp_store.check_memory_limit(self.memory_used);
+        }
         if self.rows.is_empty() {
             return Ok(());
         }
+
+        // A sorter collecting runs writes each run's record its count times
+        // and keeps one row per record from here on.
+        let run_counts = self.take_run_counts();
 
         // Sort current batch — lock collation registry once for entire sort.
         // A run is sorted the way an in-memory sort is: a single INTEGER key
@@ -1979,87 +3020,95 @@ impl SorterCursor {
             .collation_registry
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if !Self::sort_rows_by_single_integer_key(key_columns, &orders, &mut self.rows) {
-            self.rows.sort_by(|lhs, rhs| {
-                compare_sorter_rows(
-                    &lhs.values,
-                    &rhs.values,
-                    key_columns,
-                    &orders,
-                    &colls,
-                    &coll_guard,
-                    text_encoding,
-                )
-            });
-        }
+        let run_counts = if let Some(counts) = run_counts {
+            Some(Self::sort_runs(
+                key_columns,
+                &orders,
+                &colls,
+                &coll_guard,
+                text_encoding,
+                &mut self.rows,
+                counts,
+            ))
+        } else {
+            if !Self::sort_rows_by_single_integer_key(key_columns, &orders, &mut self.rows) {
+                self.rows.sort_by(|lhs, rhs| {
+                    compare_sorter_rows(
+                        &lhs.values,
+                        &rhs.values,
+                        key_columns,
+                        &orders,
+                        &colls,
+                        &coll_guard,
+                        text_encoding,
+                    )
+                });
+            }
+            None
+        };
         drop(coll_guard);
 
-        // Write to temp file.  We use `keep()` to detach the auto-delete
-        // guard so the file persists until we explicitly remove it in
-        // `sort()` / `reset()`.
-        let tmp = tempfile::NamedTempFile::new()
-            .map_err(|e| FrankenError::internal(format!("sorter spill tempfile: {e}")))?;
-        let (file, path) = tmp
-            .keep()
-            .map_err(|e| FrankenError::internal(format!("sorter spill keep: {e}")))?;
-        let mut writer = std::io::BufWriter::new(file);
-
-        let record_count = self.rows.len() as u64;
+        let temp_file = self.temp_store.create_temp_file(&self.cx, "sorter_run")?;
+        let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+        let mut flush_offset: u64 = 0;
+        let mut record_count: u64 = 0;
         let mut bytes_written: u64 = 0;
-        for row in &self.rows {
-            // Write the raw blob directly instead of re-serializing from
-            // decoded values.  The blob is the original record bytes from
-            // MakeRecord and is identical to what serialize_record would
-            // produce (but without the decode→re-encode round-trip).
-            #[allow(clippy::cast_possible_truncation)]
-            let len_bytes = (row.blob.len() as u32).to_le_bytes();
-            writer
-                .write_all(&len_bytes)
-                .map_err(|e| FrankenError::internal(format!("sorter spill write len: {e}")))?;
-            writer
-                .write_all(&row.blob)
-                .map_err(|e| FrankenError::internal(format!("sorter spill write data: {e}")))?;
-            bytes_written += 4 + row.blob.len() as u64;
+
+        let write_result: Result<()> = (|| {
+            for (at, row) in self.rows.iter().enumerate() {
+                if at.trailing_zeros() >= 8 && self.cx.is_cancel_requested() {
+                    return Err(FrankenError::Abort);
+                }
+                #[allow(clippy::cast_possible_truncation)]
+                let len_bytes = (row.blob.len() as u32).to_le_bytes();
+                let copies = run_counts.as_ref().map_or(1, |counts| counts[at]);
+                for _ in 0..copies {
+                    buf.extend_from_slice(&len_bytes);
+                    buf.extend_from_slice(&row.blob);
+                    bytes_written = bytes_written.saturating_add(4 + row.blob.len() as u64);
+                    if buf.len() >= 64 * 1024 {
+                        temp_file.write_at(&self.cx, flush_offset, &buf)?;
+                        flush_offset = flush_offset.saturating_add(buf.len() as u64);
+                        buf.clear();
+                    }
+                }
+                record_count = record_count.saturating_add(copies);
+            }
+            if !buf.is_empty() {
+                temp_file.write_at(&self.cx, flush_offset, &buf)?;
+                buf.clear();
+            }
+            Ok(())
+        })();
+
+        if let Err(err) = write_result {
+            let _ = temp_file.close_with_cx(&self.cx);
+            return Err(err);
         }
-        writer
-            .flush()
-            .map_err(|e| FrankenError::internal(format!("sorter spill flush: {e}")))?;
 
         #[allow(clippy::cast_possible_truncation)]
         let pages = (bytes_written as usize).div_ceil(SORTER_SPILL_PAGE_SIZE);
-        self.spill_pages_total += pages as u64;
+        self.spill_pages_total = self.spill_pages_total.saturating_add(pages as u64);
+        self.temp_store.stats().record_sorter_spill(bytes_written);
 
-        tracing::warn!(
+        tracing::debug!(
             rows = record_count,
             bytes = bytes_written,
             pages,
             run_index = self.spill_runs.len(),
-            "sorter spilling to disk"
+            "sorter spilling run to VFS temp file"
         );
 
         self.spill_runs.push(SpillRun {
-            path,
+            file: temp_file,
             record_count,
             bytes_written,
         });
 
-        self.rows_sorted_total += record_count;
+        self.rows_sorted_total = self.rows_sorted_total.saturating_add(record_count);
         self.rows.clear();
         self.invalidate_output_row_cache();
         self.memory_used = 0;
-        Ok(())
-    }
-
-    /// Browser builds do not have a portable temp-file story yet, so sorter
-    /// spill currently degrades to a pure in-memory sort path.
-    #[cfg(target_arch = "wasm32")]
-    fn spill_to_disk(&mut self) -> Result<()> {
-        self.spill_threshold = usize::MAX;
-        tracing::warn!(
-            rows = self.rows.len(),
-            bytes = self.memory_used,
-            "sorter spill requested on wasm; keeping rows in memory"
-        );
         Ok(())
     }
 
@@ -2135,6 +3184,30 @@ impl SorterCursor {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
 
+        // Runs sort as (row, count) pairs and stay runs for the output
+        // (a sorter collecting runs has never spilled); a sorter still
+        // `Undecided` keeps one row per record from here on.
+        match std::mem::replace(&mut self.runs, SorterRuns::Off) {
+            SorterRuns::Collecting { counts, .. } | SorterRuns::Sorted { counts } => {
+                debug_assert!(self.spill_runs.is_empty());
+                let counts = Self::sort_runs(
+                    self.key_columns,
+                    &self.sort_key_orders,
+                    &self.collations,
+                    &coll_guard,
+                    self.text_encoding,
+                    &mut self.rows,
+                    counts,
+                );
+                drop(coll_guard);
+                self.rows_sorted_total += counts.iter().sum::<u64>();
+                self.runs = SorterRuns::Sorted { counts };
+                self.invalidate_output_row_cache();
+                return Ok(());
+            }
+            SorterRuns::Undecided | SorterRuns::Off => {}
+        }
+
         if self.spill_runs.is_empty() {
             if self.top_n_limit.is_some() {
                 let key_columns = self.key_columns;
@@ -2207,17 +3280,22 @@ impl SorterCursor {
         }
 
         // Collect all runs: disk runs first, then in-memory remainder.
+        if self.cx.is_cancel_requested() {
+            return Err(FrankenError::Abort);
+        }
         let mut run_iters: Vec<RunIterator> = Vec::with_capacity(self.spill_runs.len() + 1);
         for run in &self.spill_runs {
-            run_iters.push(RunIterator::from_file(
-                &run.path,
+            run_iters.push(RunIterator::from_temp_file(
+                Arc::clone(&run.file),
+                self.cx.clone(),
+                run.bytes_written,
                 self.key_columns,
                 self.text_encoding,
-            )?);
+            ));
         }
         if !self.rows.is_empty() {
             let mem_rows = std::mem::take(&mut self.rows);
-            self.rows_sorted_total += mem_rows.len() as u64;
+            self.rows_sorted_total = self.rows_sorted_total.saturating_add(mem_rows.len() as u64);
             run_iters.push(RunIterator::from_memory(mem_rows));
         }
 
@@ -2229,7 +3307,16 @@ impl SorterCursor {
             iter.advance()?;
         }
 
+        let mut merge_steps: usize = 0;
         loop {
+            if merge_steps.trailing_zeros() >= 8 && self.cx.is_cancel_requested() {
+                drop(run_iters);
+                for run in self.spill_runs.drain(..) {
+                    let _ = run.file.close_with_cx(&self.cx);
+                }
+                return Err(FrankenError::Abort);
+            }
+            merge_steps = merge_steps.saturating_add(1);
             // Find the run with the smallest current element.
             let mut best_idx: Option<usize> = None;
             for (i, iter) in run_iters.iter().enumerate() {
@@ -2266,17 +3353,18 @@ impl SorterCursor {
             run_iters[idx].advance()?;
         }
 
+        let merged_run_count = self.spill_runs.len() + 1;
         tracing::debug!(
             rows = merged.len(),
-            runs = self.spill_runs.len() + 1,
+            runs = merged_run_count,
             "sorter merge complete"
         );
 
-        // Clean up temp files.
-        for run in &self.spill_runs {
-            let _ = std::fs::remove_file(&run.path);
+        // Close and unlink all VFS temp run files immediately.
+        drop(run_iters);
+        for run in self.spill_runs.drain(..) {
+            let _ = run.file.close_with_cx(&self.cx);
         }
-        self.spill_runs.clear();
         self.rows = merged;
         drop(coll_guard);
         self.invalidate_output_row_cache();
@@ -2287,15 +3375,20 @@ impl SorterCursor {
     /// Clear all rows and spill state (for `ResetSorter`).
     fn reset(&mut self) {
         self.rows.clear();
+        self.runs = if self.runs_allowed {
+            SorterRuns::Undecided
+        } else {
+            SorterRuns::Off
+        };
         self.position = None;
+        self.copies_left = 0;
         self.invalidate_output_row_cache();
         self.memory_used = 0;
         self.next_source_sequence = 0;
-        // Clean up temp files.
-        for run in &self.spill_runs {
-            let _ = std::fs::remove_file(&run.path);
+        // Close and unlink VFS temp run files.
+        for run in self.spill_runs.drain(..) {
+            let _ = run.file.close_with_cx(&self.cx);
         }
-        self.spill_runs.clear();
     }
 
     fn invalidate_output_row_cache(&mut self) {
@@ -2306,17 +3399,84 @@ impl SorterCursor {
 
 impl Drop for SorterCursor {
     fn drop(&mut self) {
-        for run in &self.spill_runs {
-            let _ = std::fs::remove_file(&run.path);
+        for run in self.spill_runs.drain(..) {
+            let _ = run.file.close_with_cx(&self.cx);
         }
+    }
+}
+
+/// Buffered sequential reader over a [`TrackedTempFile`] sorted run.
+struct TrackedTempRunReader {
+    file: Arc<TrackedTempFile>,
+    cx: Cx,
+    offset: u64,
+    total_len: u64,
+    buf: Vec<u8>,
+    buf_pos: usize,
+    buf_len: usize,
+}
+
+impl TrackedTempRunReader {
+    fn new(file: Arc<TrackedTempFile>, cx: Cx, total_len: u64) -> Self {
+        Self {
+            file,
+            cx,
+            offset: 0,
+            total_len,
+            buf: vec![0u8; 64 * 1024],
+            buf_pos: 0,
+            buf_len: 0,
+        }
+    }
+
+    fn read_exact_or_eof(&mut self, mut dst: &mut [u8]) -> Result<bool> {
+        let mut total_read = 0usize;
+        while !dst.is_empty() {
+            if self.buf_pos < self.buf_len {
+                let avail = self.buf_len - self.buf_pos;
+                let take = avail.min(dst.len());
+                dst[..take].copy_from_slice(&self.buf[self.buf_pos..self.buf_pos + take]);
+                self.buf_pos += take;
+                dst = &mut dst[take..];
+                total_read += take;
+                continue;
+            }
+            if self.offset >= self.total_len {
+                if total_read == 0 {
+                    return Ok(false);
+                }
+                return Err(FrankenError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "truncated sorter spill run",
+                )));
+            }
+            let remaining = (self.total_len - self.offset) as usize;
+            let to_read = remaining.min(self.buf.len());
+            let n = self
+                .file
+                .read_at(&self.cx, self.offset, &mut self.buf[..to_read])?;
+            if n == 0 {
+                if total_read == 0 {
+                    return Ok(false);
+                }
+                return Err(FrankenError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "unexpected EOF reading sorter spill run",
+                )));
+            }
+            self.offset = self.offset.saturating_add(n as u64);
+            self.buf_pos = 0;
+            self.buf_len = n;
+        }
+        Ok(true)
     }
 }
 
 /// Iterator over records in a sorted run (either disk-backed or in-memory).
 enum RunIterator {
-    /// Records read from a temporary file.
+    /// Records read from a tracked VFS temporary file.
     File {
-        reader: std::io::BufReader<std::fs::File>,
+        reader: TrackedTempRunReader,
         current: Option<SorterRow>,
         /// Number of leading sort-key columns to decode from spilled records.
         key_columns: usize,
@@ -2331,19 +3491,19 @@ enum RunIterator {
 }
 
 impl RunIterator {
-    fn from_file(
-        path: &std::path::Path,
+    fn from_temp_file(
+        file: Arc<TrackedTempFile>,
+        cx: Cx,
+        total_len: u64,
         key_columns: usize,
         text_encoding: TextEncoding,
-    ) -> Result<Self> {
-        let file = std::fs::File::open(path)
-            .map_err(|e| FrankenError::internal(format!("sorter run open: {e}")))?;
-        Ok(Self::File {
-            reader: std::io::BufReader::new(file),
+    ) -> Self {
+        Self::File {
+            reader: TrackedTempRunReader::new(file, cx, total_len),
             current: None,
             key_columns,
             text_encoding,
-        })
+        }
     }
 
     fn from_memory(rows: Vec<SorterRow>) -> Self {
@@ -2375,39 +3535,37 @@ impl RunIterator {
                 key_columns,
                 text_encoding,
             } => {
-                use std::io::Read;
                 let mut len_buf = [0u8; 4];
-                match reader.read_exact(&mut len_buf) {
-                    Ok(()) => {
-                        let len = u32::from_le_bytes(len_buf) as usize;
-                        // Read the record straight into the row: a short one
-                        // needs no heap block of its own.
-                        let mut blob = SorterBlob::from_elem(0, len);
-                        reader
-                            .read_exact(&mut blob)
-                            .map_err(|e| FrankenError::internal(format!("sorter run read: {e}")))?;
-                        // Decode only the sort-key prefix — not all columns — and
-                        // under the DB encoding so a spilled UTF-16 key sorts the
-                        // same as the in-memory path (bd-7c6g7 #5).
-                        let values = fsqlite_types::record::parse_record_prefix_with_encoding(
-                            &blob,
-                            *key_columns,
-                            *text_encoding,
-                        )
-                        .ok_or_else(|| FrankenError::internal("sorter run: malformed record"))?;
-                        *current = Some(SorterRow {
-                            values: SorterKeyValues::from_vec(values),
-                            blob,
-                            source_sequence: 0,
-                        });
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                        *current = None;
-                    }
-                    Err(e) => {
-                        return Err(FrankenError::internal(format!("sorter run read len: {e}")));
-                    }
+                if !reader.read_exact_or_eof(&mut len_buf)? {
+                    *current = None;
+                    return Ok(());
                 }
+                let len = u32::from_le_bytes(len_buf) as usize;
+                // Read the record straight into the row: a short one
+                // needs no heap block of its own.
+                let mut blob = SorterBlob::from_elem(0, len);
+                if !reader.read_exact_or_eof(&mut blob)? && len > 0 {
+                    return Err(FrankenError::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "truncated sorter spill record payload",
+                    )));
+                }
+                // Decode only the sort-key prefix — not all columns — and
+                // under the DB encoding so a spilled UTF-16 key sorts the
+                // same as the in-memory path (bd-7c6g7 #5).
+                let values = fsqlite_types::record::parse_record_prefix_with_encoding(
+                    &blob,
+                    *key_columns,
+                    *text_encoding,
+                )
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "sorter run: malformed record".to_owned(),
+                })?;
+                *current = Some(SorterRow {
+                    values: SorterKeyValues::from_vec(values),
+                    blob,
+                    source_sequence: 0,
+                });
             }
             Self::Memory { rows, current } => {
                 *current = rows.next();
@@ -2597,6 +3755,28 @@ impl SharedTxnPageIo {
 
     fn concurrent_context(&self) -> Option<ConcurrentContext> {
         self.concurrent.borrow().clone()
+    }
+
+    /// The check a B-tree page read makes before it reads the pager
+    /// transaction: a page this concurrent transaction freed is refused.
+    /// Whether or not the page has a staged write, the read is then the pager
+    /// transaction's (its write set answers first).
+    fn refuse_page_freed_in_concurrent_transaction(&self, page_no: PageNumber) -> Result<()> {
+        let concurrent = self.concurrent.borrow();
+        let Some(ctx) = concurrent.as_ref() else {
+            return Ok(());
+        };
+        let handle = ctx.handle.lock();
+        if concurrent_has_page_state(&handle) && concurrent_page_read_status(&handle, page_no).0 {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "page {} was freed earlier in concurrent transaction {}",
+                    page_no.get(),
+                    ctx.txn_id
+                ),
+            });
+        }
+        Ok(())
     }
 
     fn clear_stale_synthetic_pending_commit_surface(
@@ -3819,37 +4999,36 @@ impl PageReader for SharedTxnPageIo {
         self.txn.borrow().get_page(cx, page_no).await
     }
 
-    // bd-h9o9r: a RefCell borrow (or sync mutex guard) is held across an
-    // await in this function's body. The engine executes strictly
-    // sequentially per connection, but the reachable-reentrancy audit and
-    // borrow-scope repair belong to the Phase-C reconstruction.
-    #[allow(clippy::await_holding_refcell_ref, clippy::await_holding_lock)]
+    // bd-h9o9r: a RefCell borrow is held across an await in this function's
+    // body. The engine executes strictly sequentially per connection, but the
+    // reachable-reentrancy audit and borrow-scope repair belong to the Phase-C
+    // reconstruction.
+    #[allow(clippy::await_holding_refcell_ref)]
     async fn read_btree_page_data(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
-        if let Some(ctx) = self.concurrent_context() {
-            let has_staged_write = {
-                let handle = ctx.handle.lock();
-                let (is_freed, has_staged_write) = if concurrent_has_page_state(&handle) {
-                    concurrent_page_read_status(&handle, page_no)
-                } else {
-                    (false, false)
-                };
-                if is_freed {
-                    return Err(FrankenError::DatabaseCorrupt {
-                        detail: format!(
-                            "page {} was freed earlier in concurrent transaction {}",
-                            page_no.get(),
-                            ctx.txn_id
-                        ),
-                    });
-                }
-                has_staged_write
-            };
-
-            if has_staged_write {
-                return self.txn.borrow().get_page(cx, page_no).await;
-            }
-        }
+        self.refuse_page_freed_in_concurrent_transaction(page_no)?;
         self.txn.borrow().get_page(cx, page_no).await
+    }
+
+    fn read_resident_btree_page_data(
+        &self,
+        cx: &Cx,
+        page_no: PageNumber,
+    ) -> Option<Result<PageData>> {
+        if let Err(error) = self.refuse_page_freed_in_concurrent_transaction(page_no) {
+            return Some(Err(error));
+        }
+        self.txn.borrow().get_resident_page(cx, page_no)
+    }
+
+    // The resident answer just made the concurrent-context check; see the
+    // bd-h9o9r note on `read_btree_page_data` for the borrow held here.
+    #[allow(clippy::await_holding_refcell_ref)]
+    async fn read_nonresident_btree_page_data(
+        &self,
+        cx: &Cx,
+        page_no: PageNumber,
+    ) -> Result<PageData> {
+        self.txn.borrow().get_nonresident_page(cx, page_no).await
     }
 
     fn record_read_witness(&self, _cx: &Cx, key: WitnessKey) {
@@ -3864,15 +5043,51 @@ impl PageReader for SharedTxnPageIo {
         // not a dirty-page oracle (metadata writes can also be exempt).
         self.txn.borrow().is_page_dirty(page_no)
     }
+
+    fn tracks_dirty_pages(&self) -> bool {
+        true
+    }
 }
 
 impl PageWriter for SharedTxnPageIo {
+    // bd-i2u1c: the shared transaction carries the connection's
+    // `PRAGMA secure_delete` policy; without these two the VDBE's cursors
+    // saw the trait's OFF default whatever the transaction was set to.
+    fn secure_delete_mode(&self) -> SecureDeleteMode {
+        self.txn.borrow().secure_delete_mode()
+    }
+
+    fn note_freed_page_zeroed(&mut self, page_no: PageNumber) {
+        self.txn.borrow_mut().note_freed_page_zeroed(page_no);
+    }
+
+    #[allow(clippy::await_holding_refcell_ref)]
     async fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
         let page_size = self.txn.borrow().page_size().as_usize();
         let page_data = normalize_owned_page_data(page_size, data)?;
-        self.write_page_internal(cx, page_no, page_data).await
+        let ptrmap_sizes = self.txn.borrow().pointer_map_page_sizes();
+        let sync_bytes = if let Some((usable_size, full_page_size)) = ptrmap_sizes
+            && !fsqlite_types::is_ptrmap_page(page_no, usable_size, full_page_size)
+        {
+            Some((page_data.clone(), usable_size))
+        } else {
+            None
+        };
+        self.write_page_internal(cx, page_no, page_data).await?;
+        if let Some((written, usable_size)) = sync_bytes {
+            fsqlite_btree::freelist::ptrmap_sync_btree_page_children_on_txn(
+                cx,
+                &mut *self.txn.borrow_mut(),
+                page_no,
+                written.as_bytes(),
+                usable_size,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
+    #[allow(clippy::await_holding_refcell_ref)]
     async fn write_page_data(
         &mut self,
         cx: &Cx,
@@ -3881,7 +5096,26 @@ impl PageWriter for SharedTxnPageIo {
     ) -> Result<()> {
         let page_size = self.txn.borrow().page_size().as_usize();
         let page_data = normalize_page_data_to_size(page_size, data)?;
-        self.write_page_internal(cx, page_no, page_data).await
+        let ptrmap_sizes = self.txn.borrow().pointer_map_page_sizes();
+        let sync_bytes = if let Some((usable_size, full_page_size)) = ptrmap_sizes
+            && !fsqlite_types::is_ptrmap_page(page_no, usable_size, full_page_size)
+        {
+            Some((page_data.clone(), usable_size))
+        } else {
+            None
+        };
+        self.write_page_internal(cx, page_no, page_data).await?;
+        if let Some((written, usable_size)) = sync_bytes {
+            fsqlite_btree::freelist::ptrmap_sync_btree_page_children_on_txn(
+                cx,
+                &mut *self.txn.borrow_mut(),
+                page_no,
+                written.as_bytes(),
+                usable_size,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     fn try_mutate_staged_page_data(
@@ -3889,6 +5123,9 @@ impl PageWriter for SharedTxnPageIo {
         page_no: PageNumber,
         f: &mut dyn FnMut(&mut PageData),
     ) -> bool {
+        if self.txn.borrow().pointer_map_page_sizes().is_some() {
+            return false;
+        }
         if let Some(ctx) = self.concurrent_context() {
             let has_staged_write = {
                 let handle = ctx.handle.lock();
@@ -4183,23 +5420,71 @@ impl PageWriter for SharedTxnPageIo {
         self.txn.borrow_mut().record_write_witness(cx, key);
     }
 
-    /// bd-ujp0h: a concurrent transaction claims the page as conflict-only
-    /// (page lock plus first-committer-wins tracking, no staged bytes), so a
-    /// structural claim adds no WAL frame. Without a concurrent context the
-    /// caller restages the page instead.
+    /// Memory transactions can publish structural claims through their shared
+    /// in-process page locks and commit index without staging unchanged bytes.
+    /// File-backed transactions must restage the page: another process neither
+    /// sees this commit index nor discovers a conflict-only claim in the WAL.
+    /// In particular, a split that moves the right edge off an unchanged leaf
+    /// must publish that leaf so a peer cannot append beyond its new divider
+    /// (bd-73pfl). Returning false uses the caller's existing snapshot image
+    /// and ordinary page-write path, including cross-process FCW validation.
     fn claim_write_conflict_page<'a>(
         &'a mut self,
         cx: &'a Cx,
         page_no: PageNumber,
     ) -> impl std::future::Future<Output = Result<bool>> + 'a {
         let claimed = match self.concurrent_context() {
-            Some(ctx) => {
+            Some(ctx)
+                if matches!(
+                    &*self.txn.borrow(),
+                    TransactionKind::Memory(_)
+                        | TransactionKind::Mock(_)
+                        | TransactionKind::MemoryMock(_)
+                ) =>
+            {
                 track_concurrent_conflict_only_page(cx, &ctx, page_no, "claim_write_conflict_page")
                     .map(|()| true)
             }
-            None => Ok(false),
+            Some(_) | None => Ok(false),
         };
         std::future::ready(claimed)
+    }
+
+    fn pointer_map_page_sizes(&self) -> Option<(u32, u32)> {
+        self.txn.borrow().pointer_map_page_sizes()
+    }
+
+    #[allow(clippy::await_holding_refcell_ref)]
+    async fn read_ptrmap_entry(
+        &self,
+        cx: &Cx,
+        child_page: PageNumber,
+    ) -> Result<fsqlite_types::PtrMapEntry> {
+        self.txn.borrow().read_ptrmap_entry(cx, child_page).await
+    }
+
+    #[allow(clippy::await_holding_refcell_ref)]
+    async fn write_ptrmap_entry(
+        &mut self,
+        cx: &Cx,
+        child_page: PageNumber,
+        entry: fsqlite_types::PtrMapEntry,
+    ) -> Result<()> {
+        self.txn
+            .borrow_mut()
+            .write_ptrmap_entry(cx, child_page, entry)
+            .await
+    }
+
+    async fn write_raw_page_data(
+        &mut self,
+        cx: &Cx,
+        page_no: PageNumber,
+        data: PageData,
+    ) -> Result<()> {
+        let page_size = self.txn.borrow().page_size().as_usize();
+        let page_data = normalize_page_data_to_size(page_size, data)?;
+        self.write_page_internal(cx, page_no, page_data).await
     }
 }
 
@@ -4376,11 +5661,249 @@ impl PageWriter for TimeTravelPageIo {
 // - `Txn`: backed by SharedTxnPageIo (Phase 5 production path)
 // - `TimeTravel`: backed by TimeTravelPageIo (historical snapshot reads)
 
+/// Page store for ephemeral B-trees (`OpenAutoindex`) governed by live
+/// `PRAGMA temp_store` budgets (bd-dwjnq.5).
+///
+/// Pages stay resident up to `runtime.budget_bytes()`. Once resident bytes
+/// exceed the budget in `FILE` mode, cold pages are evicted LRU-first into a
+/// tracked VFS temp file (`TrackedTempFile`) and read back transparently on
+/// demand. Dropping the store closes and unlinks the temp file automatically.
+#[derive(Debug)]
+struct TempSpillPageStore {
+    resident: HashMap<u32, Vec<u8>>,
+    lru: VecDeque<u32>,
+    spilled_offsets: HashMap<u32, u64>,
+    spill_file: Option<Arc<TrackedTempFile>>,
+    next_spill_offset: u64,
+    next_alloc_pgno: u32,
+    page_size: u32,
+    runtime: TempStoreRuntime,
+    secure_delete_mode: SecureDeleteMode,
+    recorded_memory_only: bool,
+}
+
+impl TempSpillPageStore {
+    #[allow(clippy::cast_possible_truncation)]
+    fn with_empty_index(
+        root_page: PageNumber,
+        page_size: u32,
+        runtime: TempStoreRuntime,
+    ) -> Self {
+        let mut page = vec![0u8; page_size as usize];
+        page[0] = 0x0A; // LeafIndex
+        let content_offset = page_size as u16;
+        page[5..7].copy_from_slice(&content_offset.to_be_bytes());
+        let mut resident = HashMap::new();
+        resident.insert(root_page.get(), page);
+        let mut lru = VecDeque::new();
+        lru.push_back(root_page.get());
+        Self {
+            resident,
+            lru,
+            spilled_offsets: HashMap::new(),
+            spill_file: None,
+            next_spill_offset: 0,
+            next_alloc_pgno: root_page.get().saturating_add(1).max(2),
+            page_size,
+            runtime,
+            secure_delete_mode: SecureDeleteMode::Off,
+            recorded_memory_only: false,
+        }
+    }
+
+    fn touch_lru(&mut self, pgno: u32) {
+        if let Some(pos) = self.lru.iter().position(|&p| p == pgno) {
+            self.lru.remove(pos);
+        }
+        self.lru.push_back(pgno);
+    }
+
+    fn enforce_budget(&mut self, cx: &Cx, pinned_pgno: u32) -> Result<()> {
+        if cx.is_cancel_requested() {
+            return Err(FrankenError::Abort);
+        }
+        let page_bytes = self.page_size as usize;
+        if !self.runtime.is_file_backed() {
+            if !self.recorded_memory_only {
+                self.recorded_memory_only = true;
+                self.runtime.stats().record_memory_only_allocation();
+            }
+            let resident_bytes = self.resident.len().saturating_mul(page_bytes);
+            return self.runtime.check_memory_limit(resident_bytes);
+        }
+
+        let budget = self.runtime.budget_bytes();
+        while self.resident.len().saturating_mul(page_bytes) > budget && self.resident.len() > 1 {
+            if cx.is_cancel_requested() {
+                return Err(FrankenError::Abort);
+            }
+            let Some(victim_pos) = self.lru.iter().position(|&p| p != pinned_pgno) else {
+                break;
+            };
+            let Some(victim_pgno) = self.lru.remove(victim_pos) else {
+                break;
+            };
+            let Some(victim_bytes) = self.resident.get(&victim_pgno) else {
+                continue;
+            };
+            if self.spill_file.is_none() {
+                let opened = self.runtime.create_temp_file(cx, "temp_btree")?;
+                self.spill_file = Some(opened);
+            }
+            let file = self
+                .spill_file
+                .as_ref()
+                .expect("spill_file initialized above");
+            let offset = if let Some(&existing) = self.spilled_offsets.get(&victim_pgno) {
+                existing
+            } else {
+                let off = self.next_spill_offset;
+                self.next_spill_offset = self
+                    .next_spill_offset
+                    .saturating_add(u64::from(self.page_size));
+                off
+            };
+            file.write_at(cx, offset, victim_bytes)?;
+            self.spilled_offsets.insert(victim_pgno, offset);
+            self.resident.remove(&victim_pgno);
+            self.runtime
+                .stats()
+                .record_temp_index_spill(u64::from(self.page_size));
+        }
+        Ok(())
+    }
+}
+
+#[allow(clippy::manual_async_fn)]
+impl PageReader for TempSpillPageStore {
+    fn read_page<'a>(
+        &'a self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>>> + 'a {
+        async move {
+            if cx.is_cancel_requested() {
+                return Err(FrankenError::Abort);
+            }
+            let pgno = page_no.get();
+            if let Some(page) = self.resident.get(&pgno) {
+                return Ok(page.clone());
+            }
+            if let Some(&offset) = self.spilled_offsets.get(&pgno) {
+                let file = self.spill_file.as_ref().ok_or_else(|| {
+                    FrankenError::internal("spilled temp B-tree page missing spill file")
+                })?;
+                let mut buf = vec![0u8; self.page_size as usize];
+                file.read_exact_at(cx, offset, &mut buf)?;
+                return Ok(buf);
+            }
+            Err(FrankenError::internal("temp page not found"))
+        }
+    }
+
+    fn read_page_data<'a>(
+        &'a self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl std::future::Future<Output = Result<PageData>> + 'a {
+        async move {
+            let bytes = self.read_page(cx, page_no).await?;
+            Ok(PageData::from_vec(bytes))
+        }
+    }
+}
+
+#[allow(clippy::manual_async_fn)]
+impl PageWriter for TempSpillPageStore {
+    fn secure_delete_mode(&self) -> SecureDeleteMode {
+        self.secure_delete_mode
+    }
+
+    fn write_page<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+        data: &'a [u8],
+    ) -> impl std::future::Future<Output = Result<()>> + 'a {
+        async move {
+            if cx.is_cancel_requested() {
+                return Err(FrankenError::Abort);
+            }
+            let page_size = self.page_size as usize;
+            if data.len() > page_size {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "temp page store refused oversized page write: {} > {}",
+                        data.len(),
+                        page_size
+                    ),
+                });
+            }
+            let pgno = page_no.get();
+            let mut page = vec![0u8; page_size];
+            page[..data.len()].copy_from_slice(data);
+            self.resident.insert(pgno, page);
+            self.touch_lru(pgno);
+            self.enforce_budget(cx, pgno)
+        }
+    }
+
+    fn write_page_data<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+        data: PageData,
+    ) -> impl std::future::Future<Output = Result<()>> + 'a {
+        async move { self.write_page(cx, page_no, data.as_bytes()).await }
+    }
+
+    fn allocate_page<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+    ) -> impl std::future::Future<Output = Result<PageNumber>> + 'a {
+        async move {
+            if cx.is_cancel_requested() {
+                return Err(FrankenError::Abort);
+            }
+            let next = self.next_alloc_pgno;
+            self.next_alloc_pgno = self
+                .next_alloc_pgno
+                .checked_add(1)
+                .ok_or(FrankenError::DatabaseFull)?;
+            let pgno = PageNumber::new(next).ok_or(FrankenError::DatabaseFull)?;
+            self.resident.insert(next, vec![0u8; self.page_size as usize]);
+            self.touch_lru(next);
+            self.enforce_budget(cx, next)?;
+            Ok(pgno)
+        }
+    }
+
+    fn free_page<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl std::future::Future<Output = Result<()>> + 'a {
+        async move {
+            let pgno = page_no.get();
+            self.resident.remove(&pgno);
+            self.spilled_offsets.remove(&pgno);
+            if let Some(pos) = self.lru.iter().position(|&p| p == pgno) {
+                self.lru.remove(pos);
+            }
+            Ok(())
+        }
+    }
+
+    fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
+}
+
 /// Backend for a storage cursor, dispatching between in-memory,
-/// transaction-backed, and time-travel page I/O.
+/// spillable temporary B-tree, transaction-backed, and time-travel page I/O.
 enum CursorBackend {
     /// In-memory page store (used by tests and Phase 4 fallback).
     Mem(BtCursor<MemPageStore>),
+    /// Spillable VFS-backed temporary B-tree (`OpenAutoindex` under `PRAGMA temp_store`).
+    Temp(BtCursor<TempSpillPageStore>),
     /// Real pager transaction (Phase 5 production path, bd-2a3y).
     Txn(BtCursor<SharedTxnPageIo>),
     /// Time-travel snapshot (historical reads via MVCC version store).
@@ -4391,6 +5914,7 @@ impl std::fmt::Debug for CursorBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Mem(c) => f.debug_tuple("Mem").field(c).finish(),
+            Self::Temp(c) => f.debug_tuple("Temp").field(c).finish(),
             Self::Txn(c) => f.debug_tuple("Txn").field(c).finish(),
             Self::TimeTravel(c) => f.debug_tuple("TimeTravel").field(c).finish(),
         }
@@ -4423,6 +5947,7 @@ impl CursorBackend {
     fn kind_str(&self) -> &'static str {
         match self {
             Self::Mem(_) => "mem",
+            Self::Temp(_) => "temp",
             Self::Txn(_) => "txn",
             Self::TimeTravel(_) => "time_travel",
         }
@@ -4433,6 +5958,7 @@ impl CursorBackend {
     fn is_table_btree(&self) -> bool {
         match self {
             Self::Mem(c) => c.is_table(),
+            Self::Temp(c) => c.is_table(),
             Self::Txn(c) => c.is_table(),
             Self::TimeTravel(c) => c.is_table(),
         }
@@ -4442,6 +5968,7 @@ impl CursorBackend {
     fn usable_size(&self) -> u32 {
         match self {
             Self::Mem(c) => c.usable_size(),
+            Self::Temp(c) => c.usable_size(),
             Self::Txn(c) => c.usable_size(),
             Self::TimeTravel(c) => c.usable_size(),
         }
@@ -4451,6 +5978,7 @@ impl CursorBackend {
     fn page_size(&self) -> u32 {
         match self {
             Self::Mem(c) => c.page_size(),
+            Self::Temp(c) => c.page_size(),
             Self::Txn(c) => c.page_size(),
             Self::TimeTravel(c) => c.page_size(),
         }
@@ -4460,6 +5988,7 @@ impl CursorBackend {
     fn index_desc_flags(&self) -> &[bool] {
         match self {
             Self::Mem(c) => c.index_desc_flags(),
+            Self::Temp(c) => c.index_desc_flags(),
             Self::Txn(c) => c.index_desc_flags(),
             Self::TimeTravel(c) => c.index_desc_flags(),
         }
@@ -4469,6 +5998,7 @@ impl CursorBackend {
     fn index_collations(&self) -> &[Option<String>] {
         match self {
             Self::Mem(c) => c.index_collations(),
+            Self::Temp(c) => c.index_collations(),
             Self::Txn(c) => c.index_collations(),
             Self::TimeTravel(c) => c.index_collations(),
         }
@@ -4478,6 +6008,7 @@ impl CursorBackend {
     fn collation_registry(&self) -> Arc<Mutex<CollationRegistry>> {
         match self {
             Self::Mem(c) => c.collation_registry(),
+            Self::Temp(c) => c.collation_registry(),
             Self::Txn(c) => c.collation_registry(),
             Self::TimeTravel(c) => c.collation_registry(),
         }
@@ -4489,6 +6020,7 @@ impl CursorBackend {
     async fn first(&mut self, cx: &Cx) -> Result<bool> {
         match self {
             Self::Mem(c) => c.first(cx).await,
+            Self::Temp(c) => c.first(cx).await,
             Self::Txn(c) => c.first(cx).await,
             Self::TimeTravel(c) => c.first(cx).await,
         }
@@ -4497,6 +6029,7 @@ impl CursorBackend {
     async fn last(&mut self, cx: &Cx) -> Result<bool> {
         match self {
             Self::Mem(c) => c.last(cx).await,
+            Self::Temp(c) => c.last(cx).await,
             Self::Txn(c) => c.last(cx).await,
             Self::TimeTravel(c) => c.last(cx).await,
         }
@@ -4505,6 +6038,7 @@ impl CursorBackend {
     async fn next(&mut self, cx: &Cx) -> Result<bool> {
         match self {
             Self::Mem(c) => c.next(cx).await,
+            Self::Temp(c) => c.next(cx).await,
             Self::Txn(c) => c.next(cx).await,
             Self::TimeTravel(c) => c.next(cx).await,
         }
@@ -4516,8 +6050,22 @@ impl CursorBackend {
     fn try_next_within_leaf(&mut self, cx: &Cx) -> Result<Option<bool>> {
         match self {
             Self::Mem(c) => c.try_advance_next_within_leaf(cx),
+            Self::Temp(c) => c.try_advance_next_within_leaf(cx),
             Self::Txn(c) => c.try_advance_next_within_leaf(cx),
             Self::TimeTravel(c) => c.try_advance_next_within_leaf(cx),
+        }
+    }
+
+    /// [`Self::table_move_to`] without waiting, for a seek that lands on the
+    /// current leaf page. `None` means the cursor is untouched and
+    /// `table_move_to` must run.
+    #[inline]
+    fn try_table_seek_within_leaf(&mut self, cx: &Cx, rowid: i64) -> Result<Option<SeekResult>> {
+        match self {
+            Self::Mem(c) => c.try_table_seek_within_leaf(cx, rowid),
+            Self::Temp(c) => c.try_table_seek_within_leaf(cx, rowid),
+            Self::Txn(c) => c.try_table_seek_within_leaf(cx, rowid),
+            Self::TimeTravel(c) => c.try_table_seek_within_leaf(cx, rowid),
         }
     }
 
@@ -4526,14 +6074,31 @@ impl CursorBackend {
     async fn count_all_rows(&mut self, cx: &Cx) -> Result<i64> {
         match self {
             Self::Mem(c) => c.count_all_rows(cx).await,
+            Self::Temp(c) => c.count_all_rows(cx).await,
             Self::Txn(c) => c.count_all_rows(cx).await,
             Self::TimeTravel(c) => c.count_all_rows(cx).await,
+        }
+    }
+
+    /// bd-2fb53: [`BtCursor::count_entries_before`].
+    async fn count_entries_before(
+        &mut self,
+        cx: &Cx,
+        bound: Option<&[u8]>,
+        inclusive: bool,
+    ) -> Result<u64> {
+        match self {
+            Self::Mem(c) => c.count_entries_before(cx, bound, inclusive).await,
+            Self::Temp(c) => c.count_entries_before(cx, bound, inclusive).await,
+            Self::Txn(c) => c.count_entries_before(cx, bound, inclusive).await,
+            Self::TimeTravel(c) => c.count_entries_before(cx, bound, inclusive).await,
         }
     }
 
     async fn prev(&mut self, cx: &Cx) -> Result<bool> {
         match self {
             Self::Mem(c) => c.prev(cx).await,
+            Self::Temp(c) => c.prev(cx).await,
             Self::Txn(c) => c.prev(cx).await,
             Self::TimeTravel(c) => c.prev(cx).await,
         }
@@ -4542,6 +6107,7 @@ impl CursorBackend {
     fn eof(&self) -> bool {
         match self {
             Self::Mem(c) => c.eof(),
+            Self::Temp(c) => c.eof(),
             Self::Txn(c) => c.eof(),
             Self::TimeTravel(c) => c.eof(),
         }
@@ -4550,6 +6116,7 @@ impl CursorBackend {
     async fn rowid(&self, cx: &Cx) -> Result<i64> {
         match self {
             Self::Mem(c) => c.rowid(cx).await,
+            Self::Temp(c) => c.rowid(cx).await,
             Self::Txn(c) => c.rowid(cx).await,
             Self::TimeTravel(c) => c.rowid(cx).await,
         }
@@ -4561,8 +6128,22 @@ impl CursorBackend {
     fn try_table_leaf_rowid(&self) -> Result<Option<i64>> {
         match self {
             Self::Mem(c) => c.try_table_leaf_rowid(),
+            Self::Temp(c) => c.try_table_leaf_rowid(),
             Self::Txn(c) => c.try_table_leaf_rowid(),
             Self::TimeTravel(c) => c.try_table_leaf_rowid(),
+        }
+    }
+
+    /// [`Self::delete`] without waiting, for a table-leaf cell the b-tree
+    /// removes from a leaf the transaction holds staged; `false` changes
+    /// nothing. A time-travel cursor never deletes.
+    #[inline]
+    fn try_delete_table_leaf_cell_in_staged_image(&mut self) -> bool {
+        match self {
+            Self::Mem(c) => c.try_delete_table_leaf_cell_in_staged_image(),
+            Self::Temp(c) => c.try_delete_table_leaf_cell_in_staged_image(),
+            Self::Txn(c) => c.try_delete_table_leaf_cell_in_staged_image(),
+            Self::TimeTravel(_) => false,
         }
     }
 
@@ -4572,6 +6153,7 @@ impl CursorBackend {
     fn current_row_has_local_table_payload(&self) -> Result<bool> {
         match self {
             Self::Mem(c) => c.current_row_has_local_table_payload(),
+            Self::Temp(c) => c.current_row_has_local_table_payload(),
             Self::Txn(c) => c.current_row_has_local_table_payload(),
             Self::TimeTravel(c) => c.current_row_has_local_table_payload(),
         }
@@ -4587,19 +6169,23 @@ impl CursorBackend {
     ) -> Result<bool> {
         match self {
             Self::Mem(c) => c.try_local_table_payload_prefix_into(max_prefix_bytes, buf),
+            Self::Temp(c) => c.try_local_table_payload_prefix_into(max_prefix_bytes, buf),
             Self::Txn(c) => c.try_local_table_payload_prefix_into(max_prefix_bytes, buf),
             Self::TimeTravel(c) => c.try_local_table_payload_prefix_into(max_prefix_bytes, buf),
         }
     }
 
-    /// The current row's rowid and where its payload lies on the leaf page,
-    /// for a table-leaf cell stored whole on its leaf; `None` otherwise.
+    /// The current row's rowid, where its payload lies on the leaf page and
+    /// those payload bytes, for a table-leaf cell stored whole on its leaf;
+    /// `None` otherwise.
     #[inline]
-    fn current_local_table_row_span(&self) -> Result<Option<(i64, std::ops::Range<usize>)>> {
+    #[allow(clippy::type_complexity)]
+    fn current_local_table_row(&self) -> Result<Option<(i64, std::ops::Range<usize>, &[u8])>> {
         match self {
-            Self::Mem(c) => c.current_local_table_row_span(),
-            Self::Txn(c) => c.current_local_table_row_span(),
-            Self::TimeTravel(c) => c.current_local_table_row_span(),
+            Self::Mem(c) => c.current_local_table_row(),
+            Self::Temp(c) => c.current_local_table_row(),
+            Self::Txn(c) => c.current_local_table_row(),
+            Self::TimeTravel(c) => c.current_local_table_row(),
         }
     }
 
@@ -4608,6 +6194,7 @@ impl CursorBackend {
     fn current_page_span(&self, span: std::ops::Range<usize>) -> Option<&[u8]> {
         match self {
             Self::Mem(c) => c.current_page_span(span),
+            Self::Temp(c) => c.current_page_span(span),
             Self::Txn(c) => c.current_page_span(span),
             Self::TimeTravel(c) => c.current_page_span(span),
         }
@@ -4616,6 +6203,7 @@ impl CursorBackend {
     async fn payload(&self, cx: &Cx) -> Result<Vec<u8>> {
         match self {
             Self::Mem(c) => c.payload(cx).await,
+            Self::Temp(c) => c.payload(cx).await,
             Self::Txn(c) => c.payload(cx).await,
             Self::TimeTravel(c) => c.payload(cx).await,
         }
@@ -4624,6 +6212,7 @@ impl CursorBackend {
     async fn payload_into(&self, cx: &Cx, buf: &mut Vec<u8>) -> Result<()> {
         match self {
             Self::Mem(c) => c.payload_into(cx, buf).await,
+            Self::Temp(c) => c.payload_into(cx, buf).await,
             Self::Txn(c) => c.payload_into(cx, buf).await,
             Self::TimeTravel(c) => c.payload_into(cx, buf).await,
         }
@@ -4637,6 +6226,7 @@ impl CursorBackend {
     ) -> Result<()> {
         match self {
             Self::Mem(c) => c.payload_prefix_into(cx, max_prefix_bytes, buf).await,
+            Self::Temp(c) => c.payload_prefix_into(cx, max_prefix_bytes, buf).await,
             Self::Txn(c) => c.payload_prefix_into(cx, max_prefix_bytes, buf).await,
             Self::TimeTravel(c) => c.payload_prefix_into(cx, max_prefix_bytes, buf).await,
         }
@@ -4648,6 +6238,7 @@ impl CursorBackend {
     ) -> Result<Option<(bool, i64)>> {
         match self {
             Self::Mem(c) => c.try_probe_current_first_index_key_integer_local(probe_value),
+            Self::Temp(c) => c.try_probe_current_first_index_key_integer_local(probe_value),
             Self::Txn(c) => c.try_probe_current_first_index_key_integer_local(probe_value),
             Self::TimeTravel(c) => c.try_probe_current_first_index_key_integer_local(probe_value),
         }
@@ -4660,6 +6251,10 @@ impl CursorBackend {
     ) -> Result<FirstIndexKeyIntegerLocalRunSegment> {
         match self {
             Self::Mem(c) => {
+                c.count_equal_first_index_key_run_integer_local_segment(cx, probe_value)
+                    .await
+            }
+            Self::Temp(c) => {
                 c.count_equal_first_index_key_run_integer_local_segment(cx, probe_value)
                     .await
             }
@@ -4677,6 +6272,7 @@ impl CursorBackend {
     async fn table_move_to(&mut self, cx: &Cx, rowid: i64) -> Result<SeekResult> {
         match self {
             Self::Mem(c) => c.table_move_to(cx, rowid).await,
+            Self::Temp(c) => c.table_move_to(cx, rowid).await,
             Self::Txn(c) => c.table_move_to(cx, rowid).await,
             Self::TimeTravel(c) => c.table_move_to(cx, rowid).await,
         }
@@ -4685,6 +6281,7 @@ impl CursorBackend {
     async fn table_advance_to(&mut self, cx: &Cx, rowid: i64) -> Result<SeekResult> {
         match self {
             Self::Mem(c) => c.advance_to(cx, rowid).await,
+            Self::Temp(c) => c.advance_to(cx, rowid).await,
             Self::Txn(c) => c.advance_to(cx, rowid).await,
             Self::TimeTravel(c) => c.advance_to(cx, rowid).await,
         }
@@ -4693,6 +6290,7 @@ impl CursorBackend {
     async fn table_insert(&mut self, cx: &Cx, rowid: i64, data: &[u8]) -> Result<()> {
         match self {
             Self::Mem(c) => c.table_insert(cx, rowid, data).await,
+            Self::Temp(c) => c.table_insert(cx, rowid, data).await,
             Self::Txn(c) => c.table_insert(cx, rowid, data).await,
             Self::TimeTravel(_) => Err(FrankenError::Internal(
                 "time-travel cursors are read-only: table_insert not permitted".to_owned(),
@@ -4708,6 +6306,7 @@ impl CursorBackend {
     ) -> Result<()> {
         match self {
             Self::Mem(c) => c.table_insert_prechecked_absent(cx, rowid, data).await,
+            Self::Temp(c) => c.table_insert_prechecked_absent(cx, rowid, data).await,
             Self::Txn(c) => c.table_insert_prechecked_absent(cx, rowid, data).await,
             Self::TimeTravel(_) => Err(FrankenError::Internal(
                 "time-travel cursors are read-only: table_insert not permitted".to_owned(),
@@ -4723,6 +6322,10 @@ impl CursorBackend {
     ) -> Result<bool> {
         match self {
             Self::Mem(c) => {
+                c.table_overwrite_current_payload_same_size_no_overflow(cx, rowid, data)
+                    .await
+            }
+            Self::Temp(c) => {
                 c.table_overwrite_current_payload_same_size_no_overflow(cx, rowid, data)
                     .await
             }
@@ -4746,6 +6349,10 @@ impl CursorBackend {
                 c.table_refresh_rightmost_leaf_cache_after_insert(cx, rowid)
                     .await
             }
+            Self::Temp(c) => {
+                c.table_refresh_rightmost_leaf_cache_after_insert(cx, rowid)
+                    .await
+            }
             Self::Txn(c) => {
                 c.table_refresh_rightmost_leaf_cache_after_insert(cx, rowid)
                     .await
@@ -4764,6 +6371,7 @@ impl CursorBackend {
     ) -> Result<()> {
         match self {
             Self::Mem(c) => c.table_append_after_last_position(cx, rowid, data).await,
+            Self::Temp(c) => c.table_append_after_last_position(cx, rowid, data).await,
             Self::Txn(c) => c.table_append_after_last_position(cx, rowid, data).await,
             Self::TimeTravel(_) => Err(FrankenError::Internal(
                 "time-travel cursors are read-only: table_insert not permitted".to_owned(),
@@ -4786,6 +6394,10 @@ impl CursorBackend {
                 c.table_append_after_last_position_with_writer(cx, rowid, payload_len, writer)
                     .await
             }
+            Self::Temp(c) => {
+                c.table_append_after_last_position_with_writer(cx, rowid, payload_len, writer)
+                    .await
+            }
             Self::Txn(c) => {
                 c.table_append_after_last_position_with_writer(cx, rowid, payload_len, writer)
                     .await
@@ -4799,6 +6411,7 @@ impl CursorBackend {
     async fn delete(&mut self, cx: &Cx) -> Result<()> {
         match self {
             Self::Mem(c) => c.delete(cx).await,
+            Self::Temp(c) => c.delete(cx).await,
             Self::Txn(c) => c.delete(cx).await,
             Self::TimeTravel(_) => Err(FrankenError::Internal(
                 "time-travel cursors are read-only: delete not permitted".to_owned(),
@@ -4810,6 +6423,7 @@ impl CursorBackend {
     async fn index_move_to(&mut self, cx: &Cx, key: &[u8]) -> Result<SeekResult> {
         match self {
             Self::Mem(c) => c.index_move_to(cx, key).await,
+            Self::Temp(c) => c.index_move_to(cx, key).await,
             Self::Txn(c) => c.index_move_to(cx, key).await,
             Self::TimeTravel(c) => c.index_move_to(cx, key).await,
         }
@@ -4818,6 +6432,7 @@ impl CursorBackend {
     async fn index_move_to_upper_bound(&mut self, cx: &Cx, key: &[u8]) -> Result<()> {
         match self {
             Self::Mem(c) => c.index_move_to_upper_bound(cx, key).await,
+            Self::Temp(c) => c.index_move_to_upper_bound(cx, key).await,
             Self::Txn(c) => c.index_move_to_upper_bound(cx, key).await,
             Self::TimeTravel(c) => c.index_move_to_upper_bound(cx, key).await,
         }
@@ -4827,6 +6442,7 @@ impl CursorBackend {
     async fn index_insert(&mut self, cx: &Cx, key: &[u8]) -> Result<()> {
         match self {
             Self::Mem(c) => c.index_insert(cx, key).await,
+            Self::Temp(c) => c.index_insert(cx, key).await,
             Self::Txn(c) => c.index_insert(cx, key).await,
             Self::TimeTravel(_) => Err(FrankenError::Internal(
                 "time-travel cursors are read-only: index_insert not permitted".to_owned(),
@@ -4845,6 +6461,10 @@ impl CursorBackend {
     ) -> Result<bool> {
         match self {
             Self::Mem(c) => {
+                c.index_insert_unique_with_rightmost_report(cx, key, n_unique_cols, columns_label)
+                    .await
+            }
+            Self::Temp(c) => {
                 c.index_insert_unique_with_rightmost_report(cx, key, n_unique_cols, columns_label)
                     .await
             }
@@ -4869,6 +6489,10 @@ impl CursorBackend {
                 c.index_append_after_current_rightmost_position(cx, key)
                     .await
             }
+            Self::Temp(c) => {
+                c.index_append_after_current_rightmost_position(cx, key)
+                    .await
+            }
             Self::Txn(c) => {
                 c.index_append_after_current_rightmost_position(cx, key)
                     .await
@@ -4883,6 +6507,7 @@ impl CursorBackend {
     async fn index_root_is_empty_leaf(&mut self, cx: &Cx) -> Result<bool> {
         match self {
             Self::Mem(c) => c.index_root_is_empty_leaf(cx).await,
+            Self::Temp(c) => c.index_root_is_empty_leaf(cx).await,
             Self::Txn(c) => c.index_root_is_empty_leaf(cx).await,
             Self::TimeTravel(_) => Ok(false),
         }
@@ -4895,6 +6520,7 @@ impl CursorBackend {
     {
         match self {
             Self::Mem(c) => c.index_bulk_load_sorted_keys(cx, keys).await,
+            Self::Temp(c) => c.index_bulk_load_sorted_keys(cx, keys).await,
             Self::Txn(c) => c.index_bulk_load_sorted_keys(cx, keys).await,
             Self::TimeTravel(_) => Err(FrankenError::Internal(
                 "time-travel cursors are read-only: index bulk load not permitted".to_owned(),
@@ -4907,6 +6533,7 @@ impl CursorBackend {
     fn compare_index_records(&self, lhs: &[u8], rhs: &[u8]) -> std::cmp::Ordering {
         match self {
             Self::Mem(c) => c.compare_index_records(lhs, rhs),
+            Self::Temp(c) => c.compare_index_records(lhs, rhs),
             Self::Txn(c) => c.compare_index_records(lhs, rhs),
             Self::TimeTravel(_) => lhs.cmp(rhs),
         }
@@ -4921,6 +6548,7 @@ impl CursorBackend {
     ) -> Option<Ordering> {
         match self {
             Self::Mem(c) => c.compare_index_key_prefixes(lhs, rhs),
+            Self::Temp(c) => c.compare_index_key_prefixes(lhs, rhs),
             Self::Txn(c) => c.compare_index_key_prefixes(lhs, rhs),
             Self::TimeTravel(c) => c.compare_index_key_prefixes(lhs, rhs),
         }
@@ -4931,6 +6559,7 @@ impl CursorBackend {
     fn last_index_insert_was_past_rightmost(&self) -> bool {
         match self {
             Self::Mem(c) => c.last_index_insert_was_past_rightmost(),
+            Self::Temp(c) => c.last_index_insert_was_past_rightmost(),
             Self::Txn(c) => c.last_index_insert_was_past_rightmost(),
             Self::TimeTravel(_) => false,
         }
@@ -4943,6 +6572,7 @@ impl CursorBackend {
     fn clear_position(&mut self) {
         match self {
             Self::Mem(c) => c.invalidate(),
+            Self::Temp(c) => c.invalidate(),
             Self::Txn(c) => c.invalidate(),
             Self::TimeTravel(c) => c.invalidate(),
         }
@@ -4952,6 +6582,7 @@ impl CursorBackend {
     fn position_stamp(&self) -> Option<CursorPositionStamp> {
         match self {
             Self::Mem(c) => c.position_stamp(),
+            Self::Temp(c) => c.position_stamp(),
             Self::Txn(c) => c.position_stamp(),
             Self::TimeTravel(c) => c.position_stamp(),
         }
@@ -4962,6 +6593,7 @@ impl CursorBackend {
     fn row_image_epoch(&self) -> u64 {
         match self {
             Self::Mem(c) => c.row_image_epoch(),
+            Self::Temp(c) => c.row_image_epoch(),
             Self::Txn(c) => c.row_image_epoch(),
             Self::TimeTravel(c) => c.row_image_epoch(),
         }
@@ -5225,7 +6857,7 @@ struct PageRowView {
 }
 
 /// What the rowid-alias rules read from a record header.
-trait RecordColumns {
+pub(crate) trait RecordColumns {
     /// Number of columns the record stores.
     fn column_count(&self) -> usize;
     /// Serial type and byte range of stored column `idx`.
@@ -5251,7 +6883,7 @@ impl RecordColumns for RowDecodeScratch {
 /// slots; on a scan their upkeep and the general varint reader were most of
 /// what a header parse cost.
 #[derive(Debug, Default)]
-struct RecordColumnTable {
+pub(crate) struct RecordColumnTable {
     /// `columns[..count]` describes the current record; the rest is spare
     /// room kept from earlier records.
     columns: Vec<ColumnOffset>,
@@ -5299,7 +6931,7 @@ impl RecordColumnTable {
     /// loop state on that function's stack, a parse cost about as much as
     /// the decode scratch's.
     #[inline(never)]
-    fn parse(&mut self, record: &[u8]) -> bool {
+    pub(crate) fn parse(&mut self, record: &[u8]) -> bool {
         self.count = 0;
         let Some(&size_byte) = record.first() else {
             return false;
@@ -5468,6 +7100,17 @@ struct StorageCursor {
     /// it when the caller proved the insert landed at EOF/rightmost, because
     /// only then can a strictly larger next rowid safely reuse the append path.
     last_successful_insert_rowid: Option<i64>,
+    /// The concurrent session and schema epoch `last_successful_insert_rowid`
+    /// was learned under ((0, ZERO) without the shared rowid allocator). An
+    /// insert that is not an append claims its table for the session
+    /// (bd-hi7qg); an append rides on the claim of the insert that set the
+    /// hint. So a cursor `OpenWrite` reuses under another session or epoch
+    /// drops the hint, and its first insert there claims.
+    append_hint_scope: (u64, SchemaEpoch),
+    /// Whether the session of `append_hint_scope` already holds its claim on
+    /// this cursor's table (bd-hi7qg): a claim lasts until the session ends,
+    /// so the cursor's later non-append inserts skip the claim's lock.
+    rowid_claimed: bool,
     /// Last UNIQUE index prefix known to have been inserted at the right edge.
     ///
     /// For monotonic composite UNIQUE streams, this lets `IdxInsert` skip the
@@ -5521,6 +7164,11 @@ enum MemDbUndoOp {
         root_page: i32,
         table: MemTable,
     },
+    RenameTableRoot {
+        old_root: i32,
+        new_root: i32,
+        prev_next_root_page: i32,
+    },
     ClearTable {
         root_page: i32,
         table: MemTable,
@@ -5537,7 +7185,8 @@ enum MemDbUndoOp {
     },
     DeleteRow {
         root_page: i32,
-        row: MemRow,
+        rowid: i64,
+        values: MemRowValues,
         prev_next_rowid: i64,
     },
 }
@@ -5554,6 +7203,16 @@ impl MemDbUndoOp {
             }
             Self::DestroyTable { root_page, table } | Self::ClearTable { root_page, table } => {
                 db.tables.insert(root_page, table);
+            }
+            Self::RenameTableRoot {
+                old_root,
+                new_root,
+                prev_next_root_page,
+            } => {
+                if let Some(table) = db.tables.remove(&new_root) {
+                    db.tables.insert(old_root, table);
+                }
+                db.next_root_page = prev_next_root_page;
             }
             Self::BumpRowid {
                 root_page,
@@ -5583,11 +7242,12 @@ impl MemDbUndoOp {
             }
             Self::DeleteRow {
                 root_page,
-                row,
+                rowid,
+                values,
                 prev_next_rowid,
             } => {
                 if let Some(table) = db.tables.get_mut(&root_page) {
-                    table.insert(row.rowid, row.values);
+                    table.insert(rowid, values);
                     table.next_rowid = prev_next_rowid;
                 }
             }
@@ -5635,22 +7295,54 @@ impl MemDatabase {
         }
     }
 
+    /// Create an empty in-memory database with undo logging disabled while a
+    /// mirror reload reconstructs tables and copies connection-local TEMP rows
+    /// (bd-cmsax / bd-732ft). Call [`Self::hand_undo_state_to`] on the replaced
+    /// database right before publishing this image so live transaction,
+    /// savepoint, and statement undo state survives the swap while the
+    /// reload's own construction never enters the undo log.
+    pub fn new_without_undo() -> Self {
+        Self {
+            tables: SwissIndex::new(),
+            next_root_page: 2, // Page 1 is reserved for sqlite_master.
+            undo_enabled: false,
+            undo_log: Vec::new(),
+            statement_undo_marks: Vec::new(),
+            in_explicit_txn: false,
+        }
+    }
+
+    /// Transfer live undo state (`undo_enabled`, `undo_log`,
+    /// `statement_undo_marks`, `in_explicit_txn`) to a freshly reconstructed
+    /// mirror `target` immediately before replacing `self` (bd-cmsax / bd-732ft).
+    pub fn hand_undo_state_to(&mut self, target: &mut Self) {
+        target.undo_enabled = self.undo_enabled;
+        target.undo_log = std::mem::take(&mut self.undo_log);
+        target.statement_undo_marks = std::mem::take(&mut self.statement_undo_marks);
+        target.in_explicit_txn = self.in_explicit_txn;
+    }
+
     /// Clone for a read-only snapshot (bd-jdjee).
     ///
     /// Tables share their row storage copy-on-write, so this costs O(tables),
     /// not O(rows). The undo and statement bookkeeping start fresh: a snapshot
     /// never rolls back, and copying an in-flight transaction's undo records
     /// into it would only pin their memory.
-    #[must_use]
-    pub fn clone_for_snapshot(&self) -> Self {
-        Self {
-            tables: self.tables.clone(),
+    pub fn clone_for_snapshot(&self, cx: &Cx) -> Result<Self> {
+        let mut tables = self.tables.clone();
+        for (_, table) in tables.iter_mut() {
+            if table.temp_spill.is_some() {
+                table.detach_temp_spill_for_snapshot(cx)?;
+            }
+        }
+        Ok(Self {
+            tables,
             next_root_page: self.next_root_page,
             undo_enabled: true,
             undo_log: Vec::new(),
             statement_undo_marks: Vec::new(),
             in_explicit_txn: false,
-        }
+        })
     }
 
     /// Propagate a shared collation registry to all tracked MemTables.
@@ -5823,6 +7515,34 @@ impl MemDatabase {
         }
     }
 
+    /// Re-key an existing in-memory table mirror from `old_root` to `new_root`
+    /// (used when `auto_vacuum` root compaction relocates `largest_root_page`
+    /// into a dropped root slot) while preserving savepoint/transaction undo.
+    pub fn rename_table_root(&mut self, old_root: i32, new_root: i32) {
+        if old_root == new_root {
+            return;
+        }
+        if let Some(table) = self.tables.remove(&old_root) {
+            let prev_next_root_page = self.next_root_page;
+            if new_root >= self.next_root_page {
+                self.next_root_page = new_root + 1;
+            }
+            self.tables.insert(new_root, table);
+            self.push_undo(MemDbUndoOp::RenameTableRoot {
+                old_root,
+                new_root,
+                prev_next_root_page,
+            });
+        }
+    }
+
+    /// Drop a table immediately without retaining it in `undo_log` (used for
+    /// autocommit `DROP TABLE` on `TEMP` tables and `PRAGMA temp_store` mode
+    /// transitions so any VFS spill file closes and unlinks immediately).
+    pub fn destroy_table_without_undo(&mut self, root_page: i32) {
+        let _ = self.tables.remove(&root_page);
+    }
+
     fn clear_table(&mut self, root_page: i32) {
         // Active-transaction refreshes can clear the schema-only mirror once
         // per trigger query. An already-empty table has nothing to restore;
@@ -5907,21 +7627,49 @@ impl MemDatabase {
         }
     }
 
-    pub fn upsert_row<V>(&mut self, root_page: i32, rowid: i64, values: V)
+    /// Upsert a row while enforcing any attached `PRAGMA temp_store` budget
+    /// (spilling `TEMP`/ephemeral rows to VFS temp files or checking
+    /// `hard_heap_limit` / `Cx` cancellation).
+    pub fn upsert_row_checked<V>(
+        &mut self,
+        cx: &Cx,
+        root_page: i32,
+        rowid: i64,
+        values: V,
+    ) -> Result<()>
     where
         V: Into<MemRowValues>,
     {
         let values = values.into();
         if let Some(table) = self.tables.get_mut(&root_page) {
             let prev_next_rowid = table.next_rowid;
-            // Use binary search (O(log n)) instead of linear scan (O(n))
-            // since rows are maintained in rowid-sorted order.
+            let prev_resident_bytes = table.temp_spill.as_ref().map(|s| s.resident_bytes);
             let old_values = table
                 .rows
                 .binary_search_by_key(&rowid, |r| r.rowid)
                 .ok()
-                .map(|idx| table.rows[idx].values.clone());
-            table.insert(rowid, values);
+                .map(|idx| table.read_row_values_at(cx, idx))
+                .transpose()?
+                .flatten()
+                .map(Cow::into_owned);
+            if let Err(err) = table.insert_checked(cx, rowid, values) {
+                // `insert_checked` may have inserted `rowid` before a spill
+                // write failed (`DatabaseFull`/`Io`/`Abort`). Restore the
+                // table atomically before propagating the error.
+                match old_values {
+                    Some(prev) => table.insert(rowid, prev),
+                    None => {
+                        let _ = table.delete_by_rowid(rowid);
+                    }
+                }
+                table.next_rowid = prev_next_rowid;
+                if let (Some(spill), Some(prev_bytes)) =
+                    (table.temp_spill.as_mut(), prev_resident_bytes)
+                {
+                    spill.resident_bytes = prev_bytes;
+                }
+                return Err(err);
+            }
             self.push_undo(MemDbUndoOp::UpsertRow {
                 root_page,
                 rowid,
@@ -5929,6 +7677,7 @@ impl MemDatabase {
                 old_values,
             });
         }
+        Ok(())
     }
 
     /// Remove a column slot from every row in a TEMP table.
@@ -5936,45 +7685,53 @@ impl MemDatabase {
     /// The pre-rewrite table image is recorded as one undo entry, so an
     /// enclosing statement savepoint restores row widths, UNIQUE metadata,
     /// and the column count together.
-    pub fn remove_column_from_rows(&mut self, root_page: i32, removed_slot: usize) -> bool {
+    pub fn remove_column_from_rows(&mut self, cx: &Cx, root_page: i32, removed_slot: usize) -> Result<bool> {
         let Some(previous) = self.tables.get(&root_page).cloned() else {
-            return false;
+            return Ok(false);
         };
         if previous
             .unique_constraints
             .iter()
             .any(|constraint| constraint.columns.contains(&removed_slot))
         {
-            return false;
+            return Ok(false);
+        }
+        if let Some(table) = self.tables.get_mut(&root_page) {
+            table.remove_column_from_rows(cx, removed_slot)?;
         }
         self.push_undo(MemDbUndoOp::ClearTable {
             root_page,
             table: previous,
         });
-        if let Some(table) = self.tables.get_mut(&root_page) {
-            table.remove_column_from_rows(removed_slot);
-        }
+        Ok(true)
+    }
+
+    /// Publish a staged table rewrite and retain its previous image for rollback.
+    pub fn replace_table(&mut self, root_page: i32, updated: MemTable) -> bool {
+        let Some(slot) = self.tables.get_mut(&root_page) else { return false; };
+        let table = std::mem::replace(slot, updated);
+        self.push_undo(MemDbUndoOp::ClearTable { root_page, table });
         true
     }
 
-    /// Allocate an implicit rowid and insert the row, recording one undo entry
-    /// for both the rowid counter advance and the row mutation. If
-    /// `rowid_value_column` is present, that column is patched to the allocated
-    /// rowid before insertion.
-    #[must_use]
-    pub fn insert_auto_row<V>(
+    /// Allocate an implicit rowid and insert the row while enforcing any
+    /// attached `PRAGMA temp_store` budget (spill to VFS temp file, hard heap
+    /// check, and `Cx` cancellation).
+    pub fn insert_auto_row_checked<V>(
         &mut self,
+        cx: &Cx,
         root_page: i32,
         values: V,
         rowid_value_column: Option<usize>,
-    ) -> Option<i64>
+    ) -> Result<Option<i64>>
     where
         V: Into<MemRowValues>,
     {
         let mut values = values.into();
         if let Some(table) = self.tables.get_mut(&root_page) {
             let prev_next_rowid = table.next_rowid;
-            let rowid = table.alloc_rowid();
+            let prev_resident_bytes = table.temp_spill.as_ref().map(|s| s.resident_bytes);
+            let rowid = table.next_rowid_hint();
             if let Some(column) = rowid_value_column
                 && let Some(value) = values.get_mut(column)
             {
@@ -5984,53 +7741,60 @@ impl MemDatabase {
                 .rows
                 .binary_search_by_key(&rowid, |r| r.rowid)
                 .ok()
-                .map(|idx| table.rows[idx].values.clone());
-            table.insert(rowid, values);
+                .map(|idx| table.read_row_values_at(cx, idx))
+                .transpose()?
+                .flatten()
+                .map(Cow::into_owned);
+            // A spilled old value can fail to read. Advance the counter only
+            // after its undo image is available.
+            table.alloc_rowid();
+            if let Err(err) = table.insert_checked(cx, rowid, values) {
+                match old_values {
+                    Some(prev) => table.insert(rowid, prev),
+                    None => {
+                        let _ = table.delete_by_rowid(rowid);
+                    }
+                }
+                table.next_rowid = prev_next_rowid;
+                if let (Some(spill), Some(prev_bytes)) =
+                    (table.temp_spill.as_mut(), prev_resident_bytes)
+                {
+                    spill.resident_bytes = prev_bytes;
+                }
+                return Err(err);
+            }
             self.push_undo(MemDbUndoOp::UpsertRow {
                 root_page,
                 rowid,
                 prev_next_rowid,
                 old_values,
             });
-            Some(rowid)
+            Ok(Some(rowid))
         } else {
-            None
+            Ok(None)
         }
     }
 
     /// Delete a row by rowid, recording undo information for rollback.
-    pub fn delete_rowid(&mut self, root_page: i32, rowid: i64) -> bool {
-        if let Some(table) = self.tables.get_mut(&root_page)
-            && let Ok(index) = table.rows.binary_search_by_key(&rowid, |r| r.rowid)
-        {
-            let prev_next_rowid = table.next_rowid;
-            let row = table.rows_mut().remove(index);
-            table.remove_unique_entries(row.rowid, &row.values);
-            self.push_undo(MemDbUndoOp::DeleteRow {
-                root_page,
-                row,
-                prev_next_rowid,
-            });
-            true
-        } else {
-            false
-        }
+    pub fn delete_rowid(&mut self, cx: &Cx, root_page: i32, rowid: i64) -> Result<bool> {
+        let Some(pos) = self.tables.get(&root_page).and_then(|table| table.find_by_rowid(rowid)) else {
+            return Ok(false);
+        };
+        self.delete_at(cx, root_page, pos)
     }
 
-    #[allow(dead_code)]
-    fn delete_at(&mut self, root_page: i32, index: usize) {
-        if let Some(table) = self.tables.get_mut(&root_page) {
-            if index < table.rows.len() {
-                let prev_next_rowid = table.next_rowid;
-                let row = table.rows_mut().remove(index);
-                table.remove_unique_entries(row.rowid, &row.values);
-                self.push_undo(MemDbUndoOp::DeleteRow {
-                    root_page,
-                    row,
-                    prev_next_rowid,
-                });
-            }
+    fn delete_at(&mut self, cx: &Cx, root_page: i32, index: usize) -> Result<bool> {
+        let Some(table) = self.tables.get_mut(&root_page) else { return Ok(false); };
+        let Some(values) = table.read_row_values_at(cx, index)? else { return Ok(false); };
+        let values = values.into_owned();
+        let prev_next_rowid = table.next_rowid;
+        let row = table.rows_mut().remove(index);
+        if row.spilled.is_some() && let Some(spill) = table.temp_spill.as_mut() {
+            spill.spilled_row_count = spill.spilled_row_count.saturating_sub(1);
         }
+        table.remove_unique_entries(row.rowid, &values);
+        self.push_undo(MemDbUndoOp::DeleteRow { root_page, rowid: row.rowid, values, prev_next_rowid });
+        Ok(true)
     }
 }
 
@@ -6138,9 +7902,6 @@ thread_local! {
     static FSQLITE_VDBE_PLAIN_AGG_STEPS_TOTAL: Cell<u64> = const { Cell::new(0) };
     /// Test-only per-thread count of those that ran a built-in's typed step.
     static FSQLITE_VDBE_TYPED_AGG_STEPS_TOTAL: Cell<u64> = const { Cell::new(0) };
-    /// Test-only per-thread count of top-N preflights decided from the packed
-    /// key by `top_n_preflight_packed_verdict`.
-    static FSQLITE_VDBE_PACKED_TOP_N_VERDICTS_TOTAL: Cell<u64> = const { Cell::new(0) };
 }
 /// bd-7vkes: Count times the BTREE_APPEND fast path was taken (skip seek).
 static FSQLITE_VDBE_INSERT_APPEND_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -7395,17 +9156,18 @@ pub type ResultRow = Box<[SqliteValue]>;
 
 /// Buffered result-row storage retained by the engine when row collection is on.
 ///
-/// Rows are boxed slices rather than the 16-value inline `SmallVec` the
-/// register drain produces: that is over 500 bytes per row whatever the
-/// width, so a million-row materialized SELECT (CREATE TABLE ... AS SELECT,
-/// a FROM-clause subquery) grew and copied a half-gigabyte buffer. Every
-/// consumer turns the row into a `Vec` anyway, which a boxed slice does
-/// without copying.
+/// Rows are boxed slices rather than a 16-value inline `SmallVec`: that is
+/// over 500 bytes per row whatever the width, so a million-row materialized
+/// SELECT (CREATE TABLE ... AS SELECT, a FROM-clause subquery) grew and
+/// copied a half-gigabyte buffer. Every consumer turns the row into a `Vec`
+/// anyway, which a boxed slice does without copying.
 type ResultRowStorage = Vec<ResultRow>;
 
+/// A retained row: the values are drained into a vector of the row's exact
+/// width, which boxes without reallocating.
 #[inline]
-fn retained_result_row(row: smallvec::SmallVec<[SqliteValue; 16]>) -> ResultRow {
-    row.into_vec().into_boxed_slice()
+fn retained_result_row(row: Vec<SqliteValue>) -> ResultRow {
+    row.into_boxed_slice()
 }
 
 #[derive(Debug, Default)]
@@ -7564,6 +9326,33 @@ fn serialize_compiled_record_into_vec(
     }
 }
 
+/// The root pages storage-cursor DML dirtied since the last MemDatabase sync
+/// (bd-g595c), and the root marked last. A DML loop marks the same root on
+/// every row; while the set still holds that root a repeat mark changes
+/// nothing, so it skips the hash insert (bd-w4pr1.13.20, lever M). Every way
+/// of emptying the set forgets the last root, so a root the set lost is
+/// always inserted again.
+#[derive(Debug, Default)]
+struct DirtyRootPages {
+    roots: HashSet<i32>,
+    last: Option<i32>,
+}
+
+impl DirtyRootPages {
+    #[inline]
+    fn insert(&mut self, root_page: i32) {
+        if self.last != Some(root_page) {
+            self.roots.insert(root_page);
+            self.last = Some(root_page);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.roots.clear();
+        self.last = None;
+    }
+}
+
 /// The VDBE bytecode interpreter.
 ///
 /// Executes a program produced by the code generator, maintaining a register
@@ -7594,6 +9383,20 @@ pub struct VdbeEngine {
     trace_opcodes: bool,
     /// Execute-scoped metrics flag latched once per statement.
     collect_vdbe_metrics: bool,
+    /// Threads one scan of this statement may use, the engine's own included
+    /// (bd-w4pr1.13.11). 1 runs every scan on this thread alone, as before;
+    /// a larger value lets a scan read the transaction's snapshot through a
+    /// [`fsqlite_pager::SnapshotPageReader`] on that many threads when the
+    /// transaction offers one. Set per statement by the connection.
+    parallel_workers: usize,
+    /// Active `PRAGMA temp_store` policy, byte budget, VFS temp-file backend,
+    /// and live telemetry shared with the owning connection (bd-dwjnq.5).
+    temp_store_runtime: TempStoreRuntime,
+    /// Ephemeral `MemTable` root pages created by `OpenEphemeral` for the
+    /// current statement, keyed by cursor id so `Close`, `reset_for_reuse`,
+    /// and `take_database` destroy them and immediately release any VFS spill
+    /// files.
+    ephemeral_roots_by_cursor: HashMap<i32, i32>,
     /// Result rows accumulated during execution.
     results: ResultRowStorage,
     /// Open cursors (keyed by cursor number, i.e. p1 of OpenRead/OpenWrite).
@@ -7610,12 +9413,27 @@ pub struct VdbeEngine {
     /// as closed. Any `OpenWrite`, `take_transaction` and the next reset drop
     /// them.
     parked_read_cursor_ids: Vec<i32>,
+    /// bd-fpr5g: retained storage cursors whose slot a cursor on another root
+    /// took, oldest first, at most [`MAX_SPARE_STORAGE_CURSORS`]. Programs
+    /// that run one after another on this engine (an INSERT and the trigger
+    /// bodies it fires, or statements on several tables in one transaction)
+    /// number their cursors from 0, so each would otherwise drop the cursor
+    /// the previous one left in its slot, and the next statement on that
+    /// table would open a new cursor and seek again. An open of a root takes
+    /// its spare back into the slot and reuses it as `OpenWrite` reuses a
+    /// retained cursor. A root has at most one cursor in the engine while one
+    /// of them is a spare: none is kept while another slot holds that root,
+    /// and every open of the root takes the spare, so no other cursor writes
+    /// a root while its cursor is kept here. Spares go wherever retained
+    /// cursors go (a reset that keeps none, `take_transaction`), so they are
+    /// exactly as current as a retained cursor left in its slot.
+    spare_storage_cursors: Vec<StorageCursor>,
     /// bd-a3g0m: set once this execution opens a writable storage cursor, so
     /// no read cursor is parked from then on.
     writable_storage_cursor_opened: bool,
     /// Cursors that deleted the current row and should treat the next `Next`
     /// as a no-advance "consume successor" step.
-    pending_next_after_delete: HashSet<i32>,
+    pending_next_after_delete: CursorIdSet,
     /// Whether `OpenRead`/`OpenWrite` should route through storage-backed cursors.
     storage_cursors_enabled: bool,
     /// Whether `OP_Close` should keep storage cursors alive for reusable DML.
@@ -7705,6 +9523,11 @@ pub struct VdbeEngine {
     /// reservations, so a rolled-back statement can give them back (bd-8a8pr).
     /// 0 outside a statement savepoint.
     concurrent_rowid_statement: u64,
+    /// The database's write generation the bound concurrent transaction
+    /// sampled at BEGIN, before its snapshot bound: what the shared allocator
+    /// compares to decide that the transaction has seen every committed row
+    /// (bd-hi7qg).
+    concurrent_rowid_begin_generation: u64,
     /// INTEGER PRIMARY KEY alias column positions keyed by root page number.
     /// Used to decode storage-cursor payload columns for rowid tables.
     rowid_alias_col_by_root_page: Arc<HashMap<i32, usize>>,
@@ -7768,6 +9591,10 @@ pub struct VdbeEngine {
     /// Execution still continues to completion; rows past the cap are simply
     /// discarded while preserving register-clearing semantics.
     max_collected_result_rows: Option<usize>,
+    /// The row a [`ResultRowCallback`] is handed: `ResultRow` fills it from
+    /// its registers, the callback takes the values, and the buffer is
+    /// cleared and kept for the next row. It is empty between rows.
+    result_row_buf: Vec<SqliteValue>,
     /// Whether per-statement execution state is already in a fresh baseline.
     ///
     /// `reset_for_reuse()` establishes this for cached engines. The common
@@ -7783,10 +9610,19 @@ pub struct VdbeEngine {
     /// table dirty and bulk-sync only when a compatibility-path query needs
     /// MemDB data. This eliminates the 0.10 µs/row sync overhead for fast-path
     /// storage-cursor-backed workloads.
-    dirty_root_pages: HashSet<i32>,
+    dirty_root_pages: DirtyRootPages,
+    /// Set by `reset_for_next_transaction`, cleared by every reuse reset
+    /// (which precedes any binding or run): an engine parked across several
+    /// commits without being used is reset once, not at every commit.
+    transaction_state_clear: bool,
 }
 
-type ResultRowCallback<'a> = dyn FnMut(smallvec::SmallVec<[SqliteValue; 16]>) -> Result<()> + 'a;
+/// A per-row result callback. It is handed the row's values in order in a
+/// buffer the engine owns and reuses: it may move the values out (draining or
+/// taking the `Vec`), and whatever it leaves is dropped when it returns. The
+/// row is lent rather than passed by value so a row does not cross the call
+/// as a ~400-byte inline vector (bd-w4pr1.12, lever W3).
+type ResultRowCallback<'a> = dyn FnMut(&mut Vec<SqliteValue>) -> Result<()> + 'a;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ExactResultRowOutcome {
@@ -8140,6 +9976,11 @@ struct ColdVdbeState {
     /// Each entry is a fixed-size bit array used for early rejection
     /// during index lookups.
     bloom_filters: HashMap<i32, Vec<u64>>,
+    /// A virtual-table module's error from a `VColumn` / `VNext` the
+    /// synchronous lane ran, for the main loop's arm of the same opcode to
+    /// report as it always has (bd-w4pr1.13.21, lever S). The lane hands that
+    /// opcode back at once, so the arm runs next and takes it.
+    vtab_lane_error: Option<FrankenError>,
 }
 
 impl ColdVdbeState {
@@ -8159,6 +10000,7 @@ impl ColdVdbeState {
             register_subtypes: HashMap::new(),
             has_subtypes: false,
             bloom_filters: HashMap::new(),
+            vtab_lane_error: None,
         }
     }
 }
@@ -8359,13 +10201,17 @@ impl VdbeEngine {
             text_encoding_authoritative: false,
             trace_opcodes: opcode_trace_enabled(),
             collect_vdbe_metrics: false,
+            parallel_workers: 1,
+            temp_store_runtime: TempStoreRuntime::default(),
+            ephemeral_roots_by_cursor: HashMap::new(),
             results: Vec::with_capacity(64),
             cursors: CursorSlots::new(),
             sorters: CursorSlots::new(),
             storage_cursors: CursorSlots::new(),
             parked_read_cursor_ids: Vec::new(),
+            spare_storage_cursors: Vec::new(),
             writable_storage_cursor_opened: false,
-            pending_next_after_delete: HashSet::new(),
+            pending_next_after_delete: CursorIdSet::default(),
             storage_cursors_enabled: true,
             retain_storage_cursors_on_close: false,
             txn_page_io: None,
@@ -8395,6 +10241,7 @@ impl VdbeEngine {
             concurrent_rowid_schema_epoch: SchemaEpoch::ZERO,
             concurrent_rowid_session_id: 0,
             concurrent_rowid_statement: 0,
+            concurrent_rowid_begin_generation: 0,
             rowid_alias_col_by_root_page: Arc::new(HashMap::new()),
             table_column_count_by_root_page: Arc::new(HashMap::new()),
             first_not_null_non_ipk_col_by_root_page: Arc::new(HashMap::new()),
@@ -8414,9 +10261,11 @@ impl VdbeEngine {
             make_record_lookaside: MakeRecordStatementLookaside::default(),
             collect_result_rows: true,
             max_collected_result_rows: None,
+            result_row_buf: Vec::new(),
             statement_state_clean: true,
             statement_cold_state: StatementColdState::empty(),
-            dirty_root_pages: HashSet::new(),
+            dirty_root_pages: DirtyRootPages::default(),
+            transaction_state_clear: false,
         }
     }
 
@@ -8497,6 +10346,92 @@ impl VdbeEngine {
                 .pending_update_restore = Some(restore);
         } else if let Some(cold_state) = self.cold_state_mut() {
             cold_state.pending_update_restore = None;
+        }
+    }
+
+    #[inline]
+    fn take_vtab_lane_error(&mut self) -> Option<FrankenError> {
+        self.cold_state_mut()
+            .and_then(|cold_state| cold_state.vtab_lane_error.take())
+    }
+
+    /// `VColumn` on the synchronous lane, with the main arm's semantics: NULL
+    /// for a cursor that is missing, on a NULL row or at EOF; otherwise the
+    /// module's value between the same two requested-cancellation loads. A
+    /// module error is kept for the main arm (`Ok(false)`, `pc` unchanged).
+    fn execute_vcolumn_hot(&mut self, op: &VdbeOp, pc: &mut usize) -> Result<bool> {
+        let column = match self
+            .cold_state
+            .as_deref()
+            .and_then(|cold_state| cold_state.vtab_cursors.get(&op.p1))
+        {
+            Some(state) if !state.null_row && !state.cursor.eof() => {
+                observe_requested_execution_cancellation(&self.execution_cx)?;
+                let mut ctx = ColumnContext::new();
+                match state.cursor.column(&mut ctx, op.p2) {
+                    Ok(()) => {
+                        observe_requested_execution_cancellation(&self.execution_cx)?;
+                        Ok(ctx.take_value().unwrap_or(SqliteValue::Null))
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            _ => Ok(SqliteValue::Null),
+        };
+        match column {
+            Ok(value) => {
+                self.set_reg(op.p3, value);
+                *pc += 1;
+                Ok(true)
+            }
+            Err(error) => {
+                self.ensure_cold_state().vtab_lane_error = Some(error);
+                Ok(false)
+            }
+        }
+    }
+
+    /// `VNext` on the synchronous lane, with the main arm's semantics: fall
+    /// through for a missing cursor, a NULL row or the last row; otherwise
+    /// jump to P2. The module steps between the same two
+    /// requested-cancellation loads, with the execution context the main arm
+    /// clones. A module error is kept for the main arm (`Ok(false)`, `pc`
+    /// unchanged, the cursor where the failed step left it).
+    fn execute_vnext_hot(&mut self, op: &VdbeOp, pc: &mut usize) -> Result<bool> {
+        let cx = &self.execution_cx;
+        let step = match self
+            .cold_state
+            .as_deref_mut()
+            .and_then(|cold_state| cold_state.vtab_cursors.get_mut(&op.p1))
+        {
+            Some(state) if !state.null_row => {
+                observe_requested_execution_cancellation(cx)?;
+                match state.cursor.next(cx) {
+                    Ok(()) => {
+                        observe_requested_execution_cancellation(cx)?;
+                        Ok(!state.cursor.eof())
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            _ => Ok(false),
+        };
+        match step {
+            Ok(true) => {
+                #[allow(clippy::cast_sign_loss)]
+                {
+                    *pc = op.p2 as usize;
+                }
+                Ok(true)
+            }
+            Ok(false) => {
+                *pc += 1;
+                Ok(true)
+            }
+            Err(error) => {
+                self.ensure_cold_state().vtab_lane_error = Some(error);
+                Ok(false)
+            }
         }
     }
 
@@ -8617,6 +10552,7 @@ impl VdbeEngine {
         self.results.clear();
         // bd-a3g0m: a parked read cursor is closed; never retain it.
         self.drop_parked_read_cursors();
+        self.cleanup_ephemeral_tables();
         self.writable_storage_cursor_opened = false;
         if retain_cursors {
             // Keep cursors + cursor_root_pages + storage_cursors alive.
@@ -8630,6 +10566,7 @@ impl VdbeEngine {
             self.cursors.clear();
             self.sorters.clear();
             self.storage_cursors.clear();
+            self.spare_storage_cursors.clear();
             self.pending_next_after_delete.clear();
             self.storage_cursors_enabled = true;
             self.txn_page_io = None;
@@ -8675,6 +10612,7 @@ impl VdbeEngine {
         self.concurrent_rowid_schema_epoch = SchemaEpoch::ZERO;
         self.concurrent_rowid_session_id = 0;
         self.concurrent_rowid_statement = 0;
+        self.concurrent_rowid_begin_generation = 0;
         // table_index_meta: kept as-is — execute() overwrites it from the
         // program at the start of each run (line ~4903).
         self.make_record_lookaside.reset();
@@ -8687,6 +10625,7 @@ impl VdbeEngine {
             self.max_collected_result_rows = None;
         }
         self.statement_state_clean = true;
+        self.transaction_state_clear = false;
     }
 
     /// Reset the engine for reuse, clearing per-statement state but keeping
@@ -8756,9 +10695,150 @@ impl VdbeEngine {
         self.reset_for_reuse_ex(register_count, execution_cx, page_size, false);
     }
 
+    /// Park the engine across a write commit (bd-w4pr1.13.35): the next
+    /// statement gets what a fresh engine would bring it, without dropping and
+    /// rebuilding the engine. Everything bound to the finished transaction
+    /// (storage cursors, the lent transaction's page I/O, the database, vtab
+    /// and time-travel state) and the runtime setup it ran with goes, as in
+    /// `reset_for_reuse`; so do the two caches only a fresh engine starts
+    /// without, which the reuse resets keep. Heap capacity stays. The next
+    /// execution resets and binds the engine as for any reuse. An engine
+    /// nothing has reset for reuse since its last call is left as it is.
+    pub fn reset_for_next_transaction(&mut self) {
+        if self.transaction_state_clear {
+            return;
+        }
+        let execution_cx = self.execution_cx.clone();
+        self.reset_for_reuse_impl(0, &execution_cx, self.page_size, false, false);
+        self.builtin_collations_overridden_cache = None;
+        self.dirty_root_pages.clear();
+        self.transaction_state_clear = true;
+    }
+
     /// Control whether `OP_Close` preserves storage cursors for reusable DML.
     pub fn set_retain_storage_cursors_on_close(&mut self, retain: bool) {
         self.retain_storage_cursors_on_close = retain;
+    }
+
+    /// Threads one scan of the next execution may use, this one included
+    /// (bd-w4pr1.13.11). 0 and 1 keep every scan on this thread.
+    pub fn set_parallel_workers(&mut self, workers: usize) {
+        self.parallel_workers = workers.max(1);
+    }
+
+    /// Configure the active `PRAGMA temp_store` runtime policy, byte budget,
+    /// VFS temp-file backend, and live telemetry for this engine (bd-dwjnq.5).
+    pub fn set_temp_store_runtime(&mut self, runtime: TempStoreRuntime) {
+        self.temp_store_runtime = runtime;
+    }
+
+    /// Active temporary-storage runtime policy for this engine.
+    #[must_use]
+    pub fn temp_store_runtime(&self) -> &TempStoreRuntime {
+        &self.temp_store_runtime
+    }
+
+    /// Destroy any statement-scoped `OpenEphemeral` tables so their VFS temp
+    /// spill files are closed and unlinked immediately on cursor close, reset,
+    /// cancellation, or database handoff.
+    fn cleanup_ephemeral_tables(&mut self) {
+        if self.ephemeral_roots_by_cursor.is_empty() {
+            return;
+        }
+        let roots: Vec<i32> = self.ephemeral_roots_by_cursor.drain().map(|(_, rp)| rp).collect();
+        if let Some(db) = self.db.as_mut() {
+            for root_page in roots {
+                db.tables.remove(&root_page);
+            }
+        }
+    }
+
+    /// A reader of the lent transaction's committed snapshot for threads
+    /// outside this engine, when parallel scans are allowed and the
+    /// transaction offers one. A transaction with an MVCC concurrent context
+    /// records page reads for conflict detection and never offers one.
+    fn parallel_snapshot_reader(&self) -> Option<fsqlite_pager::SnapshotPageReader> {
+        if self.parallel_workers <= 1 {
+            return None;
+        }
+        let io = self.txn_page_io.as_ref()?;
+        if io.concurrent.borrow().is_some() {
+            return None;
+        }
+        io.txn.borrow().snapshot_page_reader()
+    }
+
+    /// bd-w4pr1.13.11: run `plan`, the program's parallel aggregate, for the
+    /// table cursor `cursor_id` its `OpenRead` just opened, on the lent
+    /// transaction's committed snapshot. `Ok(Some(values))` holds the values
+    /// of the plan's `ResultRow`. `Ok(None)` leaves the serial loop to run:
+    /// the plan does not fit this program, the transaction offers no snapshot
+    /// reader, user code could change an aggregate or a comparison, the walk
+    /// was stopped, a sum met a value it does not add exactly, or a page or
+    /// record failed to read (which the serial loop then reports itself).
+    fn try_parallel_aggregate(
+        &mut self,
+        program: &VdbeProgram,
+        plan: &ParallelAggregatePlan,
+        cursor_id: i32,
+    ) -> Result<Option<Vec<SqliteValue>>> {
+        let fits = program.ops().get(plan.result_addr).is_some_and(|op| {
+            op.opcode == Opcode::ResultRow
+                && op.p1 == plan.out_reg
+                && usize::try_from(op.p2).is_ok_and(|n| n == plan.aggregates.len())
+        });
+        if !fits
+            || self.text_encoding != TextEncoding::Utf8
+            || self
+                .func_registry
+                .as_ref()
+                .is_some_and(|registry| registry.has_application_functions())
+            || self.builtin_collations_overridden()
+        {
+            return Ok(None);
+        }
+        let Some(reader) = self.parallel_snapshot_reader() else {
+            return Ok(None);
+        };
+        let defaults = self
+            .column_defaults_by_root_page
+            .get(&plan.root_page)
+            .cloned()
+            .unwrap_or_default();
+        let workers = self.parallel_workers;
+        let Some(sc) = self.storage_cursors.get(&cursor_id) else {
+            return Ok(None);
+        };
+        if !sc.cursor.is_table_btree() {
+            return Ok(None);
+        }
+        let CursorBackend::Txn(btree) = &sc.cursor else {
+            return Ok(None);
+        };
+        let shape = TableShape {
+            ipk_col_idx: sc.ipk_col_idx,
+            table_column_count: sc.table_column_count,
+            first_not_null_non_ipk_col: sc.first_not_null_non_ipk_col,
+            record_slots: sc.record_slots.clone(),
+            real_columns: sc.real_columns.clone(),
+            defaults,
+        };
+        let cx = &sc.cx;
+        match run_parallel_aggregate(
+            plan,
+            &shape,
+            &reader,
+            btree.root_page(),
+            btree.usable_size(),
+            workers,
+            &|| cx.is_cancel_requested(),
+        ) {
+            Ok(values) => Ok(values),
+            // Raised only once every row was folded, as the serial AggFinal
+            // raises it for the same rows.
+            Err(FrankenError::IntegerOverflow) => Err(FrankenError::IntegerOverflow),
+            Err(_) => Ok(None),
+        }
     }
 
     fn clear_storage_cursor_statement_state(sc: &mut StorageCursor) {
@@ -8824,6 +10904,94 @@ impl VdbeEngine {
                 .storage_cursors
                 .get(&cursor_id)
                 .is_some_and(|sc| !sc.writable)
+    }
+
+    /// bd-fpr5g: before `cursor_id` opens on `root_page` (which its slot does
+    /// not hold), take the spare on `root_page` out, keep the cursor in the
+    /// slot as a spare (only while cursors are retained), and put the spare
+    /// taken out, if any, into the slot, where `open_storage_cursor` reuses
+    /// it. Every open of a root not in its slot comes here, so a new cursor is
+    /// never made on a root that has a spare.
+    fn swap_spare_storage_cursor_into_slot(
+        &mut self,
+        cursor_id: i32,
+        root_page: i32,
+        has_txn: bool,
+    ) {
+        let spare = self
+            .spare_storage_cursors
+            .iter()
+            .position(|spare| spare.root_page == root_page)
+            .map(|at| self.spare_storage_cursors.remove(at));
+        if self.retain_storage_cursors_on_close
+            && let Some(displaced) = self.storage_cursors.remove(&cursor_id)
+        {
+            self.keep_spare_storage_cursor(displaced, has_txn);
+        }
+        let Some(spare) = spare else {
+            return;
+        };
+        // A spare is never kept while a slot holds its root; should a slot
+        // hold one anyway, the spare is dropped rather than made a second
+        // cursor on the root.
+        if self
+            .storage_cursors
+            .values()
+            .any(|held| held.root_page == root_page)
+        {
+            return;
+        }
+        tracing::trace!(
+            cursor_id,
+            page_id = root_page,
+            backend_kind = spare.cursor.kind_str(),
+            "open_storage_cursor: took back a spare retained cursor"
+        );
+        self.storage_cursors.insert(cursor_id, spare);
+        self.cursor_root_pages.insert(cursor_id, root_page);
+    }
+
+    /// bd-fpr5g: keep `displaced`, the retained cursor whose slot a cursor on
+    /// another root is taking, as a spare, unless it could not come back
+    /// safely: its backend is not the one this execution reuses (the
+    /// retained-cursor reuse refuses it), it holds an ephemeral index's
+    /// records outside its b-tree, or another slot (or spare) holds its root,
+    /// where a second cursor could write the root under it. Its unlanded
+    /// rowid goes back to the allocator as `OP_Close` gives it back. The
+    /// oldest spare makes room when there are
+    /// [`MAX_SPARE_STORAGE_CURSORS`].
+    fn keep_spare_storage_cursor(&mut self, mut displaced: StorageCursor, has_txn: bool) {
+        let backend_matches = if has_txn {
+            displaced.cursor.is_txn()
+        } else {
+            displaced.cursor.is_mem()
+        };
+        let root_page = displaced.root_page;
+        if !backend_matches
+            || displaced.staged_build.is_some()
+            || displaced.membership_set.is_some()
+            || self
+                .storage_cursors
+                .values()
+                .any(|held| held.root_page == root_page)
+            || self
+                .spare_storage_cursors
+                .iter()
+                .any(|spare| spare.root_page == root_page)
+        {
+            return;
+        }
+        Self::reclaim_unlanded_storage_cursor_rowid_with_allocator(
+            self.concurrent_rowid_allocator.as_deref(),
+            self.concurrent_rowid_schema_epoch,
+            self.concurrent_rowid_session_id,
+            &mut displaced,
+            false,
+        );
+        if self.spare_storage_cursors.len() >= MAX_SPARE_STORAGE_CURSORS {
+            self.spare_storage_cursors.remove(0);
+        }
+        self.spare_storage_cursors.push(displaced);
     }
 
     /// bd-a3g0m: drop every read cursor `OP_Close` parked.
@@ -9269,7 +11437,10 @@ impl VdbeEngine {
             return Ok(false);
         };
         let key_columns = sorter.key_columns;
+        // A row standing for a run of records would be stored once; the
+        // per-row path emits each record (bd-w4pr1.13.8, lever G3).
         if !sc.writable
+            || !sorter.rows_are_records()
             || sorter.rows.is_empty()
             || unique_key_columns > key_columns
             || !sc.cursor.index_root_is_empty_leaf(&sc.cx).await?
@@ -9811,10 +11982,34 @@ impl VdbeEngine {
         Ok(())
     }
 
+    /// bd-jlbrk: stock records an AUTOINCREMENT table's rowid (OP_MemMax) as
+    /// soon as the row has one, before its constraint checks, so a row that
+    /// UNIQUE ... ON CONFLICT IGNORE or OR IGNORE then discards still advances
+    /// sqlite_sequence. A rowid NewRowid allocated is already in the
+    /// high-water (GH #186); this records an explicit one.
+    fn note_ignored_autoincrement_rowid(&mut self, table_cursor: i32, rowid: i64) {
+        let Some(sc) = self.storage_cursors.get(&table_cursor) else {
+            return;
+        };
+        if !matches!(sc.rowid_mode, RowIdMode::AutoIncrement) {
+            return;
+        }
+        let entry = self
+            .autoinc_alloc_high_water
+            .entry(sc.root_page)
+            .or_insert(0);
+        *entry = (*entry).max(rowid);
+    }
+
+    /// Undo the current row's provisional table insert and index entries after
+    /// a secondary-index conflict. Returns the table cursor and rowid of the
+    /// row an INSERT had just written (not an UPDATE's restored row), so the
+    /// IGNORE path can record that rowid for AUTOINCREMENT.
     async fn rollback_pending_insert_after_index_conflict(
         &mut self,
         require_pending_table_insert: bool,
-    ) -> Result<()> {
+        statement_failed: bool,
+    ) -> Result<Option<(i32, i64)>> {
         let entries = self.take_pending_idx_entries();
         for (idx_cid, idx_key) in entries {
             if self.storage_cursor_find_exact_index_key(
@@ -9840,7 +12035,7 @@ impl VdbeEngine {
                     "secondary-index conflict without pending table insert",
                 ));
             }
-            return Ok(());
+            return Ok(None);
         };
         let tsc = self
             .storage_cursors
@@ -9871,26 +12066,46 @@ impl VdbeEngine {
         // the next NewRowid would skip past a rowid no row ever occupied. The
         // NOT NULL / CHECK discards never reach this function because they fail
         // before the table insert.
-        if tsc.last_alloc_rowid == rollback.rowid {
+        let is_implicit_alloc = tsc.last_alloc_rowid > 0 && tsc.last_alloc_rowid == rollback.rowid;
+        if is_implicit_alloc {
             tsc.last_alloc_landed = false;
         }
         if tsc.last_successful_insert_rowid == Some(rollback.rowid) {
             tsc.last_successful_insert_rowid = None;
         }
+        let rollback_root_page = tsc.root_page;
         let rollback_cursor_id = rollback.cursor_id;
         let rollback_rowid = rollback.rowid;
+        // bd-u65rh: if this provisional row came from an explicit-rowid insert
+        // (or a rowid-changing UPDATE), rewind the explicit floor bump it just
+        // recorded (subject to stock's AUTOINCREMENT-OR-IGNORE burn rule).
+        if !is_implicit_alloc
+            && let Some(allocator) = self.concurrent_rowid_allocator.as_ref()
+            && let Ok(key) =
+                Self::concurrent_rowid_key(self.concurrent_rowid_schema_epoch, rollback_root_page)
+        {
+            allocator.rewind_unlanded_explicit(
+                self.concurrent_rowid_session_id,
+                key,
+                rollback_rowid,
+                statement_failed,
+            );
+        }
         self.changes = self.changes.checked_sub(1).ok_or_else(|| {
             FrankenError::internal("secondary-index rollback underflowed change counter")
         })?;
         self.sync_storage_table_delete_into_memdb_mirror(rollback_cursor_id, rollback_rowid);
-        if let Some(update_restore) = rollback.update_restore {
+        let removed_insert = if let Some(update_restore) = rollback.update_restore {
             self.restore_pending_update_after_conflict(update_restore)
                 .await?;
-        }
+            None
+        } else {
+            Some((rollback_cursor_id, rollback_rowid))
+        };
         self.last_insert_rowid = rollback.previous_last_insert_rowid;
         self.last_insert_rowid_valid = rollback.previous_last_insert_rowid_valid;
         self.last_insert_cursor_id = None;
-        Ok(())
+        Ok(removed_insert)
     }
 
     async fn restore_pending_update_after_conflict(
@@ -9943,10 +12158,11 @@ impl VdbeEngine {
                 rowid,
                 values,
             } => {
+                let cx = self.derive_execution_cx();
                 let db = self.db.as_mut().ok_or_else(|| {
                     FrankenError::internal("MemDatabase missing during UPDATE conflict restore")
                 })?;
-                db.upsert_row(root_page, rowid, values);
+                db.upsert_row_checked(&cx, root_page, rowid, values)?;
             }
         }
         Ok(())
@@ -10006,12 +12222,12 @@ impl VdbeEngine {
 
     /// Returns true if any tables have been modified and need MemDB sync.
     pub fn has_dirty_root_pages(&self) -> bool {
-        !self.dirty_root_pages.is_empty()
+        !self.dirty_root_pages.roots.is_empty()
     }
 
     /// Returns the set of dirty root pages for bulk sync.
     pub fn dirty_root_pages(&self) -> &HashSet<i32> {
-        &self.dirty_root_pages
+        &self.dirty_root_pages.roots
     }
 
     /// Clear dirty root pages after bulk sync completes.
@@ -10036,6 +12252,7 @@ impl VdbeEngine {
 
     /// Take ownership of the in-memory database back from the engine.
     pub fn take_database(&mut self) -> Option<MemDatabase> {
+        self.cleanup_ephemeral_tables();
         self.db.take()
     }
 
@@ -10148,6 +12365,7 @@ impl VdbeEngine {
         self.concurrent_rowid_schema_epoch = SchemaEpoch::ZERO;
         self.concurrent_rowid_session_id = 0;
         self.concurrent_rowid_statement = 0;
+        self.concurrent_rowid_begin_generation = 0;
     }
 
     /// Lend a pager transaction with MVCC concurrent context (bd-kivg / 5E.2).
@@ -10176,19 +12394,22 @@ impl VdbeEngine {
         );
     }
 
-    /// Provide the shared concurrent rowid allocator for implicit inserts, and
-    /// the session and statement (0 for none, bd-8a8pr) the rowids belong to.
+    /// Provide the shared concurrent rowid allocator for implicit inserts, the
+    /// session and statement (0 for none, bd-8a8pr) the rowids belong to, and
+    /// the write generation the session sampled at BEGIN (bd-hi7qg).
     pub fn set_concurrent_rowid_allocator(
         &mut self,
         allocator: Arc<ConcurrentRowIdAllocator>,
         schema_epoch: SchemaEpoch,
         session_id: u64,
         statement: u64,
+        begin_generation: u64,
     ) {
         self.concurrent_rowid_allocator = Some(allocator);
         self.concurrent_rowid_schema_epoch = schema_epoch;
         self.concurrent_rowid_session_id = session_id;
         self.concurrent_rowid_statement = statement;
+        self.concurrent_rowid_begin_generation = begin_generation;
     }
 
     /// Allocate a rowid on a MemDatabase (TEMP) table. bd-nb49a: an ordinary
@@ -10318,14 +12539,16 @@ impl VdbeEngine {
     }
 
     // bd-gh-147 added `session_id` (8th arg) to attribute reservations to the
-    // concurrent session, bd-8a8pr `statement` to the statement within it; the
-    // params are a flat threading list, not worth a dedicated struct.
+    // concurrent session, bd-8a8pr `statement` to the statement within it,
+    // bd-hi7qg the session's BEGIN write generation; the params are a flat
+    // threading list, not worth a dedicated struct.
     #[allow(clippy::too_many_arguments)]
     async fn allocate_concurrent_storage_rowid(
         allocator: &ConcurrentRowIdAllocator,
         schema_epoch: SchemaEpoch,
         session_id: u64,
         statement: u64,
+        begin_generation: u64,
         root_page: i32,
         mode: RowIdMode,
         autoinc_max: i64,
@@ -10356,16 +12579,27 @@ impl VdbeEngine {
                 .max(autoinc_max)
         };
         if visible_max == i64::MAX {
+            // bd-hi7qg: the random rowid's row is the session's too, and the
+            // append hint it may leave rides on this claim.
+            Self::claim_concurrent_storage_rowid_table(allocator, schema_epoch, session_id, sc)?;
             return Self::allocate_random_storage_rowid(sc).await;
         }
         let key = Self::concurrent_rowid_key(schema_epoch, root_page)?;
-        allocator.ensure_table_floor(
+        // bd-hi7qg: a table no live session holds a claim on, read by a
+        // transaction that has seen every committed row, gets stock's
+        // `max(rowid) + 1` back even after its maximum was deleted. The
+        // allocation leaves the session holding a claim, exhausted or not.
+        let allocated = allocator.allocate_one_above_visible_max(
             key,
-            (visible_max > 0).then(|| RowId::new(visible_max)),
+            visible_max,
             autoinc_max,
             mode,
+            session_id,
+            statement,
+            begin_generation,
         );
-        let rowid = match allocator.allocate_one_for_statement(key, session_id, statement) {
+        sc.rowid_claimed = true;
+        let rowid = match allocated {
             Ok(rowid) => rowid.get(),
             // bd-6i9c5: the shared floor reached the top of the rowid range.
             Err(RowIdAllocError::Exhausted) => {
@@ -10378,9 +12612,30 @@ impl VdbeEngine {
         Ok(rowid)
     }
 
+    /// bd-hi7qg: the bound concurrent session is about to write a row through
+    /// `sc` on its table that no other transaction can see. It holds a claim
+    /// on the table until it ends, so no peer's allocation lowers the table's
+    /// tip below that row. The cursor remembers the claim for its scope.
+    fn claim_concurrent_storage_rowid_table(
+        allocator: &ConcurrentRowIdAllocator,
+        schema_epoch: SchemaEpoch,
+        session_id: u64,
+        sc: &mut StorageCursor,
+    ) -> Result<()> {
+        if !sc.rowid_claimed {
+            let key = Self::concurrent_rowid_key(schema_epoch, sc.root_page)?;
+            allocator.claim_table(key, session_id);
+            sc.rowid_claimed = true;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn bump_concurrent_storage_rowid_floor(
         allocator: &ConcurrentRowIdAllocator,
         schema_epoch: SchemaEpoch,
+        session_id: u64,
+        statement: u64,
         root_page: i32,
         mode: RowIdMode,
         autoinc_max: i64,
@@ -10396,20 +12651,88 @@ impl VdbeEngine {
         } else {
             Self::storage_cursor_visible_max_rowid(sc).await?
         };
+        Self::raise_concurrent_storage_rowid_floor(
+            allocator,
+            schema_epoch,
+            session_id,
+            statement,
+            root_page,
+            mode,
+            autoinc_max,
+            sc,
+            table_max,
+            rowid,
+        )
+    }
+
+    /// [`Self::bump_concurrent_storage_rowid_floor`] for a row `sc` just
+    /// inserted as the table's rightmost (`last_successful_insert_rowid`),
+    /// whose largest rowid is then `rowid` itself: no walk, so no future
+    /// (bd-w4pr1.13; round 11's lever FB). `Ok(false)` leaves every other row
+    /// to the async bump.
+    #[allow(clippy::too_many_arguments)]
+    fn try_raise_concurrent_storage_rowid_floor_after_append(
+        allocator: &ConcurrentRowIdAllocator,
+        schema_epoch: SchemaEpoch,
+        session_id: u64,
+        statement: u64,
+        root_page: i32,
+        mode: RowIdMode,
+        autoinc_max: i64,
+        sc: &mut StorageCursor,
+        rowid: i64,
+    ) -> Result<bool> {
+        if sc.last_successful_insert_rowid != Some(rowid) {
+            return Ok(false);
+        }
+        Self::raise_concurrent_storage_rowid_floor(
+            allocator,
+            schema_epoch,
+            session_id,
+            statement,
+            root_page,
+            mode,
+            autoinc_max,
+            sc,
+            rowid,
+            rowid,
+        )?;
+        Ok(true)
+    }
+
+    /// Raise the shared rowid floor past `rowid`, which this session just
+    /// wrote through `sc`, on a table whose largest rowid it sees is
+    /// `table_max`.
+    #[allow(clippy::too_many_arguments)]
+    fn raise_concurrent_storage_rowid_floor(
+        allocator: &ConcurrentRowIdAllocator,
+        schema_epoch: SchemaEpoch,
+        session_id: u64,
+        statement: u64,
+        root_page: i32,
+        mode: RowIdMode,
+        autoinc_max: i64,
+        sc: &mut StorageCursor,
+        table_max: i64,
+        rowid: i64,
+    ) -> Result<()> {
         let visible_max = table_max.max(autoinc_max).max(rowid);
         let key = Self::concurrent_rowid_key(schema_epoch, root_page)?;
-        // bd-i3csr.4: this floor is what `bump_explicit(key, rowid)` would
-        // set, so the bump is not called (it was a second lock and lookup per
-        // row). `visible_max >= rowid` leaves the table's next rowid at or above
-        // `rowid + 1` (or exhausted, which the bump also leaves alone) and an
-        // AUTOINCREMENT high-water at or above `rowid`, and creates a missing
-        // entry.
-        allocator.ensure_table_floor(
+        // bd-i3csr.4 / bd-u65rh / bd-failed-insert-rowid-floor-l53w4: attribute
+        // the explicit-rowid floor bump to `(session_id, statement)` so a
+        // statement rollback, savepoint rollback, full rollback, or
+        // secondary-index conflict rewinds the tip and AUTOINCREMENT high-water
+        // when no peer intervened.
+        allocator.bump_explicit_floor_for_statement(
             key,
             (visible_max > 0).then(|| RowId::new(visible_max)),
             autoinc_max,
             mode,
+            session_id,
+            statement,
+            rowid,
         );
+        sc.rowid_claimed = true;
         Ok(())
     }
 
@@ -10420,6 +12743,7 @@ impl VdbeEngine {
     pub fn take_transaction(&mut self) -> Result<Option<TransactionKind>> {
         // Drop all storage cursors first to release Rc references.
         self.storage_cursors.clear();
+        self.spare_storage_cursors.clear();
         self.parked_read_cursor_ids.clear();
         match self.txn_page_io.take() {
             Some(txn_page_io) => Ok(Some(txn_page_io.into_inner()?)),
@@ -10454,7 +12778,11 @@ impl VdbeEngine {
 
     /// bd-perf: Check if storage cursors are empty (for drain vs take decision).
     /// bd-a3g0m: a parked read cursor counts as closed.
+    /// bd-fpr5g: a spare cursor holds the transaction like a retained one.
     pub fn storage_cursors_empty(&self) -> bool {
+        if !self.spare_storage_cursors.is_empty() {
+            return false;
+        }
         if self.parked_read_cursor_ids.is_empty() {
             return self.storage_cursors.is_empty();
         }
@@ -11250,7 +13578,7 @@ impl VdbeEngine {
                     // p3 = p2 / p1
                     let divisor = self.get_reg(op.p1);
                     let dividend = self.get_reg(op.p2);
-                    let result = sql_div(dividend, divisor);
+                    let result = dividend.sql_div(divisor);
                     self.set_reg_fast(op.p3, result);
                     pc += 1;
                 }
@@ -11259,7 +13587,7 @@ impl VdbeEngine {
                     // p3 = p2 % p1
                     let divisor = self.get_reg(op.p1);
                     let dividend = self.get_reg(op.p2);
-                    let result = sql_rem(dividend, divisor);
+                    let result = dividend.sql_rem(divisor);
                     self.set_reg_fast(op.p3, result);
                     pc += 1;
                 }
@@ -11510,7 +13838,7 @@ impl VdbeEngine {
                     // Three-valued AND: p3 = p1 AND p2
                     let a = self.get_reg(op.p1);
                     let b = self.get_reg(op.p2);
-                    let result = sql_and(a, b);
+                    let result = sql_and(a, b, self.text_encoding);
                     self.set_reg_fast(op.p3, result);
                     pc += 1;
                 }
@@ -11519,7 +13847,7 @@ impl VdbeEngine {
                     // Three-valued OR: p3 = p1 OR p2
                     let a = self.get_reg(op.p1);
                     let b = self.get_reg(op.p2);
-                    let result = sql_or(a, b);
+                    let result = sql_or(a, b, self.text_encoding);
                     self.set_reg_fast(op.p3, result);
                     pc += 1;
                 }
@@ -11530,7 +13858,7 @@ impl VdbeEngine {
                     if a.is_null() {
                         self.set_reg_fast(op.p2, SqliteValue::Null);
                     } else {
-                        self.set_reg_int(op.p2, i64::from(!vdbe_real_is_truthy(a)));
+                        self.set_reg_int(op.p2, i64::from(!a.is_sql_truthy_in(self.text_encoding)));
                     }
                     pc += 1;
                 }
@@ -11543,7 +13871,7 @@ impl VdbeEngine {
                     let should_jump = if val.is_null() {
                         op.p3 != 0
                     } else {
-                        vdbe_real_is_truthy(val)
+                        val.is_sql_truthy_in(self.text_encoding)
                     };
                     if should_jump {
                         pc = op.p2 as usize;
@@ -11559,7 +13887,7 @@ impl VdbeEngine {
                     let should_jump = if val.is_null() {
                         op.p3 != 0
                     } else {
-                        !vdbe_real_is_truthy(val)
+                        !val.is_sql_truthy_in(self.text_encoding)
                     };
                     if should_jump {
                         pc = op.p2 as usize;
@@ -11716,7 +14044,7 @@ impl VdbeEngine {
                     }
                     let cursor_id = op.p1;
                     let root_page = op.p2;
-                    self.pending_next_after_delete.remove(&cursor_id);
+                    self.pending_next_after_delete.remove(cursor_id);
                     if op.p3 == 1 {
                         let has_temp_root = self
                             .db
@@ -11741,6 +14069,23 @@ impl VdbeEngine {
                     }
                     self.cursor_root_pages.insert(cursor_id, root_page);
                     self.cursors.remove(&cursor_id);
+                    // bd-w4pr1.13.11: the aggregate loop this OpenRead starts
+                    // may run on several threads instead; on success the
+                    // program continues at its ResultRow with the same values.
+                    if self.parallel_workers > 1
+                        && let Some(plan) = program.parallel_aggregate()
+                        && plan.open_addr == pc
+                        && plan.cursor == cursor_id
+                        && plan.root_page == root_page
+                        && let Some(values) =
+                            self.try_parallel_aggregate(program, plan, cursor_id)?
+                    {
+                        for (reg, value) in (plan.out_reg..).zip(values) {
+                            self.set_reg(reg, value);
+                        }
+                        pc = plan.result_addr;
+                        continue;
+                    }
                     pc += 1;
                 }
                 Opcode::OpenWrite => {
@@ -11761,7 +14106,7 @@ impl VdbeEngine {
                     }
                     let cursor_id = op.p1;
                     let root_page = op.p2;
-                    self.pending_next_after_delete.remove(&cursor_id);
+                    self.pending_next_after_delete.remove(cursor_id);
                     if op.p3 == 1 {
                         let has_temp_root = self
                             .db
@@ -11790,12 +14135,24 @@ impl VdbeEngine {
                 }
 
                 Opcode::OpenEphemeral => {
-                    // Ephemeral table: create an in-memory table on-the-fly.
+                    // Ephemeral table: create a statement-local table governed
+                    // by the active `PRAGMA temp_store` policy and budget.
                     let cursor_id = op.p1;
-                    self.pending_next_after_delete.remove(&cursor_id);
+                    self.pending_next_after_delete.remove(cursor_id);
                     let num_cols = op.p2.max(1);
+                    let temp_runtime = self.temp_store_runtime.clone();
+                    let text_encoding = self.text_encoding;
+                    if let Some(old_root) = self.ephemeral_roots_by_cursor.remove(&cursor_id)
+                        && let Some(db) = self.db.as_mut()
+                    {
+                        db.tables.remove(&old_root);
+                    }
                     if let Some(db) = self.db.as_mut() {
                         let root_page = db.create_table(num_cols as usize);
+                        if let Some(table) = db.get_table_mut(root_page) {
+                            table.configure_temp_spill(temp_runtime, text_encoding);
+                        }
+                        self.ephemeral_roots_by_cursor.insert(cursor_id, root_page);
                         self.storage_cursors.remove(&cursor_id);
                         self.cursors
                             .insert(cursor_id, MemCursor::new(root_page, true));
@@ -11804,14 +14161,13 @@ impl VdbeEngine {
                 }
 
                 Opcode::OpenAutoindex => {
-                    // Autoindex: create an ephemeral INDEX B-tree.
-                    // Unlike OpenEphemeral (table B-tree), autoindexes use
-                    // index B-tree semantics (no rowid, key-only cells).
-                    // We create a StorageCursor backed by MemPageStore with
-                    // is_table=false so IdxInsert/IdxGE etc. work correctly.
+                    // Autoindex: create an ephemeral INDEX B-tree governed by
+                    // `PRAGMA temp_store`. In `FILE` mode, back it with
+                    // `TempSpillPageStore` so pages evict LRU-first to a VFS
+                    // temp file once resident bytes exceed `budget_bytes`.
                     let autoindex_page_size = self.page_size.get();
                     let cursor_id = op.p1;
-                    self.pending_next_after_delete.remove(&cursor_id);
+                    self.pending_next_after_delete.remove(cursor_id);
                     let root_pgno = if let Some(db) = self.db.as_mut() {
                         let rp = db.allocate_root_page();
                         PageNumber::new(rp as u32)
@@ -11819,13 +14175,18 @@ impl VdbeEngine {
                         PageNumber::new(2)
                     };
                     if let Some(root_pgno) = root_pgno {
-                        let store = MemPageStore::with_empty_index(root_pgno, autoindex_page_size);
                         let cx = self.derive_execution_cx();
-                        let mut cursor =
-                            BtCursor::new(store, root_pgno, autoindex_page_size, false);
-                        cursor.set_retain_read_witnesses(false);
+                        let temp_runtime = self.temp_store_runtime.clone();
+                        let use_spillable_temp_btree = temp_runtime.is_file_backed();
+                        // When a tight file-backed budget is active, route keys
+                        // through the spillable B-tree rather than an unbounded
+                        // in-memory MembershipSet or StagedIndexBuild buffer.
+                        let allow_unbounded_in_memory_shortcuts = !use_spillable_temp_btree
+                            || temp_runtime.budget_bytes() >= SORTER_DEFAULT_SPILL_THRESHOLD;
                         let autoindex_collations = extract_collation_names_owned(&op.p4);
-                        let membership_set = if (op.p5 & OPFLAG_MEMBERSHIP_SET) == 0 {
+                        let membership_set = if !allow_unbounded_in_memory_shortcuts
+                            || (op.p5 & OPFLAG_MEMBERSHIP_SET) == 0
+                        {
                             None
                         } else {
                             let text_is_bytewise = matches!(self.text_encoding, TextEncoding::Utf8)
@@ -11840,23 +14201,50 @@ impl VdbeEngine {
                                 text_is_bytewise,
                             }))
                         };
-                        let staged_build = (membership_set.is_none()
+                        let staged_build = (allow_unbounded_in_memory_shortcuts
+                            && membership_set.is_none()
                             && (op.p5 & OPFLAG_STAGED_BUILD) != 0)
                             .then(Box::<StagedIndexBuild>::default);
-                        if !autoindex_collations.is_empty() {
-                            cursor.set_index_collation_context(
-                                autoindex_collations,
-                                Arc::clone(&self.collation_registry),
-                                self.text_encoding,
+                        let backend = if use_spillable_temp_btree {
+                            let store = TempSpillPageStore::with_empty_index(
+                                root_pgno,
+                                autoindex_page_size,
+                                temp_runtime,
                             );
-                        }
+                            let mut cursor =
+                                BtCursor::new(store, root_pgno, autoindex_page_size, false);
+                            cursor.set_retain_read_witnesses(false);
+                            if !autoindex_collations.is_empty() {
+                                cursor.set_index_collation_context(
+                                    autoindex_collations,
+                                    Arc::clone(&self.collation_registry),
+                                    self.text_encoding,
+                                );
+                            }
+                            CursorBackend::Temp(cursor)
+                        } else {
+                            temp_runtime.stats().record_memory_only_allocation();
+                            let store =
+                                MemPageStore::with_empty_index(root_pgno, autoindex_page_size);
+                            let mut cursor =
+                                BtCursor::new(store, root_pgno, autoindex_page_size, false);
+                            cursor.set_retain_read_witnesses(false);
+                            if !autoindex_collations.is_empty() {
+                                cursor.set_index_collation_context(
+                                    autoindex_collations,
+                                    Arc::clone(&self.collation_registry),
+                                    self.text_encoding,
+                                );
+                            }
+                            CursorBackend::Mem(cursor)
+                        };
                         self.cursor_root_pages
                             .insert(cursor_id, root_pgno.get() as i32);
                         self.cursors.remove(&cursor_id);
                         self.storage_cursors.insert(
                             cursor_id,
                             StorageCursor {
-                                cursor: CursorBackend::Mem(cursor),
+                                cursor: backend,
                                 cx,
                                 text_encoding: self.text_encoding,
                                 writable: true,
@@ -11875,6 +14263,11 @@ impl VdbeEngine {
                                 membership_set,
                                 staged_build,
                                 last_successful_insert_rowid: None,
+                                append_hint_scope: (
+                                    self.concurrent_rowid_session_id,
+                                    self.concurrent_rowid_schema_epoch,
+                                ),
+                                rowid_claimed: false,
                                 last_rightmost_unique_index_prefix: None,
                                 last_rightmost_unique_index_position: None,
                                 cached_rowid: None,
@@ -11892,7 +14285,7 @@ impl VdbeEngine {
 
                 Opcode::OpenPseudo => {
                     let cursor_id = op.p1;
-                    self.pending_next_after_delete.remove(&cursor_id);
+                    self.pending_next_after_delete.remove(cursor_id);
                     self.storage_cursors.remove(&cursor_id);
                     self.cursors.insert(cursor_id, MemCursor::new_pseudo(op.p2));
                     pc += 1;
@@ -11905,7 +14298,7 @@ impl VdbeEngine {
 
                 Opcode::SorterOpen => {
                     let cursor_id = op.p1;
-                    self.pending_next_after_delete.remove(&cursor_id);
+                    self.pending_next_after_delete.remove(cursor_id);
                     let key_columns = usize::try_from(op.p2.max(1)).unwrap_or(1);
                     let top_n_from_register = (op.p5 & SORTER_OPEN_TOP_N_REGISTER) != 0;
                     let top_n_bound = if top_n_from_register {
@@ -11953,15 +14346,18 @@ impl VdbeEngine {
                     } else {
                         Vec::new()
                     };
+                    let sorter_cx = self.derive_execution_cx();
                     self.sorters.insert(
                         cursor_id,
-                        SorterCursor::with_collation_registry(
+                        SorterCursor::with_collation_registry_and_temp_store(
                             key_columns,
                             sort_key_orders,
                             collations,
                             Arc::clone(&self.collation_registry),
                             top_n_limit,
                             self.text_encoding,
+                            self.temp_store_runtime.clone(),
+                            sorter_cx,
                         ),
                     );
                     // A cursor id cannot be both table and sorter cursor.
@@ -11972,6 +14368,11 @@ impl VdbeEngine {
 
                 Opcode::Close => {
                     self.cursors.remove(&op.p1);
+                    if let Some(ephemeral_root) = self.ephemeral_roots_by_cursor.remove(&op.p1)
+                        && let Some(db) = self.db.as_mut()
+                    {
+                        db.tables.remove(&ephemeral_root);
+                    }
                     if self.retain_storage_cursors_on_close {
                         let allocator = self.concurrent_rowid_allocator.clone();
                         let schema_epoch = self.concurrent_rowid_schema_epoch;
@@ -12016,7 +14417,7 @@ impl VdbeEngine {
                     if let Some(cold_state) = self.cold_state_mut() {
                         cold_state.vtab_cursors.remove(&op.p1);
                     }
-                    self.pending_next_after_delete.remove(&op.p1);
+                    self.pending_next_after_delete.remove(op.p1);
                     pc += 1;
                 }
 
@@ -12028,7 +14429,7 @@ impl VdbeEngine {
                     // Position cursor at the first row. Jump to p2 if empty.
                     let cursor_id = op.p1;
                     // Rewind repositions the cursor, so clear any pending delete state.
-                    self.pending_next_after_delete.remove(&cursor_id);
+                    self.pending_next_after_delete.remove(cursor_id);
                     let is_empty = if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
                         if matches!(op.opcode, Opcode::Sort | Opcode::SorterSort) {
                             sorter.sort()?;
@@ -12058,13 +14459,11 @@ impl VdbeEngine {
                                 "sort completed"
                             );
                         }
-                        if sorter.rows.is_empty() {
-                            sorter.position = None;
-                            true
-                        } else {
-                            sorter.position = Some(0);
-                            false
-                        }
+                        // An unsorted Rewind reads insertion order, which a
+                        // sorter collecting runs does not keep: one whose
+                        // program has a Rewind on it never collects.
+                        debug_assert!(!matches!(sorter.runs, SorterRuns::Collecting { .. }));
+                        !sorter.position_at_first()
                     } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
                         if cursor.is_pseudo {
                             cursor.pseudo_row.is_none()
@@ -12098,7 +14497,7 @@ impl VdbeEngine {
                     // Position cursor at the last row. Jump to p2 if empty.
                     let cursor_id = op.p1;
                     // Last repositions the cursor, so clear any pending delete state.
-                    self.pending_next_after_delete.remove(&cursor_id);
+                    self.pending_next_after_delete.remove(cursor_id);
                     let is_empty = if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
                         !lean_future(|| cursor.cursor.last(&cursor.cx)).await?
                     } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
@@ -12132,7 +14531,7 @@ impl VdbeEngine {
                     // Advance cursor to the next row. Jump to p2 if more rows.
                     let cursor_id = op.p1;
                     let has_next = if !self.pending_next_after_delete.is_empty()
-                        && self.pending_next_after_delete.remove(&cursor_id)
+                        && self.pending_next_after_delete.remove(cursor_id)
                     {
                         if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
                             !cursor.cursor.eof()
@@ -12163,18 +14562,7 @@ impl VdbeEngine {
                     } else if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
                         lean_future(|| cursor.cursor.next(&cursor.cx)).await?
                     } else if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
-                        if let Some(pos) = sorter.position {
-                            let next = pos + 1;
-                            if next < sorter.rows.len() {
-                                sorter.position = Some(next);
-                                true
-                            } else {
-                                sorter.position = None;
-                                false
-                            }
-                        } else {
-                            false
-                        }
+                        sorter.advance()
                     } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
                         if cursor.is_pseudo {
                             false
@@ -12214,7 +14602,7 @@ impl VdbeEngine {
                     // Prev repositions the cursor, so clear any pending
                     // delete/next state before evaluating movement.
                     if !self.pending_next_after_delete.is_empty() {
-                        self.pending_next_after_delete.remove(&cursor_id);
+                        self.pending_next_after_delete.remove(cursor_id);
                     }
                     let has_prev = if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
                         lean_future(|| cursor.cursor.prev(&cursor.cx)).await?
@@ -12330,7 +14718,7 @@ impl VdbeEngine {
                     // If not found, jump to p2.  NULL key → not found.
                     let cursor_id = op.p1;
                     // Seek repositions the cursor, so clear any pending delete state.
-                    self.pending_next_after_delete.remove(&cursor_id);
+                    self.pending_next_after_delete.remove(cursor_id);
                     // Like stock's OP_SeekRowid, a key that is not an integer
                     // takes NUMERIC affinity ('5', '5.0' and 5.0 become 5).
                     // One still not an integer (5.5, 1e300, a blob, NULL)
@@ -12355,6 +14743,13 @@ impl VdbeEngine {
                         let seek_result = if use_rowset_advance {
                             lean_future(|| cursor.cursor.table_advance_to(&cursor.cx, rowid_val))
                                 .await?
+                        } else if let Some(landed) = cursor
+                            .cursor
+                            .try_table_seek_within_leaf(&cursor.cx, rowid_val)?
+                        {
+                            // The seek cache's latest landing is the leaf the
+                            // cursor is on and holds the target: no wait.
+                            landed
                         } else {
                             lean_future(|| cursor.cursor.table_move_to(&cursor.cx, rowid_val))
                                 .await?
@@ -12397,7 +14792,7 @@ impl VdbeEngine {
                     // Jump to p2 if no matching row exists.  NULL key → not found.
                     let cursor_id = op.p1;
                     // Seek repositions the cursor, so clear any pending delete state.
-                    self.pending_next_after_delete.remove(&cursor_id);
+                    self.pending_next_after_delete.remove(cursor_id);
                     let key_val = self.clone_reg_materialized(op.p3);
                     if key_val.is_null() {
                         pc = op.p2 as usize;
@@ -12615,7 +15010,7 @@ impl VdbeEngine {
                     // state so a following Next advances relative to the new
                     // cursor position.
                     if self.storage_cursors.contains_key(&cursor_id) {
-                        self.pending_next_after_delete.remove(&cursor_id);
+                        self.pending_next_after_delete.remove(cursor_id);
                     }
                     let key_val = self.clone_reg_materialized(op.p3);
                     if key_val.is_null() {
@@ -12678,7 +15073,7 @@ impl VdbeEngine {
                     // NULL key → never found (don't jump).
                     let cursor_id = op.p1;
                     if self.storage_cursors.contains_key(&cursor_id) {
-                        self.pending_next_after_delete.remove(&cursor_id);
+                        self.pending_next_after_delete.remove(cursor_id);
                     }
                     let key_val = self.clone_reg_materialized(op.p3);
                     if key_val.is_null() {
@@ -12742,7 +15137,7 @@ impl VdbeEngine {
                     // NULL in any key field → always jump (no conflict).
                     let cursor_id = op.p1;
                     if self.storage_cursors.contains_key(&cursor_id) {
-                        self.pending_next_after_delete.remove(&cursor_id);
+                        self.pending_next_after_delete.remove(cursor_id);
                     }
                     let key_val = self.clone_reg_materialized(op.p3);
                     let index_desc_flags = self.index_desc_flags_for_cursor(cursor_id);
@@ -12871,6 +15266,7 @@ impl VdbeEngine {
                     let concurrent_schema_epoch = self.concurrent_rowid_schema_epoch;
                     let concurrent_rowid_session_id = self.concurrent_rowid_session_id;
                     let concurrent_rowid_statement = self.concurrent_rowid_statement;
+                    let concurrent_rowid_begin_generation = self.concurrent_rowid_begin_generation;
                     // GH #186: capture the AUTOINCREMENT table's root page so the
                     // allocated rowid can be folded into the program-scoped
                     // high-water AFTER the `sc` borrow ends (sqlite_sequence must
@@ -12897,7 +15293,7 @@ impl VdbeEngine {
                         // repositions the cursor. Clear any pending delete/next
                         // state so subsequent Next/Prev behavior is consistent
                         // with the new position.
-                        self.pending_next_after_delete.remove(&cursor_id);
+                        self.pending_next_after_delete.remove(cursor_id);
                         if concurrent_mode {
                             if let Some(allocator) = concurrent_allocator.as_ref() {
                                 lean_future(|| {
@@ -12906,6 +15302,7 @@ impl VdbeEngine {
                                         concurrent_schema_epoch,
                                         concurrent_rowid_session_id,
                                         concurrent_rowid_statement,
+                                        concurrent_rowid_begin_generation,
                                         root_page,
                                         rowid_mode,
                                         autoinc_max,
@@ -13133,6 +15530,15 @@ impl VdbeEngine {
                                     // bit above the conflict-mode nibble.
                                     if oe_flag == 5 {
                                         // OE_REPLACE: Delete old, insert new
+                                        if let Some(allocator) = concurrent_allocator.as_ref() {
+                                            // bd-hi7qg: not an append, so claim.
+                                            Self::claim_concurrent_storage_rowid_table(
+                                                allocator,
+                                                concurrent_schema_epoch,
+                                                self.concurrent_rowid_session_id,
+                                                sc,
+                                            )?;
+                                        }
                                         lean_future(|| self.native_replace_row(cursor_id, rowid)).await?;
                                         let sc2 = self
                                             .storage_cursors
@@ -13149,10 +15555,14 @@ impl VdbeEngine {
                                             DecodeCacheInvalidationReason::WriteMutation,
                                         );
                                         if let Some(allocator) = concurrent_allocator.as_ref() {
+                                            let session_id = self.concurrent_rowid_session_id;
+                                            let statement = self.concurrent_rowid_statement;
                                             lean_future(|| {
                                                 Self::bump_concurrent_storage_rowid_floor(
                                                     allocator,
                                                     concurrent_schema_epoch,
+                                                    session_id,
+                                                    statement,
                                                     root_page,
                                                     rowid_mode,
                                                     autoinc_max,
@@ -13200,6 +15610,20 @@ impl VdbeEngine {
                                     // No conflict — reuse the successor/EOF position from the
                                     // existence probe when it already proved the row is absent.
                                     if insert_seek_result == Some(SeekResult::NotFound) {
+                                        // bd-hi7qg: every insert that is not an
+                                        // append seeks, a cursor's first insert
+                                        // in a session included (its append hint
+                                        // starts empty), so this is where the
+                                        // session claims the table. An append
+                                        // follows an insert that claimed.
+                                        if let Some(allocator) = concurrent_allocator.as_ref() {
+                                            Self::claim_concurrent_storage_rowid_table(
+                                                allocator,
+                                                concurrent_schema_epoch,
+                                                self.concurrent_rowid_session_id,
+                                                sc,
+                                            )?;
+                                        }
                                         let rightmost_insert = sc.cursor.eof();
                                         lean_future(|| sc.cursor.table_insert_prechecked_absent(&sc.cx, rowid, blob))
                                             .await?;
@@ -13224,7 +15648,9 @@ impl VdbeEngine {
                                                 .fetch_add(1, AtomicOrdering::Relaxed);
                                         }
                                     }
-                                    if rowid == sc.last_alloc_rowid {
+                                    let is_implicit_alloc =
+                                        sc.last_alloc_rowid > 0 && rowid == sc.last_alloc_rowid;
+                                    if is_implicit_alloc {
                                         sc.last_alloc_landed = true;
                                     }
                                     invalidate_storage_cursor_row_cache_with_reason(
@@ -13232,19 +15658,42 @@ impl VdbeEngine {
                                         self.collect_vdbe_metrics,
                                         DecodeCacheInvalidationReason::WriteMutation,
                                     );
-                                    if let Some(allocator) = concurrent_allocator.as_ref() {
-                                        lean_future(|| {
-                                            Self::bump_concurrent_storage_rowid_floor(
-                                                allocator,
-                                                concurrent_schema_epoch,
-                                                root_page,
-                                                rowid_mode,
-                                                autoinc_max,
-                                                sc,
-                                                rowid,
-                                            )
-                                        })
-                                        .await?;
+                                    // An implicit-rowid insert (`NewRowid`) already
+                                    // reserved `rowid` in `allocator` and recorded its
+                                    // session/statement ownership; only explicit-rowid
+                                    // writes (and random-rowid fallbacks) need a floor
+                                    // bump here.
+                                    if !is_implicit_alloc
+                                        && let Some(allocator) = concurrent_allocator.as_ref()
+                                    {
+                                        let session_id = self.concurrent_rowid_session_id;
+                                        let statement = self.concurrent_rowid_statement;
+                                        if !Self::try_raise_concurrent_storage_rowid_floor_after_append(
+                                            allocator,
+                                            concurrent_schema_epoch,
+                                            session_id,
+                                            statement,
+                                            root_page,
+                                            rowid_mode,
+                                            autoinc_max,
+                                            sc,
+                                            rowid,
+                                        )? {
+                                            lean_future(|| {
+                                                Self::bump_concurrent_storage_rowid_floor(
+                                                    allocator,
+                                                    concurrent_schema_epoch,
+                                                    session_id,
+                                                    statement,
+                                                    root_page,
+                                                    rowid_mode,
+                                                    autoinc_max,
+                                                    sc,
+                                                    rowid,
+                                                )
+                                            })
+                                            .await?;
+                                        }
                                     }
                                     inserted_via_storage = true;
                                     inserted_root_page = Some(root_page);
@@ -13297,6 +15746,7 @@ impl VdbeEngine {
                             // borrow ends so the connection can run victim FK
                             // and delete-trigger semantics.
                             let mut mem_replace_victims: Vec<(i64, Vec<SqliteValue>)> = Vec::new();
+                            let mem_op_cx = self.derive_execution_cx();
                             if let Some(db) = self.db.as_mut() {
                                 // Check rowid conflict first.
                                 let rowid_conflict = db
@@ -13310,7 +15760,8 @@ impl VdbeEngine {
                                 // row on a UNIQUE column.
                                 let unique_conflicts = db
                                     .get_table(root)
-                                    .map(|t| t.find_unique_conflicts(&values))
+                                    .map(|t| t.find_unique_conflicts(&mem_op_cx, &values))
+                                    .transpose()?
                                     .unwrap_or_default();
 
                                 let has_conflict = rowid_conflict || !unique_conflicts.is_empty();
@@ -13333,28 +15784,40 @@ impl VdbeEngine {
                                                 // Delete conflicting rows that are not the new rowid
                                                 // (which will be replaced by upsert_row).
                                                 if conflict_rid != rowid {
-                                                    if let Some(old_values) =
-                                                        db.get_table(root).and_then(|t| {
-                                                            t.row_values_by_rowid(conflict_rid)
+                                                    if let Some(old_values) = db
+                                                        .get_table(root)
+                                                        .map(|t| {
+                                                            t.read_row_values_by_rowid(
+                                                                &mem_op_cx,
+                                                                conflict_rid,
+                                                            )
                                                         })
+                                                        .transpose()?
+                                                        .flatten()
                                                     {
                                                         mem_replace_victims.push((
                                                             conflict_rid,
-                                                            old_values.to_vec(),
+                                                            old_values.into_owned(),
                                                         ));
                                                     }
-                                                    db.delete_rowid(root, conflict_rid);
+                                                    db.delete_rowid(&mem_op_cx, root, conflict_rid)?;
                                                 }
                                             }
                                             if rowid_conflict
                                                 && let Some(old_values) = db
                                                     .get_table(root)
-                                                    .and_then(|t| t.row_values_by_rowid(rowid))
+                                                    .map(|t| {
+                                                        t.read_row_values_by_rowid(
+                                                            &mem_op_cx, rowid,
+                                                        )
+                                                    })
+                                                    .transpose()?
+                                                    .flatten()
                                             {
                                                 mem_replace_victims
-                                                    .push((rowid, old_values.to_vec()));
+                                                    .push((rowid, old_values.into_owned()));
                                             }
-                                            db.upsert_row(root, rowid, values);
+                                            db.upsert_row_checked(&mem_op_cx, root, rowid, values)?;
                                             actually_inserted = true;
                                         }
                                         _ => {
@@ -13381,19 +15844,15 @@ impl VdbeEngine {
                                             // bd-w4pr1.22: an IPK collision, or
                                             // a violated PRIMARY KEY constraint,
                                             // halts with SQLITE_CONSTRAINT_PRIMARYKEY.
-                                            let unique_label = (!rowid_conflict)
-                                                .then(|| {
-                                                    self.db.as_ref().and_then(|db| {
-                                                        db.get_table(root).and_then(|table| {
-                                                            table
-                                                                .find_unique_conflict_label(&values)
-                                                                .map(|(label, primary_key)| {
-                                                                    (label.to_owned(), primary_key)
-                                                                })
-                                                        })
-                                                    })
-                                                })
-                                                .flatten();
+                                            let unique_label = if rowid_conflict {
+                                                None
+                                            } else {
+                                                self.db.as_ref().and_then(|db| db.get_table(root))
+                                                    .map(|table| table.find_unique_conflict_label(&mem_op_cx, &values))
+                                                    .transpose()?
+                                                    .flatten()
+                                                    .map(|(label, primary_key)| (label.to_owned(), primary_key))
+                                            };
                                             let (message, code) = match unique_label {
                                                 Some((label, primary_key)) => (
                                                     format!("UNIQUE constraint failed: {label}"),
@@ -13432,7 +15891,7 @@ impl VdbeEngine {
                                     }
                                 } else {
                                     // No conflict — insert normally
-                                    db.upsert_row(root, rowid, values);
+                                    db.upsert_row_checked(&mem_op_cx, root, rowid, values)?;
                                     actually_inserted = true;
                                 }
                             }
@@ -13497,7 +15956,7 @@ impl VdbeEngine {
                     // br-22iss: Clear pending_next_after_delete since Insert repositions
                     // the cursor. This is critical for UPDATE (Delete+Insert) to avoid
                     // infinite loops when the rowid doesn't change.
-                    self.pending_next_after_delete.remove(&cursor_id);
+                    self.pending_next_after_delete.remove(cursor_id);
                     pc += 1;
                 }
 
@@ -13515,8 +15974,17 @@ impl VdbeEngine {
                     // only for legacy Phase 4 cursors.
                     if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                         if sc.writable && !sc.cursor.eof() {
-                            let current_rowid = lean_future(|| sc.cursor.rowid(&sc.cx)).await?;
-                            if is_update {
+                            // A cursor on a table-leaf cell has the rowid in the
+                            // cell (bd-w4pr1.13.20, lever D, as the Rowid arm);
+                            // any other position takes the async read.
+                            let current_rowid = match sc.cursor.try_table_leaf_rowid()? {
+                                Some(rowid) => rowid,
+                                None => lean_future(|| sc.cursor.rowid(&sc.cx)).await?,
+                            };
+                            // An in-place rewrite that cannot conflict
+                            // (OPFLAG_UPDATE_NO_RESTORE, lever UR) is never
+                            // restored, so it keeps no copy of the row.
+                            if is_update && (op.p5 & OPFLAG_UPDATE_NO_RESTORE) == 0 {
                                 update_restore = Some(PendingUpdateRestore::Storage {
                                     cursor_id,
                                     rowid: current_rowid,
@@ -13550,18 +16018,20 @@ impl VdbeEngine {
                                 .is_some_and(|table| pos < table.rows.len());
                             if can_delete && let Some(db) = self.db.as_mut() {
                                 if is_update
-                                    && let Some(row) = db
-                                        .get_table(root)
-                                        .and_then(|table| table.rows.get(pos))
-                                        .cloned()
+                                    && let Some(table) = db.get_table(root)
+                                    && let Some(row) = table.rows.get(pos)
                                 {
+                                    let restored_values = table
+                                        .read_row_values_at(&self.execution_cx, pos)?
+                                        .map(Cow::into_owned)
+                                        .unwrap_or_default();
                                     update_restore = Some(PendingUpdateRestore::Mem {
                                         root_page: root,
                                         rowid: row.rowid,
-                                        values: row.values,
+                                        values: restored_values,
                                     });
                                 }
-                                db.delete_at(root, pos);
+                                db.delete_at(&self.execution_cx, root, pos)?;
                                 deleted = true;
                             }
                         }
@@ -13905,18 +16375,28 @@ impl VdbeEngine {
                                             // insert, roll back any already-inserted
                                             // index entries, and skip remaining indexes.
                                             4 => {
-                                                if let Err(error) = lean_future(|| {
+                                                let removed = match lean_future(|| {
                                                     self.rollback_pending_insert_after_index_conflict(
                                                         true,
+                                                        false,
                                                     )
                                                 })
                                                 .await
                                                 {
-                                                    if sideband_active {
-                                                        self.make_record_lookaside
-                                                            .replace_cleared_buf(key_blob);
+                                                    Ok(removed) => removed,
+                                                    Err(error) => {
+                                                        if sideband_active {
+                                                            self.make_record_lookaside
+                                                                .replace_cleared_buf(key_blob);
+                                                        }
+                                                        return Err(error);
                                                     }
-                                                    return Err(error);
+                                                };
+                                                if let Some((table_cursor, rowid)) = removed {
+                                                    self.note_ignored_autoincrement_rowid(
+                                                        table_cursor,
+                                                        rowid,
+                                                    );
                                                 }
                                                 self.set_conflict_skip_idx(true);
                                                 if sideband_active {
@@ -14015,6 +16495,7 @@ impl VdbeEngine {
                                                 if let Err(error) = lean_future(|| {
                                                     self.rollback_pending_insert_after_index_conflict(
                                                         false,
+                                                        true,
                                                     )
                                                 })
                                                 .await
@@ -14156,7 +16637,7 @@ impl VdbeEngine {
                 // The hot lane runs the three sorter opcodes below; these arms
                 // keep the statement loop's match complete.
                 Opcode::SorterInsert => {
-                    self.execute_sorter_insert(op)?;
+                    self.execute_sorter_insert(ops, op)?;
                     pc += 1;
                 }
 
@@ -14403,12 +16884,41 @@ impl VdbeEngine {
                         } else {
                             0
                         }
-                    } else if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
+                    } else if self.storage_cursors.get(&cursor_id).is_some() {
+                        // bd-w4pr1.13.11: with parallel workers allowed and a
+                        // snapshot reader offered, count the cursor's b-tree on
+                        // several threads. Any failure or stop falls back to the
+                        // serial count, which reports errors and cancellation as
+                        // it always has.
+                        let reader = self.parallel_snapshot_reader();
+                        let workers = self.parallel_workers;
+                        let sc = self
+                            .storage_cursors
+                            .get_mut(&cursor_id)
+                            .ok_or_else(|| FrankenError::internal("Count cursor vanished"))?;
+                        let parallel = match (&reader, &sc.cursor) {
+                            (Some(reader), CursorBackend::Txn(btree)) => {
+                                let cx = &sc.cx;
+                                fsqlite_btree::snapshot_walk::count_entries_parallel(
+                                    reader,
+                                    btree.root_page(),
+                                    btree.usable_size(),
+                                    workers,
+                                    &|| cx.is_cancel_requested(),
+                                )
+                                .ok()
+                                .flatten()
+                            }
+                            _ => None,
+                        };
                         // bd-wwqen.3: storage-cursor COUNT must report the
                         // cursor's own storage view, not a connection-local
                         // MemDatabase mirror that may lag retained same-connection
                         // writes.
-                        lean_future(|| sc.cursor.count_all_rows(&sc.cx)).await?
+                        match parallel {
+                            Some(count) => count,
+                            None => lean_future(|| sc.cursor.count_all_rows(&sc.cx)).await?,
+                        }
                     } else {
                         0
                     };
@@ -14442,6 +16952,37 @@ impl VdbeEngine {
                     };
                     let next_count = self.get_reg(op.p2).to_integer().wrapping_add(matched);
                     self.set_reg_int(op.p2, next_count);
+                    pc += 1;
+                }
+
+                Opcode::IdxCountBefore => {
+                    // bd-2fb53: count the index entries from the cursor's
+                    // position that order before the bound record in P3 (to
+                    // the end when P3 is 0), whole leaves at a time.
+                    let bound = (op.p3 > 0).then(|| self.clone_reg_materialized(op.p3));
+                    let collect_vdbe_metrics = self.collect_vdbe_metrics;
+                    let cursor = self.storage_cursors.get_mut(&op.p1).ok_or_else(|| {
+                        FrankenError::internal("IdxCountBefore requires an open storage cursor")
+                    })?;
+                    if cursor.cursor.is_table_btree() {
+                        return Err(FrankenError::internal(
+                            "IdxCountBefore requires an index cursor",
+                        ));
+                    }
+                    let bound_bytes = bound.as_ref().map(record_blob_bytes);
+                    let inclusive = (op.p5 & 1) != 0;
+                    let counted = lean_future(|| {
+                        cursor
+                            .cursor
+                            .count_entries_before(&cursor.cx, bound_bytes, inclusive)
+                    })
+                    .await?;
+                    invalidate_storage_cursor_row_cache_with_reason(
+                        cursor,
+                        collect_vdbe_metrics,
+                        DecodeCacheInvalidationReason::PositionChange,
+                    );
+                    self.set_reg_int(op.p2, i64::try_from(counted).unwrap_or(i64::MAX));
                     pc += 1;
                 }
 
@@ -14494,7 +17035,7 @@ impl VdbeEngine {
                     if val.is_null() {
                         self.set_reg(op.p2, SqliteValue::Integer(i64::from(op.p3 ^ p4_val)));
                     } else {
-                        let v = i32::from(vdbe_real_is_truthy(val));
+                        let v = i32::from(val.is_sql_truthy_in(self.text_encoding));
                         self.set_reg(op.p2, SqliteValue::Integer(i64::from((v ^ p4_val) & 1)));
                     }
                     pc += 1;
@@ -14938,7 +17479,8 @@ impl VdbeEngine {
                         if let Some(pos) = cursor.position
                             && let Some(db) = self.db.as_ref()
                             && let Some(table) = db.get_table(cursor.root_page)
-                            && let Some(row) = table.rows.get(pos)
+                            && let Some(row_values) =
+                                table.read_row_values_at(&self.execution_cx, pos)?
                         {
                             let n_compare = if op.p5 > 0 {
                                 op.p5 as usize
@@ -14949,7 +17491,7 @@ impl VdbeEngine {
                             let collations = self.index_collations_for_root(cursor.root_page);
                             let coll_guard = self.lock_collation();
                             let cmp = compare_index_prefix_keys(
-                                &row.values,
+                                &row_values,
                                 &probe_fields,
                                 n_compare,
                                 &desc_flags,
@@ -15139,7 +17681,15 @@ impl VdbeEngine {
                     };
 
                     let accum_reg = op.p1;
-                    observe_execution_cancellation(&self.execution_cx)?;
+                    // bd-w4pr1.12 (lever AFC): a per-group boundary, like
+                    // VNext's and AggStep's: a requested cancellation is one
+                    // atomic load before and after the finalize, and the
+                    // statement loop's interval checkpoint (every
+                    // VDBE_EXECUTION_CHECKPOINT_INTERVAL opcodes) covers the
+                    // e-process, native-runtime and deadline / budget planes.
+                    // Two full checkpoints here were ~720 instructions a group
+                    // (GROUP BY id over 1M rows: 722M of 5,024M).
+                    observe_requested_execution_cancellation(&self.execution_cx)?;
                     let result = match self
                         .cold_state_mut()
                         .and_then(|cold_state| cold_state.aggregates.remove(&accum_reg))
@@ -15156,7 +17706,7 @@ impl VdbeEngine {
                         None => func.finalize(func.initial_state())?,
                     };
 
-                    observe_execution_cancellation(&self.execution_cx)?;
+                    observe_requested_execution_cancellation(&self.execution_cx)?;
                     self.set_reg(accum_reg, result);
                     if let Some(subtype) = func.result_subtype() {
                         self.set_register_subtype(accum_reg, subtype);
@@ -15241,7 +17791,9 @@ impl VdbeEngine {
                     })?;
 
                     let accum_reg = op.p1;
-                    observe_execution_cancellation(&self.execution_cx)?;
+                    // bd-w4pr1.12 (lever AFC): a per-row boundary, as in
+                    // AggInverse and AggFinal: one atomic load each side.
+                    observe_requested_execution_cancellation(&self.execution_cx)?;
                     let result = match self
                         .cold_state()
                         .and_then(|cold_state| cold_state.window_contexts.get(&accum_reg))
@@ -15249,7 +17801,7 @@ impl VdbeEngine {
                         Some(ctx) => ctx.func.value(&ctx.state)?,
                         None => func.value(&func.initial_state())?,
                     };
-                    observe_execution_cancellation(&self.execution_cx)?;
+                    observe_requested_execution_cancellation(&self.execution_cx)?;
                     self.set_reg(op.p3, result);
                     pc += 1;
                 }
@@ -15937,6 +18489,11 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     let col = op.p2;
                     let dest = op.p3;
+                    // The synchronous lane ran this VColumn and kept the
+                    // module's error for this arm to report.
+                    if let Some(error) = self.take_vtab_lane_error() {
+                        break vtab_exec_outcome("VColumn", error)?;
+                    }
 
                     let column_value = if let Some(state) = self
                         .cold_state()
@@ -15966,6 +18523,11 @@ impl VdbeEngine {
                     // P2 = jump address to loop body (go back if not eof)
                     let cursor_id = op.p1;
                     let jump_if_more = op.p2;
+                    // The synchronous lane ran this VNext and kept the
+                    // module's error for this arm to report.
+                    if let Some(error) = self.take_vtab_lane_error() {
+                        break vtab_exec_outcome("VNext", error)?;
+                    }
                     let cx = self.derive_execution_cx();
 
                     if let Some(state) = self
@@ -16313,8 +18875,10 @@ impl VdbeEngine {
         self.get_reg(r).clone()
     }
 
-    /// `SorterInsert`: hand the record in register `p2` to sorter `p1`.
-    fn execute_sorter_insert(&mut self, op: &VdbeOp) -> Result<()> {
+    /// `SorterInsert`: hand the record in register `p2` to sorter `p1`. `ops`
+    /// is the program `op` belongs to, read once per sorter fill when the
+    /// sorter decides whether it collects runs.
+    fn execute_sorter_insert(&mut self, ops: &[VdbeOp], op: &VdbeOp) -> Result<()> {
         // Lazy key decode: only decode the first `key_columns`
         // values (the sort key) instead of all columns.  The
         // raw blob is retained for output via `SorterData`.
@@ -16381,133 +18945,77 @@ impl VdbeEngine {
             .ok_or_else(|| FrankenError::DatabaseCorrupt {
                 detail: "malformed record in SorterInsert".to_owned(),
             })?;
-            sorter.insert_record(key_values, blob)?;
+            sorter.insert_program_record(key_values, blob, ops, cursor_id)?;
         }
         Ok(())
     }
 
-    /// The verdict of a top-N preflight on a full heap, read from the packed
-    /// candidate key without decoding it: `Some(true)` keeps the candidate.
-    ///
-    /// `None` leaves the decision to the general path in
-    /// [`Self::execute_sorter_compare`]: no sorter, no bound or a bound of
-    /// zero, a heap that is not yet full, a sorter with a collation on any key
-    /// or on a database that is not UTF-8 (decided before the record is read,
-    /// so such a sorter pays one test per row), metrics collection on (the
-    /// general path counts its decode), a P3 that is neither the armed
-    /// `MakeRecord` sideband nor a blob register, or a key
-    /// [`compare_packed_sorter_key`] does not take. Reads only.
-    fn top_n_preflight_packed_verdict(&self, op: &VdbeOp) -> Option<bool> {
-        if self.collect_vdbe_metrics {
-            return None;
-        }
-        let sorter = self.sorters.get(&op.p1)?;
-        let limit = sorter.top_n_limit?;
-        if limit == 0
-            || sorter.rows.len() < limit
-            || !matches!(sorter.text_encoding, TextEncoding::Utf8)
-            || sorter.collations.iter().any(Option::is_some)
-        {
-            return None;
-        }
-        let worst = sorter.rows.first()?;
-        let record = if self.make_record_lookaside.sideband_is_armed_for(op.p3) {
-            self.make_record_lookaside.as_slice()
-        } else if let SqliteValue::Blob(bytes) = self.get_reg(op.p3) {
-            bytes
-        } else {
-            return None;
+    /// Whether a top-N preflight keeps its candidate key, the `key_len`
+    /// registers from `first_key_reg`, which bounded sorter `cursor_id`
+    /// judges against its current worst row as its own insert would (SQLite's
+    /// IdxLE likewise compares key registers with the stored row, building no
+    /// record). A missing sorter keeps nothing; a sorter without a bound, or
+    /// whose heap is not yet full, keeps everything. Reads only.
+    fn top_n_preflight_retains(&self, cursor_id: i32, first_key_reg: i32, key_len: usize) -> bool {
+        let Some(sorter) = self.sorters.get(&cursor_id) else {
+            return false;
         };
-        let ordering = compare_packed_sorter_key(
-            record,
-            &worst.values,
-            sorter.key_columns,
-            &sorter.sort_key_orders,
-            &sorter.collations,
-            sorter.text_encoding,
-        )?;
-        Some(ordering == Ordering::Less)
+        if sorter
+            .top_n_limit
+            .is_none_or(|limit| sorter.rows.len() < limit)
+        {
+            return true;
+        }
+        let coll = self.lock_collation();
+        if let Some(candidate) = usize::try_from(first_key_reg)
+            .ok()
+            .and_then(|start| self.registers.get(start..start.checked_add(key_len)?))
+        {
+            return sorter.would_retain_top_n(candidate, &coll);
+        }
+        let candidate: Vec<SqliteValue> = (0..key_len)
+            .map(|offset| {
+                Self::reg_with_offset(first_key_reg, offset)
+                    .map_or(SqliteValue::Null, |reg| self.get_reg(reg).clone())
+            })
+            .collect();
+        sorter.would_retain_top_n(&candidate, &coll)
     }
 
     /// `SorterCompare`, including its jump.
     ///
-    /// In preflight mode, compare a candidate key with the bounded sorter's
-    /// current worst key and jump when the candidate cannot survive.
-    /// Otherwise compare the current sorter key with P3 and jump when the
-    /// keys differ.
+    /// In preflight mode, compare the candidate key registers with the
+    /// bounded sorter's current worst key and jump when the candidate cannot
+    /// survive. Otherwise compare the current sorter key with the record in
+    /// P3 and jump when the keys differ.
     #[allow(clippy::cast_sign_loss)]
     fn execute_sorter_compare(&mut self, op: &VdbeOp, pc: &mut usize) -> Result<()> {
         let cursor_id = op.p1;
-        let is_top_n_preflight = (op.p5 & SORTER_COMPARE_TOP_N_PREFLIGHT) != 0;
-        if is_top_n_preflight && let Some(retain) = self.top_n_preflight_packed_verdict(op) {
-            // The preflight consumes P3. The general path takes the sideband
-            // buffer, clears it and puts it back, leaving the lookaside reset;
-            // a blob register is left as it is.
-            if self.make_record_lookaside.sideband_is_armed_for(op.p3) {
-                self.make_record_lookaside.reset();
+        if (op.p5 & SORTER_COMPARE_TOP_N_PREFLIGHT) != 0 {
+            let key_len = match op.p4 {
+                P4::Int(count) => usize::try_from(count).unwrap_or(0),
+                _ => 0,
+            };
+            // A key register is a value, never a record; should one hold
+            // MakeRecord's sideband, it is read as the blob it stands for.
+            if let Some(armed) = self.make_record_lookaside.armed_register()
+                && Self::register_range_contains(op.p3, key_len, armed)
+            {
+                self.materialize_make_record_sideband(armed);
             }
-            #[cfg(test)]
-            FSQLITE_VDBE_PACKED_TOP_N_VERDICTS_TOTAL.with(|counter| {
-                counter.set(counter.get().saturating_add(1));
-            });
-            if retain {
+            if self.top_n_preflight_retains(op.p1, op.p3, key_len) {
                 *pc += 1;
             } else {
                 *pc = op.p2 as usize;
             }
             return Ok(());
         }
-        // One lookup answers both: whether the sorter exists and whether its
-        // bounded heap is full.
-        let preflight_heap_full = if is_top_n_preflight {
-            self.sorters.get(&cursor_id).map(|sorter| {
-                sorter
-                    .top_n_limit
-                    .is_some_and(|limit| sorter.rows.len() >= limit)
-            })
-        } else {
-            None
-        };
-        let preflight_sorter_exists = !is_top_n_preflight || preflight_heap_full.is_some();
-        let preflight_needs_compare = preflight_heap_full == Some(true);
-        let preflight_probe = if is_top_n_preflight {
-            if self.make_record_lookaside.sideband_is_armed_for(op.p3) {
-                // Consume MakeRecord's sideband directly, then
-                // return its allocation to the lookaside pool.
-                // Materializing an Arc-backed register blob here
-                // would add an allocation to every source row.
-                self.make_record_lookaside.disarm();
-                let probe_buf = self.make_record_lookaside.take_buf();
-                let decoded = preflight_needs_compare
-                    .then(|| {
-                        decode_record_bytes_with_metrics(
-                            &probe_buf,
-                            self.text_encoding,
-                            self.collect_vdbe_metrics,
-                        )
-                    })
-                    .transpose();
-                self.make_record_lookaside.replace_cleared_buf(probe_buf);
-                decoded?
-            } else if preflight_needs_compare {
-                Some(decode_record_with_metrics(
-                    self.get_reg(op.p3),
-                    self.text_encoding,
-                    self.collect_vdbe_metrics,
-                )?)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let ordinary_needs_compare = !is_top_n_preflight
-            && self.sorters.get(&cursor_id).is_some_and(|sorter| {
-                sorter
-                    .position
-                    .is_some_and(|position| sorter.rows.get(position).is_some())
-            });
-        let ordinary_probe = if ordinary_needs_compare {
+        let needs_compare = self.sorters.get(&cursor_id).is_some_and(|sorter| {
+            sorter
+                .position
+                .is_some_and(|position| sorter.rows.get(position).is_some())
+        });
+        let probe = if needs_compare {
             if self.make_record_lookaside.sideband_is_armed_for(op.p3) {
                 // Decode the logical P3 value without consuming
                 // MakeRecord's sideband. Ordinary SorterCompare is
@@ -16529,25 +19037,10 @@ impl VdbeEngine {
             None
         };
         let coll = self.lock_collation();
-        let should_jump = if is_top_n_preflight {
-            if !preflight_sorter_exists {
-                true
-            } else if !preflight_needs_compare {
-                false
-            } else if let Some(sorter) = self.sorters.get(&cursor_id) {
-                !sorter.would_retain_top_n(
-                    preflight_probe
-                        .as_deref()
-                        .expect("preflight probe should be decoded"),
-                    &coll,
-                )
-            } else {
-                true
-            }
-        } else if let Some(sorter) = self.sorters.get(&cursor_id) {
+        let should_jump = if let Some(sorter) = self.sorters.get(&cursor_id) {
             if let Some(pos) = sorter.position {
                 if let Some(current) = sorter.rows.get(pos) {
-                    let probe = ordinary_probe
+                    let probe = probe
                         .as_deref()
                         .expect("positioned sorter probe should be decoded");
                     !sorter_keys_equal(
@@ -16910,12 +19403,14 @@ impl VdbeEngine {
             Opcode::Column => {
                 // A row whose payload is on the cursor's leaf page is read
                 // here, from the page when the value needs no heap and
-                // through the copying lane otherwise; anything else is left
-                // for `execute_column_hot`.
+                // through the copying lane otherwise, and so is the current
+                // row of a sorter; anything else is left for
+                // `execute_column_hot`.
                 #[allow(clippy::cast_sign_loss)]
                 let col_idx = op.p2 as usize;
                 if self.try_column_to_reg_in_place(op.p1, col_idx, op.p3)?
                     || self.try_column_to_reg_direct_local(op.p1, col_idx, op.p3)?
+                    || self.try_sorter_column_to_reg(op.p1, col_idx, op.p3)?
                 {
                     *pc += 1;
                     Ok(true)
@@ -17046,7 +19541,7 @@ impl VdbeEngine {
             Opcode::Divide => {
                 let divisor = self.get_reg(op.p1);
                 let dividend = self.get_reg(op.p2);
-                let result = sql_div(dividend, divisor);
+                let result = dividend.sql_div(divisor);
                 self.set_reg_arith_result(op.p3, result);
                 *pc += 1;
                 Ok(true)
@@ -17068,7 +19563,7 @@ impl VdbeEngine {
                         self.set_reg_int(op.p3, dividend.checked_rem(divisor).unwrap_or_default());
                     }
                 } else {
-                    let result = sql_rem(dividend, divisor);
+                    let result = dividend.sql_rem(divisor);
                     self.set_reg_arith_result(op.p3, result);
                 }
                 *pc += 1;
@@ -17276,7 +19771,7 @@ impl VdbeEngine {
                 let should_jump = if val.is_null() {
                     op.p3 != 0
                 } else {
-                    !vdbe_real_is_truthy(val)
+                    !val.is_sql_truthy_in(self.text_encoding)
                 };
                 if should_jump {
                     #[allow(clippy::cast_sign_loss)]
@@ -17297,7 +19792,7 @@ impl VdbeEngine {
                 if val.is_null() {
                     self.set_reg_int(op.p2, i64::from(op.p3 ^ p4_val));
                 } else {
-                    let v = i32::from(vdbe_real_is_truthy(val));
+                    let v = i32::from(val.is_sql_truthy_in(self.text_encoding));
                     self.set_reg_int(op.p2, i64::from((v ^ p4_val) & 1));
                 }
                 *pc += 1;
@@ -17321,7 +19816,7 @@ impl VdbeEngine {
                 if val.is_null() {
                     self.set_reg_fast(op.p2, SqliteValue::Null);
                 } else {
-                    self.set_reg_int(op.p2, i64::from(!vdbe_real_is_truthy(val)));
+                    self.set_reg_int(op.p2, i64::from(!val.is_sql_truthy_in(self.text_encoding)));
                 }
                 *pc += 1;
                 Ok(true)
@@ -17329,7 +19824,7 @@ impl VdbeEngine {
             // IMPL-13: Fused `Integer(p1=lit, p2=reg) + ResultRow(p1=reg, p2=1)`.
             // Emits a single-column result row whose only value is the literal
             // integer `p1`, then clears the source register to mirror the
-            // drain semantics of `ResultRow` (`take_reg_range`).
+            // drain semantics of `ResultRow` (`take_reg_range_into`).
             //
             // Correctness: byte-equivalent to the unfused sequence. The
             // codegen-side peephole pass is responsible for verifying that
@@ -17339,7 +19834,7 @@ impl VdbeEngine {
                 let lit = i64::from(op.p1);
                 let reg = op.p2;
                 // Preserve Integer's write-then-ResultRow-drain side effects:
-                // the register ends up cleared after `take_reg_range`.
+                // the register ends up cleared after `take_reg_range_into`.
                 self.set_reg_int(reg, lit);
 
                 let should_retain_row = self.collect_result_rows
@@ -17350,9 +19845,12 @@ impl VdbeEngine {
                 if row_handler.is_some() || should_retain_row {
                     let materialize_start = collect_vdbe_metrics.then(Instant::now);
                     // Single-column row: drain the register just like
-                    // `take_reg_range(reg, 1)` would.
-                    let mut row: smallvec::SmallVec<[SqliteValue; 16]> =
-                        smallvec::SmallVec::with_capacity(1);
+                    // `take_reg_range_into(reg, 1, ..)` would.
+                    let mut row = if row_handler.is_some() {
+                        std::mem::take(&mut self.result_row_buf)
+                    } else {
+                        Vec::with_capacity(1)
+                    };
                     row.push(self.take_reg(reg));
                     if collect_vdbe_metrics {
                         if let Some(materialize_start) = materialize_start {
@@ -17365,7 +19863,7 @@ impl VdbeEngine {
                         record_result_row_metrics(&row);
                     }
                     if let Some(handler) = row_handler.as_mut() {
-                        (*handler)(row)?;
+                        self.hand_result_row(row, &mut **handler)?;
                     } else {
                         self.results.push(retained_result_row(row));
                     }
@@ -17407,7 +19905,7 @@ impl VdbeEngine {
                 let should_jump = if val.is_null() {
                     op.p3 != 0
                 } else {
-                    vdbe_real_is_truthy(val)
+                    val.is_sql_truthy_in(self.text_encoding)
                 };
                 if should_jump {
                     #[allow(clippy::cast_sign_loss)]
@@ -17429,8 +19927,14 @@ impl VdbeEngine {
             // The rowid of a storage cursor on a table leaf is in the cell the
             // cursor stands on. Everything else `Rowid` serves (an index
             // cursor, a virtual table, an in-memory cursor, a cursor at EOF)
-            // keeps its arm in `try_execute_hot_opcode_async`. A decline
-            // follows at most the stale-row refresh that arm starts with.
+            // keeps its arm in `try_execute_hot_opcode_async`.
+            //
+            // The cell is read directly; the row-decode cache is neither
+            // consulted nor filled (bd-w4pr1.13.20, lever R). Each of its
+            // readers compares the cursor's position stamp itself before
+            // trusting it, and keeping it coherent here (the stamp compare and
+            // the invalidation of a moved row) cost more than the two varints
+            // of the read on every scanned row.
             Opcode::Rowid => {
                 let Some(cursor) = self.storage_cursors.get_mut(&op.p1) else {
                     return Ok(false);
@@ -17438,10 +19942,28 @@ impl VdbeEngine {
                 if cursor.cursor.eof() {
                     return Ok(false);
                 }
-                let Some(rowid) = try_storage_cursor_cached_rowid_local(cursor)? else {
+                let Some(rowid) = cursor.cursor.try_table_leaf_rowid()? else {
                     return Ok(false);
                 };
                 self.set_reg_int(op.p2, rowid);
+                *pc += 1;
+                Ok(true)
+            }
+            // A virtual-table cursor's column read and step are synchronous
+            // calls into the module (bd-w4pr1.13.21, lever S): leaving this
+            // lane for them cost an INSERT ... SELECT from a table-valued
+            // function ~85 instructions each per row. A module error goes to
+            // the main loop's arm, which reports it as before.
+            Opcode::VColumn => self.execute_vcolumn_hot(op, pc),
+            Opcode::VNext => self.execute_vnext_hot(op, pc),
+            // An INTEGER is already an integer key: MustBeInt converts nothing
+            // and does not jump; of the main arm's take and write only the
+            // subtype clear remains. Every other value takes that arm.
+            Opcode::MustBeInt => {
+                if !matches!(self.get_reg(op.p1), SqliteValue::Integer(_)) {
+                    return Ok(false);
+                }
+                self.clear_register_subtype(op.p1);
                 *pc += 1;
                 Ok(true)
             }
@@ -17456,7 +19978,7 @@ impl VdbeEngine {
             // either: one of them per row is what ended the run in ORDER BY
             // and GROUP BY loops.
             Opcode::SorterInsert => {
-                self.execute_sorter_insert(op)?;
+                self.execute_sorter_insert(ops, op)?;
                 *pc += 1;
                 Ok(true)
             }
@@ -17469,8 +19991,58 @@ impl VdbeEngine {
                 *pc += 1;
                 Ok(true)
             }
+            // A plain DELETE's row on a table leaf the transaction holds
+            // staged is removed here (bd-w4pr1.13.20, lever SD): that b-tree
+            // delete never waits, and leaving this lane for it cost ~260
+            // instructions a deleted row. An UPDATE's Delete and every delete
+            // the b-tree declines (a leaf's last or only row, an overflowing
+            // row, the first write of a leaf) take the main loop's arm.
+            Opcode::Delete => self.execute_plain_delete_hot(op, pc),
             _ => Ok(false),
         }
+    }
+
+    /// The main loop's `Delete` arm for a plain DELETE (no `OPFLAG_ISUPDATE`)
+    /// whose row the b-tree removes without waiting. `Ok(false)` changes
+    /// nothing and leaves the opcode to that arm.
+    ///
+    /// Kept out of line so the synchronous lane's scan loop stays as small as
+    /// it was.
+    #[inline(never)]
+    fn execute_plain_delete_hot(&mut self, op: &VdbeOp, pc: &mut usize) -> Result<bool> {
+        if op.p5 & OPFLAG_ISUPDATE != 0 {
+            return Ok(false);
+        }
+        let cursor_id = op.p1;
+        let collect_vdbe_metrics = self.collect_vdbe_metrics;
+        let Some(sc) = self.storage_cursors.get_mut(&cursor_id) else {
+            return Ok(false);
+        };
+        if !sc.writable || sc.cursor.eof() {
+            return Ok(false);
+        }
+        let Some(rowid) = sc.cursor.try_table_leaf_rowid()? else {
+            return Ok(false);
+        };
+        if !sc.cursor.try_delete_table_leaf_cell_in_staged_image() {
+            return Ok(false);
+        }
+        invalidate_storage_cursor_row_cache_with_reason(
+            sc,
+            collect_vdbe_metrics,
+            DecodeCacheInvalidationReason::WriteMutation,
+        );
+        // The rest of the main arm after a storage delete, for a plain DELETE:
+        // no update restore, no deferred rewrite.
+        self.sync_storage_table_delete_into_memdb_mirror(cursor_id, rowid);
+        drop(self.take_pending_update_idx_deletes());
+        self.set_pending_update_restore(None);
+        if op.p5 & 1 != 0 {
+            self.changes += 1;
+        }
+        self.pending_next_after_delete.insert(cursor_id);
+        *pc += 1;
+        Ok(true)
     }
 
     /// Whether [`Self::try_execute_hot_opcode_async`] has an arm for `opcode`.
@@ -17567,6 +20139,7 @@ impl VdbeEngine {
                 let concurrent_schema_epoch = self.concurrent_rowid_schema_epoch;
                 let concurrent_rowid_session_id = self.concurrent_rowid_session_id;
                 let concurrent_rowid_statement = self.concurrent_rowid_statement;
+                let concurrent_rowid_begin_generation = self.concurrent_rowid_begin_generation;
                 let previous_last_insert_rowid = self.last_insert_rowid;
                 let previous_last_insert_rowid_valid = self.last_insert_rowid_valid;
 
@@ -17582,6 +20155,7 @@ impl VdbeEngine {
                                 concurrent_schema_epoch,
                                 concurrent_rowid_session_id,
                                 concurrent_rowid_statement,
+                                concurrent_rowid_begin_generation,
                                 root_page,
                                 rowid_mode,
                                 autoinc_max,
@@ -17642,7 +20216,7 @@ impl VdbeEngine {
                             previous_last_insert_rowid_valid,
                             update_restore: None,
                         }));
-                        self.pending_next_after_delete.remove(&cursor_id);
+                        self.pending_next_after_delete.remove(cursor_id);
                         // CRITICAL FIX: Mark table dirty so MemDB fast paths
                         // know the data is stale and fall back to pager reads.
                         // Without this, subsequent COUNT(*)/LIKE queries via
@@ -17678,11 +20252,13 @@ impl VdbeEngine {
                     rec_buf.clear();
                     self.make_record_lookaside.replace_buf(rec_buf);
 
+                    let op_cx = self.derive_execution_cx();
                     let unique_conflicts = self
                         .db
                         .as_ref()
                         .and_then(|db| db.get_table(root_page))
-                        .map(|table| table.find_unique_conflicts(&values))
+                        .map(|table| table.find_unique_conflicts(&op_cx, &values))
+                        .transpose()?
                         .unwrap_or_default();
                     if !unique_conflicts.is_empty() {
                         // bd-towj6: report the constraint that actually
@@ -17693,7 +20269,9 @@ impl VdbeEngine {
                             .db
                             .as_ref()
                             .and_then(|db| db.get_table(root_page))
-                            .and_then(|table| table.find_unique_conflict_label(&values))
+                            .map(|table| table.find_unique_conflict_label(&op_cx, &values))
+                            .transpose()?
+                            .flatten()
                             .map_or_else(
                                 || ("TEMP table unique constraint".to_owned(), false),
                                 |(label, primary_key)| (label.to_owned(), primary_key),
@@ -17710,7 +20288,7 @@ impl VdbeEngine {
                             "FusedAppendInsert: TEMP MemDatabase is not attached",
                         )
                     })?;
-                    db.upsert_row(root_page, rowid, values);
+                    db.upsert_row_checked(&op_cx, root_page, rowid, values)?;
 
                     self.changes += 1;
                     self.last_insert_rowid = rowid;
@@ -17724,7 +20302,7 @@ impl VdbeEngine {
                         previous_last_insert_rowid_valid,
                         update_restore: None,
                     }));
-                    self.pending_next_after_delete.remove(&cursor_id);
+                    self.pending_next_after_delete.remove(cursor_id);
                 } else {
                     return Err(FrankenError::internal(format!(
                         "FusedAppendInsert: no cursor for id {cursor_id}"
@@ -17783,7 +20361,7 @@ impl VdbeEngine {
     #[inline(always)]
     fn next_hot_step(&mut self, cursor_id: i32) -> Result<Option<bool>> {
         let has_next = if !self.pending_next_after_delete.is_empty()
-            && self.pending_next_after_delete.remove(&cursor_id)
+            && self.pending_next_after_delete.remove(cursor_id)
         {
             if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
                 !cursor.cursor.eof()
@@ -17817,18 +20395,7 @@ impl VdbeEngine {
                 None => return Ok(None),
             }
         } else if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
-            if let Some(pos) = sorter.position {
-                let next = pos + 1;
-                if next < sorter.rows.len() {
-                    sorter.position = Some(next);
-                    true
-                } else {
-                    sorter.position = None;
-                    false
-                }
-            } else {
-                false
-            }
+            sorter.advance()
         } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
             if cursor.is_pseudo {
                 false
@@ -17986,26 +20553,51 @@ impl VdbeEngine {
                 None => true,
             };
         if row_handler.is_some() || should_retain_row {
-            let materialize_start = collect_vdbe_metrics.then(Instant::now);
-            let row = self.take_reg_range(op.p1, count);
-            if collect_vdbe_metrics {
-                if let Some(materialize_start) = materialize_start {
-                    FSQLITE_VDBE_RESULT_ROW_MATERIALIZATION_TIME_NS_TOTAL.fetch_add(
-                        u64::try_from(materialize_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                        AtomicOrdering::Relaxed,
-                    );
-                }
-                record_result_row_metrics(&row);
-            }
-            if let Some(handler) = row_handler.as_mut() {
-                (*handler)(row)?;
-            } else {
-                self.results.push(retained_result_row(row));
-            }
+            self.emit_register_result_row(op.p1, count, collect_vdbe_metrics, row_handler)
         } else {
             self.discard_reg_range(op.p1, count);
+            Ok(())
         }
-        Ok(())
+    }
+
+    /// A `ResultRow` whose row goes to the callback or is retained: drain
+    /// registers `start..start + count` into the row and hand it over. A row
+    /// for the callback is lent in the reused buffer; a retained row is
+    /// drained into a vector of its own width.
+    ///
+    /// Kept out of line: inlined into the interpreter loop it changed the
+    /// loop's code enough to cost sorting GROUP BY statements, which emit few
+    /// rows, ~5% of their cycles (bd-w4pr1.12, lever W3).
+    #[inline(never)]
+    fn emit_register_result_row(
+        &mut self,
+        start: i32,
+        count: usize,
+        collect_vdbe_metrics: bool,
+        row_handler: &mut Option<&mut ResultRowCallback<'_>>,
+    ) -> Result<()> {
+        let materialize_start = collect_vdbe_metrics.then(Instant::now);
+        let mut row = if row_handler.is_some() {
+            std::mem::take(&mut self.result_row_buf)
+        } else {
+            Vec::with_capacity(count)
+        };
+        self.take_reg_range_into(start, count, &mut row);
+        if collect_vdbe_metrics {
+            if let Some(materialize_start) = materialize_start {
+                FSQLITE_VDBE_RESULT_ROW_MATERIALIZATION_TIME_NS_TOTAL.fetch_add(
+                    u64::try_from(materialize_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    AtomicOrdering::Relaxed,
+                );
+            }
+            record_result_row_metrics(&row);
+        }
+        if let Some(handler) = row_handler.as_mut() {
+            self.hand_result_row(row, &mut **handler)
+        } else {
+            self.results.push(retained_result_row(row));
+            Ok(())
+        }
     }
 
     fn emit_compiled_result_row(
@@ -18021,7 +20613,12 @@ impl VdbeEngine {
             };
         if row_handler.is_some() || should_retain_row {
             let materialize_start = collect_vdbe_metrics.then(Instant::now);
-            let row: smallvec::SmallVec<[SqliteValue; 16]> = values.iter().cloned().collect();
+            let mut row = if row_handler.is_some() {
+                std::mem::take(&mut self.result_row_buf)
+            } else {
+                Vec::with_capacity(values.len())
+            };
+            row.extend_from_slice(values);
             if collect_vdbe_metrics {
                 if let Some(materialize_start) = materialize_start {
                     FSQLITE_VDBE_RESULT_ROW_MATERIALIZATION_TIME_NS_TOTAL.fetch_add(
@@ -18032,7 +20629,7 @@ impl VdbeEngine {
                 record_result_row_metrics(&row);
             }
             if let Some(handler) = row_handler.as_mut() {
-                (*handler)(row)?;
+                self.hand_result_row(row, &mut **handler)?;
             } else {
                 self.results.push(retained_result_row(row));
             }
@@ -18136,6 +20733,7 @@ impl VdbeEngine {
         let concurrent_schema_epoch = self.concurrent_rowid_schema_epoch;
         let concurrent_rowid_session_id = self.concurrent_rowid_session_id;
         let concurrent_rowid_statement = self.concurrent_rowid_statement;
+        let concurrent_rowid_begin_generation = self.concurrent_rowid_begin_generation;
         let previous_last_insert_rowid = self.last_insert_rowid;
         let previous_last_insert_rowid_valid = self.last_insert_rowid_valid;
 
@@ -18157,6 +20755,7 @@ impl VdbeEngine {
                     concurrent_schema_epoch,
                     concurrent_rowid_session_id,
                     concurrent_rowid_statement,
+                    concurrent_rowid_begin_generation,
                     template.root_page,
                     rowid_mode,
                     autoinc_max,
@@ -18247,7 +20846,7 @@ impl VdbeEngine {
             update_restore: None,
         }));
         self.clear_pending_idx_entries();
-        self.pending_next_after_delete.remove(&template.cursor_id);
+        self.pending_next_after_delete.remove(template.cursor_id);
         self.mark_storage_root_page_dirty(template.root_page);
 
         Ok(ExecOutcome::Done)
@@ -18789,6 +21388,8 @@ impl VdbeEngine {
                 cached_rowid: None,
                 payload_includes_rowid_alias: None,
                 last_successful_insert_rowid: None,
+                append_hint_scope: old_sc.append_hint_scope,
+                rowid_claimed: false,
                 last_rightmost_unique_index_prefix: None,
                 last_rightmost_unique_index_position: None,
                 ipk_col_idx: old_sc.ipk_col_idx,
@@ -18825,22 +21426,33 @@ impl VdbeEngine {
     }
 
     /// Like `collect_reg_range` but *moves* values out of the register file,
-    /// leaving Null in the source registers. This avoids deep-cloning Text and
-    /// Blob values on the hot ResultRow path where the registers are about to
-    /// be overwritten by the next iteration anyway.
+    /// leaving Null in the source registers, and appends them to `row`. This
+    /// avoids deep-cloning Text and Blob values on the hot ResultRow path
+    /// where the registers are about to be overwritten by the next iteration
+    /// anyway.
     #[inline]
-    fn take_reg_range(
-        &mut self,
-        start: i32,
-        count: usize,
-    ) -> smallvec::SmallVec<[SqliteValue; 16]> {
-        let mut row = smallvec::SmallVec::with_capacity(count);
+    fn take_reg_range_into(&mut self, start: i32, count: usize, row: &mut Vec<SqliteValue>) {
+        row.reserve_exact(count);
         for offset in 0..count {
             let val = Self::reg_with_offset(start, offset)
                 .map_or_else(|| SqliteValue::Null, |reg| self.take_reg(reg));
             row.push(val);
         }
-        row
+    }
+
+    /// Hands the row in `self.result_row_buf` to `handler`, then empties the
+    /// buffer (dropping anything the handler left) and keeps it for the next
+    /// row, also when the handler fails.
+    #[inline]
+    fn hand_result_row(
+        &mut self,
+        mut row: Vec<SqliteValue>,
+        handler: &mut ResultRowCallback<'_>,
+    ) -> Result<()> {
+        let outcome = handler(&mut row);
+        row.clear();
+        self.result_row_buf = row;
+        outcome
     }
 
     #[inline]
@@ -19974,13 +22586,9 @@ impl VdbeEngine {
             if let Some(pos) = cursor.position
                 && let Some(db) = self.db.as_ref()
                 && let Some(table) = db.get_table(cursor.root_page)
-                && let Some(row) = table.rows.get(pos)
+                && let Some(row_values) = table.read_row_values_at(&self.execution_cx, pos)?
             {
-                let value = row
-                    .values
-                    .get(col_idx)
-                    .cloned()
-                    .unwrap_or(SqliteValue::Null);
+                let value = row_values.get(col_idx).cloned().unwrap_or(SqliteValue::Null);
                 if collect_vdbe_metrics {
                     record_decoded_value_metrics(&value);
                 }
@@ -19990,72 +22598,38 @@ impl VdbeEngine {
 
         // Sorter cursor: read column directly from the sorted row.
         if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
-            if let Some(pos) = sorter.position {
-                if let Some(value) = sorter
-                    .rows
-                    .get(pos)
-                    .and_then(|row| row.values.get(col_idx))
-                    .cloned()
-                {
-                    note_decode_cache_hit(collect_vdbe_metrics);
-                    if collect_vdbe_metrics {
-                        record_decoded_value_metrics(&value);
-                    }
-                    return Ok(value);
-                }
-                let refresh_state = ensure_sorter_row_cache(sorter, collect_vdbe_metrics, pos)?;
-                let rows = &sorter.rows;
-                let cached_row_decode = &mut sorter.cached_row_decode;
-                let row = rows.get(pos).ok_or_else(|| FrankenError::DatabaseCorrupt {
-                    detail: format!("missing sorter row at position {pos}"),
-                })?;
-                let value = if col_idx < cached_row_decode.column_count() {
-                    let cached_value_ready = cached_row_decode.cached_value_ready(col_idx);
-                    if cached_value_ready {
-                        if refresh_state.refreshed && refresh_state.eager_values_ready {
-                            note_decode_cache_miss(collect_vdbe_metrics);
-                        } else {
-                            note_decode_cache_hit(collect_vdbe_metrics);
-                        }
-                        cached_row_decode
-                            .cached_value(col_idx)
-                            .cloned()
-                            .unwrap_or(SqliteValue::Null)
-                    } else if let Some(value) =
-                        fsqlite_types::record::decode_column_from_offset_with_encoding(
-                            &row.blob,
-                            cached_row_decode
-                                .column_offset(col_idx)
-                                .expect("col_idx checked against column_count"),
-                            // bd-0s9bv: a sorter row blob is the raw source-table
-                            // record (ORDER BY pushes it through unchanged), so TEXT
-                            // must be decoded in the DB's storage encoding. Utf8-only
-                            // decode returned raw UTF-16 bytes for a UTF-16 database.
-                            text_encoding,
-                            collect_vdbe_metrics,
-                        )
-                    {
-                        note_decode_cache_miss(collect_vdbe_metrics);
-                        cached_row_decode.cache_decoded(col_idx, value.clone());
-                        value
-                    } else {
-                        return Err(FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "malformed sorter record while reading column {col_idx}"
-                            ),
-                        });
-                    }
-                } else {
-                    SqliteValue::Null
-                };
-                if collect_vdbe_metrics {
-                    record_decoded_value_metrics(&value);
-                }
-                return Ok(value);
-            }
+            return sorter_current_row_column(sorter, col_idx, text_encoding, collect_vdbe_metrics);
         }
 
         Ok(SqliteValue::Null)
+    }
+
+    /// `Column` on a sorter cursor, on the synchronous lane (bd-w4pr1.13.8,
+    /// lever G2): reads and stores what the async lane's `execute_column_hot`
+    /// would, through the same [`sorter_current_row_column`], so the output
+    /// loop of a sorted GROUP BY no longer leaves the lane once per row.
+    ///
+    /// Returns `Ok(false)`, having changed nothing, for a cursor id that is a
+    /// storage or memory cursor (which [`Self::cursor_column`] reads before
+    /// any sorter) or that is not a sorter.
+    fn try_sorter_column_to_reg(
+        &mut self,
+        cursor_id: i32,
+        col_idx: usize,
+        target: i32,
+    ) -> Result<bool> {
+        if self.storage_cursors.get(&cursor_id).is_some() || self.cursors.get(&cursor_id).is_some()
+        {
+            return Ok(false);
+        }
+        let (text_encoding, collect_vdbe_metrics) = (self.text_encoding, self.collect_vdbe_metrics);
+        let Some(sorter) = self.sorters.get_mut(&cursor_id) else {
+            return Ok(false);
+        };
+        let value =
+            sorter_current_row_column(sorter, col_idx, text_encoding, collect_vdbe_metrics)?;
+        self.set_reg_fast(target, value);
+        Ok(true)
     }
 
     /// Get the rowid from the cursor's current row.
@@ -20136,6 +22710,10 @@ impl VdbeEngine {
         let has_txn = self.txn_page_io.is_some();
         let txn_cx = self.derive_execution_cx();
         let (rowid_mode, autoincrement_high_water) = self.storage_cursor_runtime_meta(root_page);
+        let append_hint_scope = (
+            self.concurrent_rowid_session_id,
+            self.concurrent_rowid_schema_epoch,
+        );
         // bd-a3g0m: an OpenRead of the same root takes back the read cursor
         // parked in this slot (the reuse branch below); a parked cursor on
         // another root is dropped. An OpenWrite drops every parked cursor and
@@ -20153,6 +22731,18 @@ impl VdbeEngine {
                 self.storage_cursors.remove(&cursor_id);
             }
         }
+        // bd-fpr5g: a retained cursor this slot holds on another root becomes
+        // a spare, and the spare on this root, if any, comes back into the
+        // slot for the reuse below. (The slot's own cursor decides, not
+        // `cursor_root_pages`, which can still name a root for an empty slot.)
+        if (self.retain_storage_cursors_on_close || !self.spare_storage_cursors.is_empty())
+            && self
+                .storage_cursors
+                .get(&cursor_id)
+                .is_none_or(|held| held.root_page != root_page)
+        {
+            self.swap_spare_storage_cursor_into_slot(cursor_id, root_page, has_txn);
+        }
         if self.cursor_root_pages.get(&cursor_id).copied() == Some(root_page)
             && let Some(existing) = self.storage_cursors.get_mut(&cursor_id)
         {
@@ -20167,6 +22757,14 @@ impl VdbeEngine {
                 existing.root_page = root_page;
                 existing.rowid_mode = rowid_mode;
                 existing.autoincrement_high_water = autoincrement_high_water;
+                // bd-hi7qg: an append hint learned under another session (or
+                // schema epoch) rides on no claim of this one; dropping it
+                // makes the cursor's next insert seek, and claim.
+                if existing.append_hint_scope != append_hint_scope {
+                    existing.last_successful_insert_rowid = None;
+                    existing.append_hint_scope = append_hint_scope;
+                    existing.rowid_claimed = false;
+                }
                 self.cursor_root_pages.insert(cursor_id, root_page);
                 tracing::trace!(
                     cursor_id,
@@ -20204,9 +22802,15 @@ impl VdbeEngine {
                 // MemDatabase allocates root pages beyond the pager's db_size.
                 let page_data = match page_io.read_page(&txn_cx, root_pgno).await {
                     Ok(bytes) => bytes,
-                    // Cancellation is terminal for this execution. It cannot
-                    // authorize a successful read from a transient snapshot.
-                    Err(FrankenError::Abort) => return Err(FrankenError::Abort),
+                    // Cancellation and on-disk corruption/auth errors are terminal
+                    // for this execution. They must never authorize a fallback to a
+                    // transient MemDatabase snapshot or be downgraded into an
+                    // opaque Internal("OpenRead failed") error.
+                    Err(
+                        err @ (FrankenError::Abort
+                        | FrankenError::DatabaseCorrupt { .. }
+                        | FrankenError::NotADatabase { .. }),
+                    ) => return Err(err),
                     Err(err) => {
                         // Check if MemDatabase can serve this table.
                         let has_mem_table = self
@@ -20382,6 +22986,8 @@ impl VdbeEngine {
                             last_alloc_rowid: 0,
                             last_alloc_landed: false,
                             last_successful_insert_rowid: None,
+                            append_hint_scope,
+                            rowid_claimed: false,
                             last_rightmost_unique_index_prefix: None,
                             last_rightmost_unique_index_position: None,
                             payload_buf: Vec::new(),
@@ -20503,7 +23109,12 @@ impl VdbeEngine {
                             error = %err,
                             "open_storage_cursor: failed to initialize writable root page in pager"
                         );
-                        return if matches!(err, FrankenError::Abort) {
+                        return if matches!(
+                            err,
+                            FrankenError::Abort
+                                | FrankenError::DatabaseCorrupt { .. }
+                                | FrankenError::NotADatabase { .. }
+                        ) {
                             Err(err)
                         } else {
                             Ok(false)
@@ -20553,6 +23164,8 @@ impl VdbeEngine {
                             last_alloc_rowid: 0,
                             last_alloc_landed: false,
                             last_successful_insert_rowid: None,
+                            append_hint_scope,
+                            rowid_claimed: false,
                             last_rightmost_unique_index_prefix: None,
                             last_rightmost_unique_index_position: None,
                             payload_buf: Vec::new(),
@@ -20725,8 +23338,11 @@ impl VdbeEngine {
         if is_table_btree
             && let Some(table) = self.db.as_ref().and_then(|db| db.get_table(root_page))
         {
-            for row in table.rows.iter() {
-                let payload = encode_record_with_encoding(&row.values, self.text_encoding);
+            for (pos, row) in table.rows.iter().enumerate() {
+                let row_values = table
+                    .read_row_values_at(&cx, pos)?
+                    .ok_or_else(|| FrankenError::internal("MemTable row disappeared during open"))?;
+                let payload = encode_record_with_encoding(&row_values, self.text_encoding);
                 if let Err(err) = cursor.table_insert(&cx, row.rowid, &payload).await {
                     return if matches!(err, FrankenError::Abort) {
                         Err(err)
@@ -20759,6 +23375,8 @@ impl VdbeEngine {
                 last_alloc_rowid: 0,
                 last_alloc_landed: false,
                 last_successful_insert_rowid: None,
+                append_hint_scope,
+                rowid_claimed: false,
                 last_rightmost_unique_index_prefix: None,
                 last_rightmost_unique_index_position: None,
                 payload_buf: Vec::new(),
@@ -20839,26 +23457,9 @@ impl VdbeEngine {
 
 /// SQLite affinity constants (from §3.2 of datatype3.html).
 /// Encoded in the lower bits of comparison opcode p5 (masked by 0x47).
-const SQLITE_AFF_MASK: u16 = 0x47;
-const SQLITE_AFF_TEXT: u16 = 0x42; // 'B'
+pub(crate) const SQLITE_AFF_MASK: u16 = 0x47;
+pub(crate) const SQLITE_AFF_TEXT: u16 = 0x42; // 'B'
 const SQLITE_AFF_NUMERIC: u16 = 0x43; // 'C'
-
-/// C SQLite OP_If/OP_IfNot truthiness: uses `sqlite3VdbeRealValue() != 0.0`,
-/// which means 0.1, 0.5, -0.1 etc. are all truthy (unlike integer truncation).
-fn vdbe_real_is_truthy(val: &SqliteValue) -> bool {
-    match val {
-        SqliteValue::Null => false,
-        SqliteValue::Integer(n) => *n != 0,
-        SqliteValue::Float(f) => *f != 0.0,
-        SqliteValue::Text(_) | SqliteValue::Blob(_) => {
-            let i = val.to_integer();
-            if i != 0 {
-                return true;
-            }
-            val.to_float() != 0.0
-        }
-    }
-}
 
 /// Apply SQLite comparison affinity coercion (§3.2 of datatype3.html).
 ///
@@ -20916,6 +23517,23 @@ fn coerce_for_comparison<'a>(
     (Cow::Borrowed(lhs), Cow::Borrowed(rhs))
 }
 
+/// How a comparison opcode with no collation in P4, affinity flags `p5` and
+/// no built-in collation overridden orders `lhs` against `rhs` (P3 against
+/// P1), for code that evaluates a WHERE outside the dispatch loop
+/// (bd-w4pr1.13.11). `None` is an indeterminate comparison.
+pub(crate) fn compare_for_where(
+    lhs: &SqliteValue,
+    rhs: &SqliteValue,
+    p5: u16,
+    enc: TextEncoding,
+) -> Option<Ordering> {
+    if let Some(ord) = fast_compare_same_storage_class(lhs, rhs, &P4::None, p5, enc) {
+        return ord;
+    }
+    let (lhs, rhs) = coerce_for_comparison(lhs, rhs, p5);
+    lhs.partial_cmp(&rhs)
+}
+
 fn values_equal_without_collation(lhs: &SqliteValue, rhs: &SqliteValue) -> bool {
     if lhs.is_null() || rhs.is_null() {
         return false;
@@ -20959,8 +23577,8 @@ fn collate_compare(
 ) -> Option<std::cmp::Ordering> {
     match (lhs, rhs) {
         (SqliteValue::Text(l), SqliteValue::Text(r)) => Some(compare_text_with_collation(
-            l.as_bytes_direct(),
-            r.as_bytes_direct(),
+            l,
+            r,
             coll_name,
             collation_registry,
             enc,
@@ -20970,8 +23588,8 @@ fn collate_compare(
 }
 
 fn compare_text_with_collation(
-    left: &[u8],
-    right: &[u8],
+    left: &SmallText,
+    right: &SmallText,
     coll_name: &str,
     collation_registry: &CollationRegistry,
     enc: TextEncoding,
@@ -20990,12 +23608,11 @@ fn compare_text_with_collation(
     if coll_name.eq_ignore_ascii_case("BINARY")
         && collation_registry.uses_builtin_implementation("BINARY")
     {
-        return binary_compare_bytes(left, right, enc);
+        return left.cmp_binary_in(right, enc);
     }
     collation_registry
         .find(coll_name)
-        .map(|collation| collation.compare(left, right))
-        .unwrap_or_else(|| binary_compare_bytes(left, right, enc))
+        .map_or_else(|| left.cmp_binary_in(right, enc), |collation| collation.compare(left.as_bytes_direct(), right.as_bytes_direct()))
 }
 
 /// BINARY collation byte comparison that honors the database storage encoding
@@ -21012,6 +23629,7 @@ fn compare_text_with_collation(
 ///
 /// For UTF-8 databases this is a plain `memcmp` — byte-for-byte the previous
 /// behavior, so the common hot path pays nothing.
+#[cfg(test)]
 fn binary_compare_bytes(left: &[u8], right: &[u8], enc: TextEncoding) -> Ordering {
     // Raw (byte-preserved non-UTF-8) TEXT is the bd-6y0jd concern — it
     // compares as stored.
@@ -21024,11 +23642,11 @@ fn builtin_collation_compare_text(
     coll_name: &str,
     enc: TextEncoding,
 ) -> Option<Ordering> {
+    if coll_name.eq_ignore_ascii_case("BINARY") {
+        return Some(left.cmp_binary_in(right, enc));
+    }
     let left = left.as_bytes_direct();
     let right = right.as_bytes_direct();
-    if coll_name.eq_ignore_ascii_case("BINARY") {
-        return Some(binary_compare_bytes(left, right, enc));
-    }
     if coll_name.eq_ignore_ascii_case("NOCASE") {
         return Some(compare_ascii_nocase_bytes(left, right));
     }
@@ -21047,7 +23665,7 @@ fn cmp_sqlite_values_collated(
     match (a, b) {
         (SqliteValue::Text(l), SqliteValue::Text(r)) => {
             builtin_collation_compare_text(l, r, coll, enc).unwrap_or_else(|| {
-                binary_compare_bytes(l.as_bytes_direct(), r.as_bytes_direct(), enc)
+                l.cmp_binary_in(r, enc)
             })
         }
         _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
@@ -21149,11 +23767,7 @@ fn fast_compare_same_storage_class(
                 builtin_collation_compare_text(a, b, coll_name, enc).map(Some)
             }
             // No collation named ⇒ implicit BINARY, which is encoding-aware.
-            _ => Some(Some(binary_compare_bytes(
-                a.as_bytes_direct(),
-                b.as_bytes_direct(),
-                enc,
-            ))),
+            _ => Some(Some(a.cmp_binary_in(b, enc))),
         },
         (SqliteValue::Blob(a), SqliteValue::Blob(b)) if !matches!(p4, P4::Collation(_)) => {
             Some(Some(a.as_ref().cmp(b.as_ref())))
@@ -21694,7 +24308,13 @@ fn try_storage_cursor_payload_includes_rowid_alias_local(
 /// Returns the header-only verdict and, when that verdict is "absent" on a
 /// short payload whose slot holds an integer, the slot to compare with the
 /// row's rowid.
-fn payload_rowid_alias_header_verdict<C: RecordColumns>(
+///
+/// Inlined at every call: the in-place `Column` lane calls it once per row,
+/// and a second caller (the parallel aggregate scan, bd-w4pr1.13.11) was
+/// enough for LLVM to stop inlining it there (+9M instructions on a 1M-row
+/// filtered aggregate).
+#[inline(always)]
+pub(crate) fn payload_rowid_alias_header_verdict<C: RecordColumns>(
     row_decode: &C,
     ipk_col_idx: usize,
     table_column_count: Option<usize>,
@@ -22544,7 +25164,7 @@ fn payload_includes_rowid_alias_without_rowid<C: RecordColumns>(
     matches!(classify_serial_type(col.serial_type), SerialTypeClass::Null)
 }
 
-fn column_payload_end(col: &ColumnOffset) -> Option<usize> {
+pub(crate) fn column_payload_end(col: &ColumnOffset) -> Option<usize> {
     let start = usize::try_from(col.body_offset).ok()?;
     let len = usize::try_from(col.value_len).ok()?;
     start.checked_add(len)
@@ -22559,7 +25179,7 @@ fn column_payload_end(col: &ColumnOffset) -> Option<usize> {
 /// marks a column the record leaves out, which reads past the record end.
 /// Such a record always stores the alias slot, as stock's does. Otherwise
 /// columns after the alias sit one slot earlier when the payload omits it.
-fn storage_payload_column_index(
+pub(crate) fn storage_payload_column_index(
     col_idx: usize,
     ipk_col_idx: Option<usize>,
     payload_includes_rowid_alias: bool,
@@ -22735,12 +25355,13 @@ fn try_read_column_in_place(
         return Ok(None);
     };
     let view = &mut cursor.page_row;
+    // A row new to this view takes its record bytes from the same cursor
+    // call that locates it, and the column below is read from those bytes;
+    // a row parsed before asks the page for them again.
+    let mut fresh_record: Option<&[u8]> = None;
     if view.stamp != Some(stamp) {
         view.stamp = None;
-        let Some((rowid, payload)) = cursor.cursor.current_local_table_row_span()? else {
-            return Ok(None);
-        };
-        let Some(bytes) = cursor.cursor.current_page_span(payload.clone()) else {
+        let Some((rowid, payload, bytes)) = cursor.cursor.current_local_table_row()? else {
             return Ok(None);
         };
         if !view.layout.parse(bytes) {
@@ -22750,6 +25371,7 @@ fn try_read_column_in_place(
         view.payload = payload;
         view.includes_rowid_alias = None;
         view.stamp = Some(stamp);
+        fresh_record = Some(bytes);
     }
 
     let ipk_col_idx = cursor.ipk_col_idx;
@@ -22766,7 +25388,9 @@ fn try_read_column_in_place(
             if let Some(slot) = rowid_slot {
                 // A short record whose slot holds an integer stores the alias
                 // exactly when that integer is the row's rowid.
-                let Some(bytes) = cursor.cursor.current_page_span(view.payload.clone()) else {
+                let Some(bytes) =
+                    fresh_record.or_else(|| cursor.cursor.current_page_span(view.payload.clone()))
+                else {
                     return Ok(None);
                 };
                 if column_payload_end(&slot).is_none_or(|end| end > bytes.len()) {
@@ -22796,7 +25420,9 @@ fn try_read_column_in_place(
     let Some(col) = view.layout.column_offset(payload_idx) else {
         return Ok(None);
     };
-    let Some(record) = cursor.cursor.current_page_span(view.payload.clone()) else {
+    let Some(record) =
+        fresh_record.or_else(|| cursor.cursor.current_page_span(view.payload.clone()))
+    else {
         return Ok(None);
     };
     // The column's own bytes. A record cut short of them is malformed, which
@@ -22942,6 +25568,79 @@ fn finish_storage_cursor_row_layout(
         refreshed,
         eager_values_ready,
     }))
+}
+
+/// Column `col_idx` of the sorter's current row, as `Column` reads it: a
+/// column of the decoded sort-key prefix from the row, any other through the
+/// sorter's row-decode cache, NULL past the record's end or with no current
+/// row. Shared by [`VdbeEngine::cursor_column`] and the synchronous lane's
+/// `Column` (bd-w4pr1.13.8, lever G2).
+fn sorter_current_row_column(
+    sorter: &mut SorterCursor,
+    col_idx: usize,
+    text_encoding: TextEncoding,
+    collect_vdbe_metrics: bool,
+) -> Result<SqliteValue> {
+    let Some(pos) = sorter.position else {
+        return Ok(SqliteValue::Null);
+    };
+    if let Some(value) = sorter
+        .rows
+        .get(pos)
+        .and_then(|row| row.values.get(col_idx))
+        .cloned()
+    {
+        note_decode_cache_hit(collect_vdbe_metrics);
+        if collect_vdbe_metrics {
+            record_decoded_value_metrics(&value);
+        }
+        return Ok(value);
+    }
+    let refresh_state = ensure_sorter_row_cache(sorter, collect_vdbe_metrics, pos)?;
+    let rows = &sorter.rows;
+    let cached_row_decode = &mut sorter.cached_row_decode;
+    let row = rows.get(pos).ok_or_else(|| FrankenError::DatabaseCorrupt {
+        detail: format!("missing sorter row at position {pos}"),
+    })?;
+    let value = if col_idx < cached_row_decode.column_count() {
+        let cached_value_ready = cached_row_decode.cached_value_ready(col_idx);
+        if cached_value_ready {
+            if refresh_state.refreshed && refresh_state.eager_values_ready {
+                note_decode_cache_miss(collect_vdbe_metrics);
+            } else {
+                note_decode_cache_hit(collect_vdbe_metrics);
+            }
+            cached_row_decode
+                .cached_value(col_idx)
+                .cloned()
+                .unwrap_or(SqliteValue::Null)
+        } else if let Some(value) = fsqlite_types::record::decode_column_from_offset_with_encoding(
+            &row.blob,
+            cached_row_decode
+                .column_offset(col_idx)
+                .expect("col_idx checked against column_count"),
+            // bd-0s9bv: a sorter row blob is the raw source-table record (ORDER
+            // BY pushes it through unchanged), so TEXT must be decoded in the
+            // DB's storage encoding. Utf8-only decode returned raw UTF-16 bytes
+            // for a UTF-16 database.
+            text_encoding,
+            collect_vdbe_metrics,
+        ) {
+            note_decode_cache_miss(collect_vdbe_metrics);
+            cached_row_decode.cache_decoded(col_idx, value.clone());
+            value
+        } else {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!("malformed sorter record while reading column {col_idx}"),
+            });
+        }
+    } else {
+        SqliteValue::Null
+    };
+    if collect_vdbe_metrics {
+        record_decoded_value_metrics(&value);
+    }
+    Ok(value)
 }
 
 fn ensure_sorter_row_cache(
@@ -23282,20 +25981,14 @@ fn cmp_values_collated(
 ) -> Ordering {
     if let (SqliteValue::Text(lt), SqliteValue::Text(rt)) = (lhs, rhs) {
         return match collation {
-            Some(coll) => compare_text_with_collation(
-                lt.as_bytes_direct(),
-                rt.as_bytes_direct(),
-                coll,
-                collation_registry,
-                enc,
-            ),
+            Some(coll) => compare_text_with_collation(lt, rt, coll, collation_registry, enc),
             // bd-9pi70: an absent collation is implicit BINARY, which orders in
             // the DB storage encoding (bd-bld9w.4). Now that sort keys are decoded
             // to canonical UTF-8 (SorterInsert), a plain `partial_cmp` here would
             // order by UTF-8 bytes and diverge from stock on a UTF-16 database; the
             // encoding-aware comparator re-encodes to the storage encoding. For a
             // UTF-8 database this is byte-for-byte identical to `partial_cmp`.
-            None => binary_compare_bytes(lt.as_bytes_direct(), rt.as_bytes_direct(), enc),
+            None => lt.cmp_binary_in(rt, enc),
         };
     }
     lhs.partial_cmp(rhs).unwrap_or(Ordering::Equal)
@@ -23372,124 +26065,6 @@ fn compare_sorter_rows(
     Ordering::Equal
 }
 
-/// The most columns a packed key may have for [`compare_packed_sorter_key`].
-const PACKED_SORTER_KEY_MAX_COLUMNS: usize = 8;
-
-/// Compare a packed sort-key record against a decoded key, giving what
-/// `compare_sorter_rows(&decoded_record, rhs, ..)` gives, without decoding the
-/// record (bd-w4pr1.13).
-///
-/// `None` means the general path must answer: a database that is not UTF-8,
-/// a record the record decoder would reject (the whole header is walked with
-/// its checks first, trailing bytes included) or one of more than
-/// [`PACKED_SORTER_KEY_MAX_COLUMNS`] columns, a key column holding a BLOB or
-/// a reserved serial type, TEXT under a collation, or TEXT against a value
-/// that is not TEXT.
-///
-/// On a UTF-8 database the decoder keeps a TEXT payload's bytes exactly, valid
-/// or not, and BINARY order is a byte compare of them (`binary_text_cmp`), so
-/// TEXT is compared as stored. Every other column is decoded by
-/// `decode_scalar_value`, which decodes as the record decoder does (NaN reads
-/// as NULL), and ordered by `SqliteValue::cmp`, as `cmp_values_collated` does
-/// for two values that are not both TEXT.
-fn compare_packed_sorter_key(
-    record: &[u8],
-    rhs: &[SqliteValue],
-    key_columns: usize,
-    sort_key_orders: &[SortKeyOrder],
-    collations: &[Option<String>],
-    enc: TextEncoding,
-) -> Option<Ordering> {
-    if !matches!(enc, TextEncoding::Utf8) {
-        return None;
-    }
-    let (header_size, size_len) = read_varint(record)?;
-    let header_size = usize::try_from(header_size).ok()?;
-    if header_size > record.len() || header_size < size_len {
-        return None;
-    }
-    let mut columns = [(0_u64, 0_usize, 0_usize); PACKED_SORTER_KEY_MAX_COLUMNS];
-    let mut column_count = 0;
-    let mut at = size_len;
-    let mut body = header_size;
-    while at < header_size {
-        let (serial_type, used) = read_varint(&record[at..header_size])?;
-        at += used;
-        let len = usize::try_from(serial_type_len(serial_type)?).ok()?;
-        let end = body.checked_add(len)?;
-        if end > record.len() {
-            return None;
-        }
-        *columns.get_mut(column_count)? = (serial_type, body, end);
-        column_count += 1;
-        body = end;
-    }
-    if body != record.len() {
-        return None;
-    }
-    let columns = &columns[..column_count];
-
-    for idx in 0..key_columns.max(1) {
-        let order = sort_key_orders
-            .get(idx)
-            .copied()
-            .unwrap_or(SortKeyOrder::Asc);
-        let is_desc = matches!(order, SortKeyOrder::Desc | SortKeyOrder::DescNullsFirst);
-        let nulls_last = matches!(order, SortKeyOrder::Desc | SortKeyOrder::AscNullsLast);
-        let Some(&(serial_type, start, end)) = columns.get(idx) else {
-            return Some(match (rhs.get(idx).is_some(), is_desc) {
-                (false, _) => Ordering::Equal,
-                (true, true) => Ordering::Greater,
-                (true, false) => Ordering::Less,
-            });
-        };
-        let Some(rhs_value) = rhs.get(idx) else {
-            return Some(if is_desc {
-                Ordering::Less
-            } else {
-                Ordering::Greater
-            });
-        };
-        let bytes = &record[start..end];
-        let lhs_scalar = if classify_serial_type(serial_type) == SerialTypeClass::Text {
-            None
-        } else {
-            Some(fsqlite_types::record::decode_scalar_value(serial_type, bytes)?)
-        };
-
-        let l_null = matches!(lhs_scalar, Some(SqliteValue::Null));
-        let r_null = rhs_value.is_null();
-        if l_null || r_null {
-            if l_null && r_null {
-                continue;
-            }
-            return Some(if l_null == nulls_last {
-                Ordering::Greater
-            } else {
-                Ordering::Less
-            });
-        }
-
-        let mut ord = match (&lhs_scalar, rhs_value) {
-            (Some(lhs_value), _) => lhs_value.cmp(rhs_value),
-            (None, SqliteValue::Text(rhs_text))
-                if collations.get(idx).is_none_or(Option::is_none) =>
-            {
-                bytes.cmp(rhs_text.as_bytes_direct())
-            }
-            (None, _) => return None,
-        };
-        if ord == Ordering::Equal {
-            continue;
-        }
-        if is_desc {
-            ord = ord.reverse();
-        }
-        return Some(ord);
-    }
-    Some(Ordering::Equal)
-}
-
 fn opcode_trace_enabled() -> bool {
     let env_enabled = std::env::var(VDBE_TRACE_ENV).is_ok_and(|value| {
         let normalized = value.trim().to_ascii_lowercase();
@@ -23499,85 +26074,8 @@ fn opcode_trace_enabled() -> bool {
 }
 
 // ── Arithmetic helpers ──────────────────────────────────────────────────────
-
-/// Mirrors C SQLite `numericType()` (SQLite VDBE:496): returns true if BOTH
-/// operands should be treated as integers for arithmetic purposes.
-/// Text/Blob that parse as i64 are integer-typed; Float is not.
-fn both_integer_numeric_type(a: &SqliteValue, b: &SqliteValue) -> bool {
-    a.is_integer_numeric_type() && b.is_integer_numeric_type()
-}
-
-/// SQL division with NULL propagation and division-by-zero handling.
-#[allow(clippy::cast_precision_loss)]
-fn sql_div(dividend: &SqliteValue, divisor: &SqliteValue) -> SqliteValue {
-    if dividend.is_null() || divisor.is_null() {
-        return SqliteValue::Null;
-    }
-    // C SQLite numericType() coercion (SQLite VDBE:1932-1934): if both operands
-    // are integer-typed (including text that parses as integer), use int math.
-    let both_int = both_integer_numeric_type(dividend, divisor);
-    if both_int {
-        let a = dividend.to_integer();
-        let b = divisor.to_integer();
-        if b == 0 {
-            SqliteValue::Null
-        } else {
-            match a.checked_div(b) {
-                Some(result) => SqliteValue::Integer(result),
-                // i64::MIN / -1 overflows; C SQLite promotes to float via
-                // `goto fp_math` (SQLite VDBE:1916), NOT wrapping.
-                #[allow(clippy::cast_precision_loss)]
-                None => {
-                    let result = a as f64 / b as f64;
-                    if result.is_nan() {
-                        SqliteValue::Null
-                    } else {
-                        SqliteValue::Float(result)
-                    }
-                }
-            }
-        }
-    } else {
-        let b = divisor.to_float();
-        if b == 0.0 {
-            SqliteValue::Null
-        } else {
-            let result = dividend.to_float() / b;
-            if result.is_nan() {
-                SqliteValue::Null
-            } else {
-                SqliteValue::Float(result)
-            }
-        }
-    }
-}
-
-/// SQL remainder with NULL propagation and division-by-zero handling.
-///
-/// C SQLite (SQLite VDBE:1920): when both operands are MEM_Int, result is Integer.
-/// When either is Float/Text/Blob, fp_math path casts to integer for the
-/// modulo but stores the result as Float (MEM_Real).
-/// C SQLite `numericType()` coercion: text that parses as integer is treated
-/// as integer for the both-int check (SQLite VDBE:1932-1934).
-#[allow(clippy::cast_precision_loss)]
-fn sql_rem(dividend: &SqliteValue, divisor: &SqliteValue) -> SqliteValue {
-    if dividend.is_null() || divisor.is_null() {
-        return SqliteValue::Null;
-    }
-    let both_int = both_integer_numeric_type(dividend, divisor);
-    let a = dividend.to_integer();
-    let b = divisor.to_integer();
-    if b == 0 {
-        return SqliteValue::Null;
-    }
-    // i64::MIN % -1 = 0 mathematically.
-    let result = a.checked_rem(b).unwrap_or_default();
-    if both_int {
-        SqliteValue::Integer(result)
-    } else {
-        SqliteValue::Float(result as f64)
-    }
-}
+// Division and remainder are `SqliteValue::sql_div` / `sql_rem` (shared with
+// the core evaluator and index regeneration, bd-5lrpw).
 
 /// SQL shift left (SQLite semantics: negative shift = shift right).
 fn sql_shift_left(val: i64, amount: i64) -> SqliteValue {
@@ -23608,18 +26106,18 @@ fn sql_shift_right(val: i64, amount: i64) -> SqliteValue {
 }
 
 /// Three-valued SQL AND.
-fn sql_and(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
+fn sql_and(a: &SqliteValue, b: &SqliteValue, encoding: TextEncoding) -> SqliteValue {
     // C SQLite compiles AND/OR using OP_If/OP_IfNot which use
     // sqlite3VdbeRealValue() != 0.0, so 0.5 is truthy.
     let a_val = if a.is_null() {
         None
     } else {
-        Some(vdbe_real_is_truthy(a))
+        Some(a.is_sql_truthy_in(encoding))
     };
     let b_val = if b.is_null() {
         None
     } else {
-        Some(vdbe_real_is_truthy(b))
+        Some(b.is_sql_truthy_in(encoding))
     };
 
     match (a_val, b_val) {
@@ -23630,16 +26128,16 @@ fn sql_and(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
 }
 
 /// Three-valued SQL OR.
-fn sql_or(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
+fn sql_or(a: &SqliteValue, b: &SqliteValue, encoding: TextEncoding) -> SqliteValue {
     let a_val = if a.is_null() {
         None
     } else {
-        Some(vdbe_real_is_truthy(a))
+        Some(a.is_sql_truthy_in(encoding))
     };
     let b_val = if b.is_null() {
         None
     } else {
-        Some(vdbe_real_is_truthy(b))
+        Some(b.is_sql_truthy_in(encoding))
     };
 
     match (a_val, b_val) {
@@ -23738,8 +26236,8 @@ fn parse_cast_integer_prefix(s: &str) -> i64 {
 /// On a UTF-8 database this is `SmallText::from_arc_bytes`: the bytes are
 /// preserved verbatim (invalid UTF-8 kept in the byte-preserving raw form) and
 /// the `Arc` is retained without a copy. On a UTF-16 database the bytes are
-/// decoded as UTF-16LE/BE code units (an odd trailing byte is dropped, lone
-/// surrogates become U+FFFD) — a pure byte-relabel matching stock's per-value
+/// interpreted as UTF-16LE/BE code units (an odd trailing byte is dropped and
+/// unpaired surrogates keep their native units) — a byte-relabel matching stock's per-value
 /// encoding tag, NOT a canonical-UTF-8 interpretation followed by a transcode.
 fn blob_to_text_via_db_encoding(bytes: Arc<[u8]>, text_encoding: TextEncoding) -> SmallText {
     match text_encoding {
@@ -23773,11 +26271,7 @@ fn sql_cast(val: SqliteValue, target: i32, text_encoding: TextEncoding) -> Sqlit
         (other, _) => other,
     };
     match target_byte {
-        b'A' | b'a' => SqliteValue::Blob(match val {
-            SqliteValue::Blob(b) => b,
-            SqliteValue::Text(s) => Arc::from(s.as_bytes_direct()),
-            other => Arc::from(other.to_text().into_bytes()),
-        }),
+        b'A' | b'a' => val.cast_to_blob_in(text_encoding),
         b'B' | b'b' => {
             // C SQLite changes the storage-class tag without validating or
             // replacing the BLOB payload. On a UTF-8 DB the bytes are retained
@@ -23850,6 +26344,33 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    impl SorterCursor {
+        fn new(
+            key_columns: usize,
+            sort_key_orders: Vec<SortKeyOrder>,
+            collations: Vec<Option<String>>,
+        ) -> Self {
+            Self::with_collation_registry(
+                key_columns, sort_key_orders, collations, Arc::new(Mutex::new(CollationRegistry::new())),
+                None, TextEncoding::Utf8,
+            )
+        }
+
+        fn with_collation_registry(
+            key_columns: usize,
+            sort_key_orders: Vec<SortKeyOrder>,
+            collations: Vec<Option<String>>,
+            collation_registry: Arc<Mutex<CollationRegistry>>,
+            top_n_limit: Option<usize>,
+            text_encoding: TextEncoding,
+        ) -> Self {
+            Self::with_collation_registry_and_temp_store(
+                key_columns, sort_key_orders, collations, collation_registry, top_n_limit,
+                text_encoding, TempStoreRuntime::default(), Cx::new(),
+            )
+        }
+    }
     use crate::{Label, ProgramBuilder};
     use asupersync::runtime::{Runtime, RuntimeBuilder};
     use fsqlite_func::vtab::{IndexInfo, VirtualTable, VirtualTableCursor};
@@ -23957,6 +26478,7 @@ mod tests {
 
     #[test]
     fn test_nocase_comparators_match_sqlite_boundaries() {
+        let cx = Cx::new();
         let sqlite = rusqlite::Connection::open_in_memory().expect("canonical SQLite");
         let registry = fsqlite_func::collation::CollationRegistry::new();
         let collation = registry.find("NOCASE").expect("built-in NOCASE");
@@ -23967,7 +26489,13 @@ mod tests {
         for left in values {
             let left_value = SqliteValue::Text(left.into());
             let mut table = MemTable::new(1);
-            table.add_unique_column_group_with_collations(vec![0], vec![Some("NOCASE".to_owned())]);
+            table
+                .add_unique_column_group_with_collations(
+                    &cx,
+                    vec![0],
+                    vec![Some("NOCASE".to_owned())],
+                )
+                .unwrap();
             table.insert(1, vec![left_value.clone()]);
             for right in values {
                 let comparison: i64 = sqlite
@@ -23997,7 +26525,7 @@ mod tests {
                     "DISTINCT {left:?}, {right:?}"
                 );
                 assert_eq!(
-                    table.find_unique_conflicts(&[right_value]),
+                    table.find_unique_conflicts(&cx, &[right_value]).unwrap(),
                     if expected == Ordering::Equal {
                         vec![1]
                     } else {
@@ -25708,7 +28236,7 @@ mod tests {
             &program,
             None,
             &mut |row| {
-                streamed_rows.push(row.into_vec());
+                streamed_rows.push(std::mem::take(row));
                 Ok(())
             },
         ))
@@ -25726,6 +28254,78 @@ mod tests {
         );
         assert_eq!(engine.get_reg(r1), &SqliteValue::Null);
         assert_eq!(engine.get_reg(r2), &SqliteValue::Null);
+    }
+
+    #[test]
+    fn test_result_row_handler_sees_each_row_alone_in_the_lent_buffer() {
+        // bd-w4pr1.12 lever W3: the callback is lent the row in a buffer the
+        // engine reuses. Whatever a callback leaves in it must not reach the
+        // next row, also after a callback fails.
+        let long_text = "a text value longer than the inline limit";
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        let r1 = b.alloc_reg();
+        let r2 = b.alloc_reg();
+        b.emit_op(Opcode::Integer, 1, r1, 0, P4::None, 0);
+        b.emit_op(Opcode::String8, 0, r2, 0, P4::Str(long_text.to_owned()), 0);
+        b.emit_op(Opcode::ResultRow, r1, 2, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 2, r1, 0, P4::None, 0);
+        b.emit_op(Opcode::Null, 0, r2, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, r1, 2, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 3, r1, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 4, r2, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, r1, 2, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+        let program = b.finish().expect("program should build");
+        let expected = vec![
+            vec![SqliteValue::Integer(1), SqliteValue::Text(long_text.into())],
+            vec![SqliteValue::Integer(2), SqliteValue::Null],
+            vec![SqliteValue::Integer(3), SqliteValue::Integer(4)],
+        ];
+
+        // A callback that moves out only the first value of each row and
+        // leaves the second one in the buffer.
+        let mut engine = VdbeEngine::new(program.register_count());
+        let mut seen = Vec::new();
+        let outcome = run_async(engine.execute_with_borrowed_bindings_and_row_handler(
+            &program,
+            None,
+            &mut |row| {
+                seen.push(row.clone());
+                let _first = row.remove(0);
+                Ok(())
+            },
+        ))
+        .expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+        assert_eq!(seen, expected, "each row arrives alone and whole");
+        assert!(engine.result_row_buf.is_empty(), "the buffer is empty between rows");
+        assert_eq!(engine.get_reg(r1), &SqliteValue::Null);
+        assert_eq!(engine.get_reg(r2), &SqliteValue::Null);
+
+        // A callback that fails on the second row, leaving that row behind.
+        let mut engine = VdbeEngine::new(program.register_count());
+        let mut calls = 0_usize;
+        let err = run_async(engine.execute_with_borrowed_bindings_and_row_handler(
+            &program,
+            None,
+            &mut |_row| {
+                calls += 1;
+                if calls == 2 {
+                    return Err(FrankenError::internal("row handler refused the row"));
+                }
+                Ok(())
+            },
+        ))
+        .expect_err("a failing row handler stops the statement");
+        assert!(
+            err.to_string().contains("row handler refused the row"),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(calls, 2, "no row is handed over after the failure");
+        assert!(engine.result_row_buf.is_empty(), "a failed row is not kept");
     }
 
     #[test]
@@ -26665,6 +29265,101 @@ mod tests {
         assert!(!engine.try_column_to_reg_in_place(0, 0, 1).unwrap());
     }
 
+    /// bd-w4pr1.13.4 (lever CL1): a column read on a row new to the in-place
+    /// view takes its record from the same cursor call that locates the row,
+    /// and a read of a row parsed before asks the page for it again. Both
+    /// give, for every column of every row (a short record among them), what
+    /// the copying lane gives; a column the in-place lane declines leaves the
+    /// target register as it was.
+    #[test]
+    fn test_in_place_column_lane_reads_new_and_parsed_rows_like_the_copying_lane() {
+        let rows: Vec<(i64, Vec<SqliteValue>)> = vec![
+            (
+                1,
+                vec![
+                    SqliteValue::Integer(41),
+                    SqliteValue::Text("short".into()),
+                    SqliteValue::Float(1.5),
+                    SqliteValue::Null,
+                    SqliteValue::Integer(-3),
+                ],
+            ),
+            (
+                2,
+                vec![
+                    SqliteValue::Integer(-7),
+                    SqliteValue::Text(String::new().into()),
+                    SqliteValue::Float(-0.25),
+                    SqliteValue::Text("x".into()),
+                    SqliteValue::Integer(i64::MAX),
+                ],
+            ),
+            (3, vec![SqliteValue::Null, SqliteValue::Text("abc".into())]),
+            (
+                5,
+                vec![
+                    SqliteValue::Integer(0),
+                    SqliteValue::Null,
+                    SqliteValue::Integer(1 << 40),
+                    SqliteValue::Text("tail".into()),
+                    SqliteValue::Float(3.0),
+                ],
+            ),
+        ];
+        let mut db = MemDatabase::new();
+        let root = db.create_table(5);
+        {
+            let table = db.get_table_mut(root).expect("table should exist");
+            for (rowid, values) in &rows {
+                table.insert(*rowid, values.clone());
+            }
+        }
+        let mut engine = VdbeEngine::new(4);
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+        assert!(
+            run_async(engine.open_storage_cursor(0, root, false))
+                .expect("storage cursor open should not error")
+        );
+        engine.cursor_root_pages.insert(0, root);
+
+        let mut served = [0_usize; 2];
+        for column in 0..5 {
+            {
+                let sc = engine.storage_cursors.get_mut(&0).unwrap();
+                assert!(run_async(sc.cursor.first(&sc.cx)).expect("cursor should rewind"));
+            }
+            for (index, (rowid, _)) in rows.iter().enumerate() {
+                // Pass 0 reads a row new to the view, pass 1 the parsed row.
+                for (pass, count) in served.iter_mut().enumerate() {
+                    engine.set_reg_int(1, 777);
+                    let in_place = engine.try_column_to_reg_in_place(0, column, 1).unwrap();
+                    let got = engine.get_reg(1).clone();
+                    let copied = engine.try_column_to_reg_direct_local(0, column, 2).unwrap();
+                    let want = engine.get_reg(2).clone();
+                    if in_place {
+                        *count += 1;
+                        assert!(copied, "row {rowid} column {column} pass {pass}");
+                        assert_eq!(got, want, "row {rowid} column {column} pass {pass}");
+                    } else {
+                        assert_eq!(
+                            got,
+                            SqliteValue::Integer(777),
+                            "row {rowid} column {column} pass {pass}"
+                        );
+                    }
+                }
+                if index + 1 < rows.len() {
+                    let sc = engine.storage_cursors.get_mut(&0).unwrap();
+                    assert!(run_async(sc.cursor.next(&sc.cx)).expect("cursor should advance"));
+                }
+            }
+        }
+        assert!(served[0] >= 12, "new-row reads served: {}", served[0]);
+        assert_eq!(served[0], served[1]);
+    }
+
     /// Hold [`RecordColumnTable::parse`] to the decode scratch's header
     /// parse on `record`: the same verdict, and the same table when the
     /// header is accepted. Returns whether it was accepted.
@@ -27424,7 +30119,7 @@ mod tests {
             VdbeEngine::new_with_execution_cx(program.register_count(), &cx, PageSize::DEFAULT);
 
         let mut rows = 0_usize;
-        let mut handler = |_row: smallvec::SmallVec<[SqliteValue; 16]>| -> Result<()> {
+        let mut handler = |_row: &mut Vec<SqliteValue>| -> Result<()> {
             rows += 1;
             if rows == 10 {
                 cx.cancel_with_reason(fsqlite_types::cx::CancelReason::UserInterrupt);
@@ -27482,6 +30177,160 @@ mod tests {
             rows_delivered_before_cancellation_is_observed(Opcode::NotNull, true),
             expected
         );
+    }
+
+    /// How [`rows_before_aggregate_signal_is_observed`]'s row handler signals
+    /// the running statement (bd-w4pr1.12, lever AFC).
+    #[derive(Clone, Copy, Debug)]
+    enum AggregateSignal {
+        /// `Cx::cancel_with_reason`: the local flag that the per-group atomic
+        /// load reads.
+        Requested,
+        /// A cancellation published on an attached native context (a runtime
+        /// timeout), which only a full checkpoint consults.
+        NativeTimeout,
+        /// An attached native context whose poll quota is spent: the budget
+        /// plane, which only a full checkpoint consults.
+        NativeBudget,
+    }
+
+    /// Opcodes per group or row in [`rows_before_aggregate_signal_is_observed`].
+    const AGGREGATE_SIGNAL_LOOP_OPS: usize = 4;
+
+    /// Rows a statement delivers when `signal` is raised from its row handler
+    /// at row `at`, and its outcome. Each group of the GROUP BY shape is
+    /// `AddImm / AggFinal count / ResultRow / Goto`, and each row of the
+    /// window shape `AddImm / AggValue row_number / ResultRow / Goto`, so the
+    /// aggregate opcode is the only one that can observe a requested
+    /// cancellation per group. (`AggStep` observes one too, in
+    /// `plain_agg_step`, so a group that steps would not show whether
+    /// `AggFinal` does.)
+    fn rows_before_aggregate_signal_is_observed(
+        window: bool,
+        signal: AggregateSignal,
+        at: usize,
+    ) -> (usize, Result<ExecOutcome>) {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let mut builder = ProgramBuilder::new();
+        let r_counter = builder.alloc_reg();
+        let r_acc = builder.alloc_reg();
+        let r_out = builder.alloc_reg();
+        builder.emit_op(Opcode::Integer, 0, r_counter, 0, P4::None, 0);
+        let loop_top = builder.emit_op(Opcode::AddImm, r_counter, 1, 0, P4::None, 0);
+        if window {
+            let row_number = P4::FuncName("row_number".to_owned());
+            builder.emit_op(Opcode::AggValue, r_acc, 0, r_out, row_number, 0);
+            builder.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+        } else {
+            let count = P4::FuncName("count".to_owned());
+            builder.emit_op(Opcode::AggFinal, r_acc, 0, 0, count, 0);
+            builder.emit_op(Opcode::ResultRow, r_acc, 1, 0, P4::None, 0);
+        }
+        let loop_top = i32::try_from(loop_top).expect("loop address fits i32");
+        builder.emit_op(Opcode::Goto, 0, loop_top, 0, P4::None, 0);
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let program = builder.finish().expect("program should build");
+
+        let cx = Cx::new();
+        cx.transition_to_running();
+        let mut engine =
+            VdbeEngine::new_with_execution_cx(program.register_count(), &cx, PageSize::DEFAULT);
+        let mut registry = FunctionRegistry::new();
+        register_builtins(&mut registry);
+        fsqlite_func::register_window_builtins(&mut registry);
+        engine.set_function_registry(Arc::new(registry));
+
+        let interval = usize::try_from(VDBE_EXECUTION_CHECKPOINT_INTERVAL).unwrap();
+        let mut rows = 0_usize;
+        let mut handler = |_row: &mut Vec<SqliteValue>| -> Result<()> {
+            rows += 1;
+            if rows == at {
+                match signal {
+                    AggregateSignal::Requested => {
+                        cx.cancel_with_reason(fsqlite_types::cx::CancelReason::UserInterrupt);
+                    }
+                    AggregateSignal::NativeTimeout => {
+                        let native = asupersync::Cx::for_testing();
+                        native.set_cancel_reason(asupersync::types::CancelReason::timeout());
+                        cx.set_native_cx(native);
+                    }
+                    AggregateSignal::NativeBudget => {
+                        cx.set_native_cx(asupersync::Cx::for_testing_with_budget(
+                            asupersync::Budget::INFINITE.with_poll_quota(0),
+                        ));
+                    }
+                }
+            }
+            // A statement that never observes the signal would run forever;
+            // fail it instead, well past the next interval checkpoint.
+            if rows > at + 4 * interval {
+                return Err(FrankenError::internal(
+                    "the signal was not observed at a checkpoint",
+                ));
+            }
+            Ok(())
+        };
+        let outcome = run_async(engine.execute_with_borrowed_bindings_and_row_handler(
+            &program,
+            None,
+            &mut handler,
+        ));
+        drop(handler);
+        (rows, outcome)
+    }
+
+    /// bd-w4pr1.12 (lever AFC): AggFinal and AggValue observe a requested
+    /// cancellation with one atomic load each side of the call, so a request
+    /// made at a group is observed at the next group's AggFinal (the next
+    /// row's AggValue), halfway through about 1M groups. A boundary that
+    /// does not look at all leaves the request to the interval checkpoint,
+    /// hundreds of groups later.
+    #[test]
+    fn test_aggregate_boundaries_observe_a_requested_cancellation_at_the_next_group() {
+        for window in [false, true] {
+            let (rows, outcome) = rows_before_aggregate_signal_is_observed(
+                window,
+                AggregateSignal::Requested,
+                500_000,
+            );
+            assert!(
+                matches!(outcome, Err(FrankenError::Abort)),
+                "window={window}: unexpected outcome {outcome:?}"
+            );
+            assert_eq!(rows, 500_000, "window={window}");
+        }
+    }
+
+    /// bd-w4pr1.12 (lever AFC): the native-runtime and budget planes, which
+    /// only a full checkpoint consults, are still enforced on an aggregate
+    /// statement: by the statement loop's interval checkpoint, within
+    /// VDBE_EXECUTION_CHECKPOINT_INTERVAL opcodes of the signal, and the
+    /// statement stops with the cancellation error.
+    #[test]
+    fn test_aggregate_statements_observe_native_timeouts_and_spent_budgets_within_the_interval() {
+        let bound = usize::try_from(VDBE_EXECUTION_CHECKPOINT_INTERVAL).unwrap()
+            / AGGREGATE_SIGNAL_LOOP_OPS
+            + 1;
+        for window in [false, true] {
+            for signal in [
+                AggregateSignal::NativeTimeout,
+                AggregateSignal::NativeBudget,
+            ] {
+                let (rows, outcome) =
+                    rows_before_aggregate_signal_is_observed(window, signal, 500_000);
+                assert!(
+                    matches!(outcome, Err(FrankenError::Abort)),
+                    "window={window} {signal:?}: unexpected outcome {outcome:?}"
+                );
+                assert!(
+                    (500_000..=500_000 + bound).contains(&rows),
+                    "window={window} {signal:?}: {rows} rows, bound {bound} after row 500000"
+                );
+            }
+        }
     }
 
     #[test]
@@ -27865,6 +30714,105 @@ mod tests {
     }
 
     #[test]
+    fn test_reset_for_next_transaction_leaves_what_a_fresh_engine_brings() {
+        let state = ReusableTableExecutionState {
+            func_registry: Arc::new(FunctionRegistry::new()),
+            collation_registry: Arc::new(std::sync::Mutex::new(CollationRegistry::new())),
+            schema_cookie: 7,
+            autoincrement_seq_by_root_page: HashMap::new(),
+            rowid_alias_col_by_root_page: Arc::new(HashMap::new()),
+            table_column_count_by_root_page: Arc::new(HashMap::new()),
+            first_not_null_non_ipk_col_by_root_page: Arc::new(HashMap::new()),
+            ipk_label_by_root_page: Arc::new(HashMap::new()),
+            column_defaults_by_root_page: Arc::new(HashMap::new()),
+            index_desc_flags_by_root_page: Arc::new(HashMap::new()),
+            index_collations_by_root_page: Arc::new(HashMap::new()),
+            reject_mem_fallback: false,
+            memdb_rows_loaded: true,
+            storage_cursor_memdb_count_shortcuts_safe: true,
+            version_store: None,
+            collect_result_rows: true,
+            max_collected_result_rows: None,
+            text_encoding: TextEncoding::Utf8,
+        };
+        let mut engine = VdbeEngine::new(4);
+        engine.apply_reusable_table_execution_state(state.clone());
+        engine.builtin_collations_overridden();
+        engine.mark_root_page_dirty(3);
+        engine.cursor_root_pages.insert(1, 3);
+        assert_eq!(engine.schema_cookie(), 7);
+        assert!(engine.builtin_collations_overridden_cache.is_some());
+
+        engine.reset_for_next_transaction();
+        // The runtime setup and the cursor state go, as on a fresh engine; a
+        // reset that kept either (the reuse resets) fails here.
+        assert_eq!(engine.schema_cookie(), 0);
+        assert!(engine.func_registry.is_none());
+        assert!(!engine.memdb_rows_loaded);
+        assert!(engine.cursor_root_pages.is_empty());
+        assert!(!engine.has_txn_page_io());
+        // The caches only a fresh engine starts without.
+        assert!(engine.builtin_collations_overridden_cache.is_none());
+        assert!(!engine.has_dirty_root_pages());
+
+        // The next statement binds it as it would bind a fresh engine.
+        let reset_cx = Cx::new();
+        engine.reset_for_reuse_preserving_runtime_setup(4, &reset_cx, PageSize::DEFAULT, false);
+        let reused = engine.apply_reusable_table_execution_state(state.clone());
+        let mut fresh = VdbeEngine::new(4);
+        let fresh_outcome = fresh.apply_reusable_table_execution_state(state);
+        assert!(reused.function_cache_cleared);
+        assert_eq!(
+            reused.function_cache_cleared,
+            fresh_outcome.function_cache_cleared
+        );
+        assert_eq!(engine.schema_cookie(), fresh.schema_cookie());
+        assert_eq!(engine.memdb_rows_loaded, fresh.memdb_rows_loaded);
+
+        // Reused and bound again, the engine is reset again at the next
+        // commit: the reuse reset re-arms it.
+        engine.mark_root_page_dirty(4);
+        engine.reset_for_next_transaction();
+        assert_eq!(engine.schema_cookie(), 0);
+        assert!(engine.func_registry.is_none());
+        assert!(!engine.has_dirty_root_pages());
+    }
+
+    #[test]
+    fn test_repeat_dirty_marks_of_one_root_leave_the_set_an_uncached_mark_leaves() {
+        // bd-w4pr1.13.20, lever M: a repeat mark of the root marked last skips
+        // its insert, and every way of emptying the set makes the next mark
+        // insert again (a remembered root that outlived the set would leave a
+        // modified table looking clean to the MemDatabase sync).
+        let roots = |engine: &VdbeEngine| {
+            let mut roots: Vec<i32> = engine.dirty_root_pages().iter().copied().collect();
+            roots.sort_unstable();
+            roots
+        };
+        let mut engine = VdbeEngine::new(4);
+        for _ in 0..3 {
+            engine.mark_root_page_dirty(7);
+        }
+        assert_eq!(roots(&engine), vec![7]);
+        for root in [9, 7, 9, 9, 7] {
+            engine.mark_root_page_dirty(root);
+        }
+        assert_eq!(roots(&engine), vec![7, 9], "two alternating roots both stay");
+
+        engine.clear_dirty_root_pages();
+        assert!(!engine.has_dirty_root_pages());
+        engine.mark_root_page_dirty(7);
+        assert_eq!(roots(&engine), vec![7], "the root marked last before a sync");
+
+        engine.reset_for_next_transaction();
+        assert!(!engine.has_dirty_root_pages());
+        engine.mark_root_page_dirty(7);
+        engine.mark_storage_root_page_dirty(7);
+        assert_eq!(roots(&engine), vec![7], "the root marked last before a reset");
+        assert!(!engine.storage_cursor_memdb_count_shortcuts_safe);
+    }
+
+    #[test]
     fn test_execute_clears_cold_subtype_state_between_statements() {
         let mut subtype_builder = ProgramBuilder::new();
         let subtype_reg = subtype_builder.alloc_reg();
@@ -27996,7 +30944,7 @@ mod tests {
         }));
         engine.push_pending_idx_entry(1, index_key.clone());
 
-        run_async(engine.rollback_pending_insert_after_index_conflict(true))
+        run_async(engine.rollback_pending_insert_after_index_conflict(true, false))
             .expect("rollback should remove provisional row and tracked index entries");
 
         let table_cursor = engine.storage_cursors.get_mut(&0).unwrap();
@@ -29287,13 +32235,12 @@ mod tests {
 
             // A later, worse key is rejected before payload evaluation.
             b.emit_op(Opcode::Integer, 20, r_key, 0, P4::None, 0);
-            b.emit_op(Opcode::MakeRecord, r_key, 1, r_record, P4::None, 0);
             b.emit_jump_to_label(
                 Opcode::SorterCompare,
                 0,
-                r_record,
+                r_key,
                 rejected,
-                P4::None,
+                P4::Int(1),
                 SORTER_COMPARE_TOP_N_PREFLIGHT,
             );
             b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
@@ -29305,13 +32252,12 @@ mod tests {
 
             // A better key falls through and is eligible for projection.
             b.emit_op(Opcode::Integer, 5, r_key, 0, P4::None, 0);
-            b.emit_op(Opcode::MakeRecord, r_key, 1, r_record, P4::None, 0);
             b.emit_jump_to_label(
                 Opcode::SorterCompare,
                 0,
-                r_record,
+                r_key,
                 unexpectedly_rejected,
-                P4::None,
+                P4::Int(1),
                 SORTER_COMPARE_TOP_N_PREFLIGHT,
             );
             b.emit_op(Opcode::Integer, 3, r_out, 0, P4::None, 0);
@@ -29333,7 +32279,7 @@ mod tests {
         assert_eq!(
             materializations_after - materializations_before,
             0,
-            "top-N preflight should consume MakeRecord sideband bytes without allocating an Arc-backed register blob"
+            "a top-N preflight on key registers leaves the inserted record's sideband alone"
         );
     }
 
@@ -34122,7 +37068,7 @@ mod tests {
 
             // Allocate, land that row, allocate again; output both rowids.
             //
-            // `ResultRow` CONSUMES its registers (`take_reg_range`), so the
+            // `ResultRow` CONSUMES its registers (`take_reg_range_into`), so the
             // allocated rowid is copied into a scratch register for output and
             // register 1 is kept intact for `Insert` to use as the rowid.
             // Emitting `ResultRow` directly on register 1 and then handing the
@@ -34246,15 +37192,19 @@ mod tests {
 
     #[test]
     fn test_memdb_repeated_clear_preserves_undo_and_temp_rows() {
+        let cx = Cx::new();
         let mut db = MemDatabase::new();
         let main = db.create_table(1);
         let temp = db.create_table(1);
         assert!(temp > main);
         db.get_table_mut(main)
             .expect("main table")
-            .add_unique_column_group(vec![0]);
-        db.upsert_row(main, 7, vec![SqliteValue::Integer(42)]);
-        db.upsert_row(temp, 9, vec![SqliteValue::Integer(84)]);
+            .add_unique_column_group(&cx, vec![0])
+            .unwrap();
+        db.upsert_row_checked(&cx, main, 7, vec![SqliteValue::Integer(42)])
+            .unwrap();
+        db.upsert_row_checked(&cx, temp, 9, vec![SqliteValue::Integer(84)])
+            .unwrap();
         db.begin_undo();
         let original = db.undo_version();
 
@@ -34272,7 +37222,8 @@ mod tests {
             Some([SqliteValue::Integer(84)].as_slice())
         );
 
-        db.upsert_row(main, 11, vec![SqliteValue::Integer(63)]);
+        db.upsert_row_checked(&cx, main, 11, vec![SqliteValue::Integer(63)])
+            .unwrap();
         db.clear_table_rows_at_or_below(main);
         db.rollback_to(cleared);
         assert!(db.get_table(main).expect("main table").rows.is_empty());
@@ -34284,28 +37235,34 @@ mod tests {
         );
         assert_eq!(table.next_rowid_hint(), 8);
         assert_eq!(
-            table.find_unique_conflicts(&[SqliteValue::Integer(42)]),
+            table
+                .find_unique_conflicts(&cx, &[SqliteValue::Integer(42)])
+                .unwrap(),
             vec![7]
         );
         assert!(
             table
-                .find_unique_conflicts(&[SqliteValue::Integer(63)])
+                .find_unique_conflicts(&cx, &[SqliteValue::Integer(63)])
+                .unwrap()
                 .is_empty()
         );
     }
 
     #[test]
     fn test_memdb_clear_removes_stale_unique_entries_without_rows() {
+        let cx = Cx::new();
         let mut db = MemDatabase::new();
         let root = db.create_table(1);
         let table = db.get_table_mut(root).expect("table");
-        table.add_unique_column_group(vec![0]);
+        table.add_unique_column_group(&cx, vec![0]).unwrap();
         table.insert(1, vec![SqliteValue::Integer(42)]);
         // Deliberate inconsistent-state control: a row-only emptiness check
         // would incorrectly leave this unique-key entry in place.
         table.rows_mut().clear();
         assert_eq!(
-            table.find_unique_conflicts(&[SqliteValue::Integer(42)]),
+            table
+                .find_unique_conflicts(&cx, &[SqliteValue::Integer(42)])
+                .unwrap(),
             vec![1]
         );
         db.begin_undo();
@@ -34315,14 +37272,16 @@ mod tests {
         assert!(
             db.get_table(root)
                 .expect("table")
-                .find_unique_conflicts(&[SqliteValue::Integer(42)])
+                .find_unique_conflicts(&cx, &[SqliteValue::Integer(42)])
+                .unwrap()
                 .is_empty()
         );
         db.rollback_to(original);
         assert_eq!(
             db.get_table(root)
                 .expect("table")
-                .find_unique_conflicts(&[SqliteValue::Integer(42)]),
+                .find_unique_conflicts(&cx, &[SqliteValue::Integer(42)])
+                .unwrap(),
             vec![1]
         );
     }
@@ -34350,25 +37309,33 @@ mod tests {
 
     #[test]
     fn test_memdb_delete_rowid_records_undo() {
+        let cx = Cx::new();
         let mut db = MemDatabase::new();
         let root = db.create_table(2);
         db.get_table_mut(root)
             .expect("table should exist")
-            .add_unique_column_group(vec![0]);
-        db.upsert_row(
+            .add_unique_column_group(&cx, vec![0])
+            .unwrap();
+        db.upsert_row_checked(
+            &cx,
             root,
             1,
             vec![SqliteValue::Integer(10), SqliteValue::Integer(100)],
-        );
+        )
+        .unwrap();
 
         db.begin_undo();
         let token = db.undo_version();
-        assert!(db.delete_rowid(root, 1), "delete should find the row");
+        assert!(
+            db.delete_rowid(&cx, root, 1).unwrap(),
+            "delete should find the row"
+        );
         let table = db.get_table(root).expect("table should exist");
         assert_eq!(table.row_values_by_rowid(1), None);
         assert!(
             table
-                .find_unique_conflicts(&[SqliteValue::Integer(10), SqliteValue::Integer(999)])
+                .find_unique_conflicts(&cx, &[SqliteValue::Integer(10), SqliteValue::Integer(999)])
+                .unwrap()
                 .is_empty(),
             "delete should remove the unique-index entry"
         );
@@ -34378,7 +37345,9 @@ mod tests {
         let restored = vec![SqliteValue::Integer(10), SqliteValue::Integer(100)];
         assert_eq!(table.row_values_by_rowid(1), Some(restored.as_slice()));
         assert_eq!(
-            table.find_unique_conflicts(&[SqliteValue::Integer(10), SqliteValue::Integer(999)]),
+            table
+                .find_unique_conflicts(&cx, &[SqliteValue::Integer(10), SqliteValue::Integer(999)])
+                .unwrap(),
             vec![1],
             "rollback should restore the unique-index entry"
         );
@@ -34386,22 +37355,27 @@ mod tests {
 
     #[test]
     fn test_memdb_insert_auto_row_records_undo_and_patches_rowid_alias() {
+        let cx = Cx::new();
         let mut db = MemDatabase::new();
         let root = db.create_table(2);
-        db.upsert_row(
+        db.upsert_row_checked(
+            &cx,
             root,
             5,
             vec![SqliteValue::Integer(5), SqliteValue::Text("old".into())],
-        );
+        )
+        .unwrap();
 
         db.begin_undo();
         let token = db.undo_version();
         let rowid = db
-            .insert_auto_row(
+            .insert_auto_row_checked(
+                &cx,
                 root,
                 vec![SqliteValue::Null, SqliteValue::Text("new".into())],
                 Some(0),
             )
+            .unwrap()
             .expect("table should exist");
         assert_eq!(rowid, 6);
         let table = db.get_table(root).expect("table should exist");
@@ -34423,33 +37397,41 @@ mod tests {
 
     #[test]
     fn test_memdb_replace_secondary_unique_rollback_restores_deleted_and_replaced_rows() {
+        let cx = Cx::new();
         let mut db = MemDatabase::new();
         let root = db.create_table(2);
         db.get_table_mut(root)
             .expect("table should exist")
-            .add_unique_column_group(vec![1]);
-        db.upsert_row(
+            .add_unique_column_group(&cx, vec![1])
+            .unwrap();
+        db.upsert_row_checked(
+            &cx,
             root,
             1,
             vec![SqliteValue::Integer(1), SqliteValue::Text("alpha".into())],
-        );
-        db.upsert_row(
+        )
+        .unwrap();
+        db.upsert_row_checked(
+            &cx,
             root,
             2,
             vec![SqliteValue::Integer(2), SqliteValue::Text("beta".into())],
-        );
+        )
+        .unwrap();
 
         db.begin_undo();
         let token = db.undo_version();
         assert!(
-            db.delete_rowid(root, 1),
+            db.delete_rowid(&cx, root, 1).unwrap(),
             "REPLACE should delete the secondary-unique conflict"
         );
-        db.upsert_row(
+        db.upsert_row_checked(
+            &cx,
             root,
             2,
             vec![SqliteValue::Integer(2), SqliteValue::Text("alpha".into())],
-        );
+        )
+        .unwrap();
         let table = db.get_table(root).expect("table should exist");
         assert_eq!(table.row_values_by_rowid(1), None);
         assert_eq!(
@@ -34457,10 +37439,12 @@ mod tests {
             Some([SqliteValue::Integer(2), SqliteValue::Text("alpha".into())].as_slice())
         );
         assert_eq!(
-            table.find_unique_conflicts(&[
-                SqliteValue::Integer(99),
-                SqliteValue::Text("alpha".into())
-            ]),
+            table
+                .find_unique_conflicts(
+                    &cx,
+                    &[SqliteValue::Integer(99), SqliteValue::Text("alpha".into())]
+                )
+                .unwrap(),
             vec![2]
         );
 
@@ -34476,17 +37460,21 @@ mod tests {
             Some([SqliteValue::Integer(2), SqliteValue::Text("beta".into())].as_slice())
         );
         assert_eq!(
-            table.find_unique_conflicts(&[
-                SqliteValue::Integer(99),
-                SqliteValue::Text("alpha".into())
-            ]),
+            table
+                .find_unique_conflicts(
+                    &cx,
+                    &[SqliteValue::Integer(99), SqliteValue::Text("alpha".into())]
+                )
+                .unwrap(),
             vec![1]
         );
         assert_eq!(
-            table.find_unique_conflicts(&[
-                SqliteValue::Integer(99),
-                SqliteValue::Text("beta".into())
-            ]),
+            table
+                .find_unique_conflicts(
+                    &cx,
+                    &[SqliteValue::Integer(99), SqliteValue::Text("beta".into())]
+                )
+                .unwrap(),
             vec![2]
         );
     }
@@ -34555,13 +37543,16 @@ mod tests {
 
     #[test]
     fn test_memtable_unique_conflict_index_tracks_insert_delete_and_update() {
+        let cx = Cx::new();
         let mut table = MemTable::new(2);
-        table.add_unique_column_group(vec![0]);
+        table.add_unique_column_group(&cx, vec![0]).unwrap();
         table.insert(1, vec![SqliteValue::Integer(10), SqliteValue::Integer(100)]);
         table.insert(2, vec![SqliteValue::Integer(20), SqliteValue::Integer(200)]);
 
         assert_eq!(
-            table.find_unique_conflicts(&[SqliteValue::Integer(10), SqliteValue::Integer(999)]),
+            table
+                .find_unique_conflicts(&cx, &[SqliteValue::Integer(10), SqliteValue::Integer(999)])
+                .unwrap(),
             vec![1],
             "lookup should find the conflicting rowid via the unique index"
         );
@@ -34569,21 +37560,25 @@ mod tests {
         assert!(table.delete_by_rowid(1), "delete should succeed");
         assert!(
             table
-                .find_unique_conflicts(&[SqliteValue::Integer(10), SqliteValue::Integer(999)])
+                .find_unique_conflicts(&cx, &[SqliteValue::Integer(10), SqliteValue::Integer(999)])
+                .unwrap()
                 .is_empty(),
             "deleted rows must be removed from the unique index"
         );
 
         table.insert(2, vec![SqliteValue::Integer(10), SqliteValue::Integer(200)]);
         assert_eq!(
-            table.find_unique_conflicts(&[SqliteValue::Integer(10), SqliteValue::Integer(999)]),
+            table
+                .find_unique_conflicts(&cx, &[SqliteValue::Integer(10), SqliteValue::Integer(999)])
+                .unwrap(),
             vec![2],
             "updates must refresh the unique index entry"
         );
 
         assert!(
             table
-                .find_unique_conflicts(&[SqliteValue::Null, SqliteValue::Integer(999)])
+                .find_unique_conflicts(&cx, &[SqliteValue::Null, SqliteValue::Integer(999)])
+                .unwrap()
                 .is_empty(),
             "NULL keys must remain non-conflicting under SQLite UNIQUE semantics"
         );
@@ -34591,14 +37586,81 @@ mod tests {
 
     #[test]
     fn test_memtable_unique_conflict_index_honors_nocase_collation() {
+        let cx = Cx::new();
         let mut table = MemTable::new(1);
-        table.add_unique_column_group_with_collations(vec![0], vec![Some("NOCASE".to_owned())]);
+        table
+            .add_unique_column_group_with_collations(&cx, vec![0], vec![Some("NOCASE".to_owned())])
+            .unwrap();
         table.insert(1, vec![SqliteValue::Text("Alice".into())]);
 
         assert_eq!(
-            table.find_unique_conflicts(&[SqliteValue::Text("alice".into())]),
+            table
+                .find_unique_conflicts(&cx, &[SqliteValue::Text("alice".into())])
+                .unwrap(),
             vec![1],
             "builtin NOCASE unique indexes must normalize case-equivalent text"
+        );
+    }
+
+    #[test]
+    fn test_memtable_uniques_recheck_replaced_builtin_collation() {
+        struct ExactRtrim;
+
+        impl fsqlite_func::collation::CollationFunction for ExactRtrim {
+            fn name(&self) -> &str {
+                "rtrim"
+            }
+
+            fn compare(&self, left: &[u8], right: &[u8]) -> Ordering {
+                left.cmp(right)
+            }
+        }
+
+        let cx = Cx::new();
+        let registry = Arc::new(Mutex::new(CollationRegistry::new()));
+        let mut table = MemTable::new(1);
+        table.set_collation_registry(Arc::clone(&registry));
+        let collations = vec![Some("RTRIM".to_owned())];
+        table
+            .add_unique_column_group_labeled(
+                &cx,
+                vec![0],
+                collations.clone(),
+                Some("t.k".to_owned()),
+                true,
+            )
+            .unwrap();
+        table.insert(1, vec![SqliteValue::Text("key".into())]);
+        let padded_key = vec![SqliteValue::Text("key ".into())];
+        assert_eq!(table.find_unique_conflicts(&cx, &padded_key).unwrap(), [1]);
+
+        registry.lock().unwrap().register(ExactRtrim);
+        assert!(table.find_unique_conflicts(&cx, &padded_key).unwrap().is_empty());
+        assert_eq!(table.find_unique_conflict_label(&cx, &padded_key).unwrap(), None);
+        table.insert(2, padded_key.clone());
+        assert!(table.unique_column_group_is_valid(&cx, &[0], &collations).unwrap());
+        assert_eq!(table.find_unique_conflicts(&cx, &padded_key).unwrap(), [2]);
+        assert_eq!(
+            table.find_unique_conflict_label(&cx, &padded_key).unwrap(),
+            Some(("t.k", true))
+        );
+
+        table.pad_rows_to_column_count(&cx, 2, &SqliteValue::Integer(7)).unwrap();
+        assert_eq!(table.find_unique_conflicts(&cx, &padded_key).unwrap(), [2]);
+        table.insert(2, vec![SqliteValue::Text("moved".into()), SqliteValue::Integer(8)]);
+        assert!(table.delete_by_rowid(1));
+        table.insert(3, vec![SqliteValue::Text("key ".into()), SqliteValue::Integer(9)]);
+
+        // The canonical index remains complete while overridden, including
+        // changes to two rows sharing one built-in key and a DDL rebuild.
+        table.set_collation_registry(Arc::new(Mutex::new(CollationRegistry::new())));
+        assert_eq!(
+            table.find_unique_conflicts(&cx, &[SqliteValue::Text("key".into())]).unwrap(),
+            [3]
+        );
+        assert_eq!(
+            table.find_unique_conflicts(&cx, &[SqliteValue::Text("moved".into())]).unwrap(),
+            [2]
         );
     }
 
@@ -34629,14 +37691,18 @@ mod tests {
             .unwrap_or_else(|err| err.into_inner())
             .register(DashlessNoCaseCollation);
 
+        let cx = Cx::new();
         let mut db = MemDatabase::new();
         let root = db.create_table(1);
         {
             let table = db.get_table_mut(root).expect("table should exist");
-            table.add_unique_column_group_with_collations(
-                vec![0],
-                vec![Some("DASHLESS_NOCASE".to_owned())],
-            );
+            table
+                .add_unique_column_group_with_collations(
+                    &cx,
+                    vec![0],
+                    vec![Some("DASHLESS_NOCASE".to_owned())],
+                )
+                .unwrap();
             table.insert(1, vec![SqliteValue::Text("Alpha-Beta".into())]);
         }
 
@@ -34649,7 +37715,9 @@ mod tests {
             .expect("database should still be attached");
         let table = db.get_table(root).expect("table should exist");
         assert_eq!(
-            table.find_unique_conflicts(&[SqliteValue::Text("alpha beta".into())]),
+            table
+                .find_unique_conflicts(&cx, &[SqliteValue::Text("alpha beta".into())])
+                .unwrap(),
             vec![1],
             "custom-collation UNIQUE fallback must use the engine-provided registry"
         );
@@ -35221,6 +38289,266 @@ mod tests {
         // Only one row with the updated value.
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], SqliteValue::Integer(99));
+    }
+
+    /// bd-hi7qg: a session that inserts explicit rowids holds a claim on the
+    /// table, so no peer's allocation lowers the shared tip below its rows,
+    /// which no peer can see. The claim is taken where the Insert arm seeks
+    /// (the cursor's first insert); the appends after it take none. A retained
+    /// cursor reopened under another session drops the append hint it learned
+    /// before, so the new session's first insert seeks and claims too: without
+    /// that, every row of the second run below is an append on the old hint
+    /// and the session never claims.
+    #[test]
+    fn test_explicit_rowid_inserts_claim_their_table_for_the_session() {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let epoch = SchemaEpoch::new(1);
+        let key = AllocatorKey {
+            schema_epoch: epoch,
+            table_id: TableId::new(u32::try_from(root).expect("small root")),
+        };
+        let allocator = Arc::new(ConcurrentRowIdAllocator::with_write_generation(
+            epoch,
+            Arc::new(AtomicU64::new(0)),
+        ));
+        // A peer whose view of the table is empty, at the current write
+        // generation: it lowers the tip to 1 unless a live session claims the
+        // table.
+        let peer_allocates = |session: u64| {
+            allocator
+                .allocate_one_above_visible_max(key, 0, 0, RowIdMode::Normal, session, 0, 0)
+                .expect("peer allocation")
+                .get()
+        };
+        // Insert explicit rowids `first..first + 3` (the first seeks, the rest
+        // append), then return every rowid the cursor holds.
+        let program = |first: i32| {
+            let mut b = ProgramBuilder::new();
+            let end = b.emit_label();
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+            for rowid in first..first + 3 {
+                b.emit_op(Opcode::Integer, rowid, 1, 0, P4::None, 0);
+                b.emit_op(Opcode::Integer, 7, 2, 0, P4::None, 0);
+                b.emit_op(Opcode::MakeRecord, 2, 1, 3, P4::None, 0);
+                b.emit_op(Opcode::Insert, 0, 3, 1, P4::None, 0);
+            }
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, done, P4::None, 0);
+            let body = b.current_addr();
+            b.emit_op(Opcode::Rowid, 0, 4, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 4, 1, 0, P4::None, 0);
+            let next_target = i32::try_from(body).expect("small program");
+            b.emit_op(Opcode::Next, 0, next_target, 0, P4::None, 0);
+            b.resolve_label(done);
+            b.emit_op(Opcode::Close, 0, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+            b.finish().expect("program should build")
+        };
+        let rowids = |engine: &mut VdbeEngine| -> Vec<i64> {
+            engine
+                .take_results()
+                .into_iter()
+                .map(|row| row.into_vec()[0].to_integer())
+                .collect()
+        };
+
+        // Run 1, session 7: rows 10, 11, 12.
+        let first_run = program(10);
+        let mut engine = VdbeEngine::new(first_run.register_count());
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+        engine.set_retain_storage_cursors_on_close(true);
+        engine.set_concurrent_rowid_allocator(Arc::clone(&allocator), epoch, 7, 0, 0);
+        assert_eq!(
+            run_async(engine.execute(&first_run)).expect("first run"),
+            ExecOutcome::Done
+        );
+        assert_eq!(rowids(&mut engine), vec![10, 11, 12]);
+        assert_eq!(allocator.next_rowid(&key), Some(13));
+        assert_eq!(peer_allocates(9), 13, "session 7's claim holds the tip");
+        allocator.clear_session(9);
+
+        // Run 2, session 8 after session 7 ended, on the retained cursor (it
+        // still holds rows 10..=12): rows 20, 21, 22 are all above its hint.
+        allocator.clear_session(7);
+        let second_run = program(20);
+        engine.reset_for_reuse_ex(
+            second_run.register_count(),
+            &Cx::new(),
+            PageSize::DEFAULT,
+            true,
+        );
+        engine.set_reject_mem_fallback(false);
+        engine.set_retain_storage_cursors_on_close(true);
+        engine.set_concurrent_rowid_allocator(Arc::clone(&allocator), epoch, 8, 0, 0);
+        assert_eq!(
+            run_async(engine.execute(&second_run)).expect("second run"),
+            ExecOutcome::Done
+        );
+        assert_eq!(
+            rowids(&mut engine),
+            vec![10, 11, 12, 20, 21, 22],
+            "the second run reused the retained cursor"
+        );
+        assert_eq!(peer_allocates(10), 23, "session 8's claim holds the tip");
+
+        // Control: with no live claim, the same peer view lowers the tip.
+        allocator.clear_session(8);
+        allocator.clear_session(10);
+        assert_eq!(peer_allocates(11), 1);
+    }
+
+    /// bd-fpr5g: programs run one after another on the engine with retained
+    /// cursors (an INSERT, then the trigger bodies it fires) number their
+    /// cursors from 0. A retained cursor a program on another root displaces
+    /// is kept as a spare and taken back by the next open of its root, in
+    /// whatever slot. The mem backend makes reuse observable: its cursor holds
+    /// its own copy of the rows it inserted, which a new cursor (filled from
+    /// the empty `MemDatabase` table) does not have.
+    #[test]
+    fn test_displaced_retained_cursor_is_kept_as_a_spare_and_taken_back() {
+        let mut db = MemDatabase::new();
+        let roots: Vec<i32> = (0..10).map(|_| db.create_table(1)).collect();
+        let (r1, r2) = (roots[0], roots[1]);
+        // Insert `rowids` through cursor `slot` on `root`.
+        let insert = |slot: i32, root: i32, rowids: &[i32]| {
+            let mut b = ProgramBuilder::new();
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenWrite, slot, root, 0, P4::Int(1), 0);
+            for &rowid in rowids {
+                b.emit_op(Opcode::Integer, rowid, 1, 0, P4::None, 0);
+                b.emit_op(Opcode::Integer, 7, 2, 0, P4::None, 0);
+                b.emit_op(Opcode::MakeRecord, 2, 1, 3, P4::None, 0);
+                b.emit_op(Opcode::Insert, slot, 3, 1, P4::None, 0);
+            }
+            b.emit_op(Opcode::Close, slot, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+            b.finish().expect("program should build")
+        };
+        // Return every rowid cursor `slot` on `root` holds.
+        let scan = |slot: i32, root: i32| {
+            let mut b = ProgramBuilder::new();
+            let end = b.emit_label();
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenRead, slot, root, 0, P4::Int(1), 0);
+            b.emit_jump_to_label(Opcode::Rewind, slot, 0, done, P4::None, 0);
+            let body = b.current_addr();
+            b.emit_op(Opcode::Rowid, slot, 4, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 4, 1, 0, P4::None, 0);
+            let next_target = i32::try_from(body).expect("small program");
+            b.emit_op(Opcode::Next, slot, next_target, 0, P4::None, 0);
+            b.resolve_label(done);
+            b.emit_op(Opcode::Close, slot, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+            b.finish().expect("program should build")
+        };
+        let mut engine = VdbeEngine::new(8);
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+        engine.set_retain_storage_cursors_on_close(true);
+        let run = |engine: &mut VdbeEngine, program: &VdbeProgram, retain: bool| -> Vec<i64> {
+            engine.reset_for_reuse_ex(
+                program.register_count(),
+                &Cx::new(),
+                PageSize::DEFAULT,
+                retain,
+            );
+            engine.set_reject_mem_fallback(false);
+            engine.set_retain_storage_cursors_on_close(retain);
+            assert_eq!(
+                run_async(engine.execute(program)).expect("program runs"),
+                ExecOutcome::Done
+            );
+            engine
+                .take_results()
+                .into_iter()
+                .map(|row| row.into_vec()[0].to_integer())
+                .collect()
+        };
+        let spare_roots = |engine: &VdbeEngine| -> Vec<i32> {
+            engine
+                .spare_storage_cursors
+                .iter()
+                .map(|spare| spare.root_page)
+                .collect()
+        };
+
+        run(&mut engine, &insert(0, r1, &[1, 2, 3]), true);
+        // Another root in slot 0: r1's cursor becomes a spare.
+        run(&mut engine, &insert(0, r2, &[10, 11]), true);
+        assert_eq!(spare_roots(&engine), vec![r1]);
+        assert!(!engine.storage_cursors_empty(), "a spare holds the engine");
+        // Back in slot 0, r1's cursor still holds its rows; r2's is the spare.
+        assert_eq!(run(&mut engine, &scan(0, r1), true), vec![1, 2, 3]);
+        assert_eq!(spare_roots(&engine), vec![r2]);
+        // A spare comes back into whatever slot opens its root.
+        assert_eq!(run(&mut engine, &scan(3, r2), true), vec![10, 11]);
+        assert!(spare_roots(&engine).is_empty());
+
+        // A reset that keeps no cursors drops the spares with them: r1's rows
+        // were only in its cursor.
+        run(&mut engine, &insert(0, roots[4], &[12]), true);
+        assert_eq!(spare_roots(&engine), vec![r1]);
+        assert!(run(&mut engine, &scan(0, r1), false).is_empty());
+        assert!(spare_roots(&engine).is_empty());
+        assert!(engine.storage_cursors_empty());
+
+        // Two cursors on one root: one is not kept while the other is still in
+        // a slot (the kept one could go stale under the other's writes); the
+        // last one is.
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::OpenWrite, 1, r1, 0, P4::Int(1), 0);
+        b.emit_op(Opcode::OpenRead, 2, r1, 0, P4::Int(1), 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+        let two_on_r1 = b.finish().expect("program should build");
+        run(&mut engine, &two_on_r1, true);
+        run(&mut engine, &insert(1, roots[2], &[20]), true);
+        assert!(
+            !spare_roots(&engine).contains(&r1),
+            "slot 2 still holds r1, so slot 1's r1 cursor is not kept"
+        );
+        run(&mut engine, &insert(2, roots[3], &[30]), true);
+        assert_eq!(
+            spare_roots(&engine),
+            vec![r1],
+            "once no slot holds r1, its last cursor is kept"
+        );
+
+        // At most MAX_SPARE_STORAGE_CURSORS are kept, and the oldest goes
+        // first. Start from no cursors.
+        run(&mut engine, &scan(0, roots[9]), false);
+        for &root in &roots {
+            run(&mut engine, &insert(0, root, &[40]), true);
+        }
+        assert_eq!(
+            spare_roots(&engine),
+            roots[1..=MAX_SPARE_STORAGE_CURSORS],
+            "roots[0]'s cursor made room for roots[8]'s"
+        );
+        assert!(run(&mut engine, &scan(0, roots[0]), true).is_empty());
+        assert_eq!(spare_roots(&engine), roots[2..=9]);
+        // The spare a full set is asked for comes back before the displaced
+        // cursor makes room.
+        assert_eq!(run(&mut engine, &scan(0, roots[2]), true), vec![40]);
+
+        // take_transaction drops them as well.
+        assert!(!spare_roots(&engine).is_empty());
+        engine
+            .take_transaction()
+            .expect("no transaction to give back");
+        assert!(spare_roots(&engine).is_empty());
     }
 
     #[test]
@@ -39638,6 +42966,376 @@ mod tests {
         assert_eq!(sorter.memory_used, 0, "memory_used should be 0");
     }
 
+    #[test]
+    fn test_temp_store_sorter_btree_and_memtable_policy_and_faults() {
+        use crate::temp_store::{
+            EffectiveTempStore, OsTempFileBackend, TempFileBackend, TempFileHandle, TempStoreMode,
+            TempStoreRuntime, TempStoreStats,
+        };
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+        struct FaultTempBackend {
+            fail_on_write_at_byte: usize,
+            disk_full: bool,
+            bytes_written: AtomicUsize,
+            fail_read_offset: Arc<AtomicU64>,
+        }
+
+        struct FaultTempHandle {
+            inner: Box<dyn TempFileHandle>,
+            fail_on_write_at_byte: usize,
+            disk_full: bool,
+            bytes_written: Arc<AtomicUsize>,
+            fail_read_offset: Arc<AtomicU64>,
+        }
+
+        impl TempFileHandle for FaultTempHandle {
+            fn write_at(&self, cx: &Cx, offset: u64, data: &[u8]) -> Result<()> {
+                let next = self
+                    .bytes_written
+                    .fetch_add(data.len(), Ordering::Relaxed)
+                    .saturating_add(data.len());
+                if next >= self.fail_on_write_at_byte {
+                    return if self.disk_full {
+                        Err(FrankenError::DatabaseFull)
+                    } else {
+                        Err(FrankenError::Io(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "injected temp write failure",
+                        )))
+                    };
+                }
+                self.inner.write_at(cx, offset, data)
+            }
+
+            fn read_at(&self, cx: &Cx, offset: u64, buf: &mut [u8]) -> Result<usize> {
+                if offset == self.fail_read_offset.load(Ordering::Relaxed) {
+                    return Err(FrankenError::Io(std::io::Error::other(
+                        "injected temp read failure",
+                    )));
+                }
+                self.inner.read_at(cx, offset, buf)
+            }
+
+            fn file_size(&self, cx: &Cx) -> Result<u64> {
+                self.inner.file_size(cx)
+            }
+
+            fn truncate(&self, cx: &Cx, size: u64) -> Result<()> {
+                self.inner.truncate(cx, size)
+            }
+
+            fn close(&self, cx: &Cx) -> Result<()> {
+                self.inner.close(cx)
+            }
+        }
+
+        impl TempFileBackend for FaultTempBackend {
+            fn create_temp_file(&self, cx: &Cx, purpose: &str) -> Result<Box<dyn TempFileHandle>> {
+                let inner = OsTempFileBackend.create_temp_file(cx, purpose)?;
+                Ok(Box::new(FaultTempHandle {
+                    inner,
+                    fail_on_write_at_byte: self.fail_on_write_at_byte,
+                    disk_full: self.disk_full,
+                    bytes_written: Arc::new(AtomicUsize::new(
+                        self.bytes_written.load(Ordering::Relaxed),
+                    )),
+                    fail_read_offset: Arc::clone(&self.fail_read_offset),
+                }))
+            }
+        }
+
+        // 1. FILE mode spills sorter runs and cleans up every temp handle after merge.
+        let file_stats = Arc::new(TempStoreStats::new());
+        let file_runtime = TempStoreRuntime::new(
+            TempStoreMode::File,
+            128,
+            None,
+            Some(Arc::new(OsTempFileBackend)),
+            Arc::clone(&file_stats),
+        );
+        assert_eq!(file_runtime.effective_mode(), EffectiveTempStore::File);
+        let mut sorter = SorterCursor::with_collation_registry_and_temp_store(
+            1,
+            vec![SortKeyOrder::Asc],
+            Vec::new(),
+            Arc::new(Mutex::new(CollationRegistry::new())),
+            None,
+            TextEncoding::Utf8,
+            file_runtime.clone(),
+            Cx::new(),
+        );
+        for v in (0..40_i64).rev() {
+            let vals = vec![
+                SqliteValue::Integer(v),
+                SqliteValue::Text(SmallText::new(&format!("payload-{v:04}-abcdefgh"))),
+            ];
+            let blob = serialize_record(&vals);
+            sorter.insert_row(vals, blob).expect("file mode insert");
+        }
+        assert!(
+            file_stats.snapshot().sorter_spill_runs >= 1,
+            "FILE mode must spill runs beyond 128-byte budget"
+        );
+        assert!(file_stats.snapshot().active_temp_files >= 1);
+        sorter.sort().expect("file mode merge");
+        let after_merge = file_stats.snapshot();
+        assert_eq!(after_merge.active_temp_files, 0, "all spill handles closed");
+        assert_eq!(after_merge.temp_files_opened, after_merge.temp_files_closed);
+        assert_eq!(sorter.rows.len(), 40);
+        assert_eq!(sorter.rows[0].values[0], SqliteValue::Integer(0));
+        assert_eq!(sorter.rows[39].values[0], SqliteValue::Integer(39));
+
+        // 2. MEMORY mode never opens a temp file and enforces hard_heap_limit -> OutOfMemory.
+        let mem_stats = Arc::new(TempStoreStats::new());
+        let mem_runtime = TempStoreRuntime::new(
+            TempStoreMode::Memory,
+            128,
+            Some(512),
+            Some(Arc::new(OsTempFileBackend)),
+            Arc::clone(&mem_stats),
+        );
+        assert_eq!(mem_runtime.effective_mode(), EffectiveTempStore::Memory);
+        let mut mem_sorter = SorterCursor::with_collation_registry_and_temp_store(
+            1,
+            vec![SortKeyOrder::Asc],
+            Vec::new(),
+            Arc::new(Mutex::new(CollationRegistry::new())),
+            None,
+            TextEncoding::Utf8,
+            mem_runtime,
+            Cx::new(),
+        );
+        let mut hit_oom = false;
+        for v in 0..40_i64 {
+            let vals = vec![
+                SqliteValue::Integer(v),
+                SqliteValue::Text(SmallText::new(&"x".repeat(64))),
+            ];
+            let blob = serialize_record(&vals);
+            match mem_sorter.insert_row(vals, blob) {
+                Ok(()) => {}
+                Err(FrankenError::OutOfMemory) => {
+                    hit_oom = true;
+                    break;
+                }
+                Err(other) => panic!("expected OutOfMemory in MEMORY mode, got {other:?}"),
+            }
+        }
+        assert!(hit_oom, "MEMORY mode must enforce hard_heap_limit");
+        let mem_snap = mem_stats.snapshot();
+        assert_eq!(mem_snap.temp_files_opened, 0);
+        assert_eq!(mem_snap.sorter_spill_runs, 0);
+        assert!(mem_snap.memory_only_allocations >= 1);
+
+        // 3. Disk-full (DatabaseFull) and I/O write failure propagate cleanly with 0 leaked files.
+        for disk_full in [true, false] {
+            let fault_stats = Arc::new(TempStoreStats::new());
+            let fault_runtime = TempStoreRuntime::new(
+                TempStoreMode::File,
+                64,
+                None,
+                Some(Arc::new(FaultTempBackend {
+                    fail_on_write_at_byte: 1,
+                    disk_full,
+                    bytes_written: AtomicUsize::new(0),
+                    fail_read_offset: Arc::new(AtomicU64::new(u64::MAX)),
+                })),
+                Arc::clone(&fault_stats),
+            );
+            let mut fault_sorter = SorterCursor::with_collation_registry_and_temp_store(
+                1,
+                vec![SortKeyOrder::Asc],
+                Vec::new(),
+                Arc::new(Mutex::new(CollationRegistry::new())),
+                None,
+                TextEncoding::Utf8,
+                fault_runtime,
+                Cx::new(),
+            );
+            let vals = vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text(SmallText::new(&"z".repeat(128))),
+            ];
+            let blob = serialize_record(&vals);
+            let err = fault_sorter
+                .insert_row(vals, blob)
+                .expect_err("injected fault must fail spill");
+            if disk_full {
+                assert!(matches!(err, FrankenError::DatabaseFull), "got {err:?}");
+            } else {
+                assert!(matches!(err, FrankenError::Io(_)), "got {err:?}");
+            }
+            drop(fault_sorter);
+            assert_eq!(
+                fault_stats.snapshot().active_temp_files,
+                0,
+                "fault path must close leaked spill handles"
+            );
+        }
+
+        // 4. Caller Cx cancellation fails with Abort and leaks 0 files.
+        let cancel_stats = Arc::new(TempStoreStats::new());
+        let cancel_runtime = TempStoreRuntime::new(
+            TempStoreMode::File,
+            64,
+            None,
+            Some(Arc::new(OsTempFileBackend)),
+            Arc::clone(&cancel_stats),
+        );
+        let cx = Cx::new();
+        cx.cancel();
+        let mut cancel_sorter = SorterCursor::with_collation_registry_and_temp_store(
+            1,
+            vec![SortKeyOrder::Asc],
+            Vec::new(),
+            Arc::new(Mutex::new(CollationRegistry::new())),
+            None,
+            TextEncoding::Utf8,
+            cancel_runtime,
+            cx.clone(),
+        );
+        let vals = vec![SqliteValue::Integer(1)];
+        let blob = serialize_record(&vals);
+        let err = cancel_sorter
+            .insert_row(vals, blob)
+            .expect_err("cancelled cx must abort sorter");
+        assert!(matches!(err, FrankenError::Abort), "got {err:?}");
+        assert_eq!(cancel_stats.snapshot().active_temp_files, 0);
+
+        // 5. MemTable temp spill writes & reads back exact values and closes on drop.
+        let tbl_stats = Arc::new(TempStoreStats::new());
+        let fail_read_offset = Arc::new(AtomicU64::new(u64::MAX));
+        let tbl_runtime = TempStoreRuntime::new(
+            TempStoreMode::File,
+            256,
+            None,
+            Some(Arc::new(FaultTempBackend {
+                fail_on_write_at_byte: usize::MAX,
+                disk_full: false,
+                bytes_written: AtomicUsize::new(0),
+                fail_read_offset: Arc::clone(&fail_read_offset),
+            })),
+            Arc::clone(&tbl_stats),
+        );
+        let cx_ok = Cx::new();
+        {
+            let mut table = MemTable::new(2);
+            table.configure_temp_spill(tbl_runtime, TextEncoding::Utf8);
+            table.add_unique_column_group(&cx_ok, vec![0]).unwrap();
+            let expected_rows = (1..=25_i64)
+                .map(|i| {
+                    (
+                        i,
+                        vec![
+                            SqliteValue::Integer(i),
+                            SqliteValue::Text(SmallText::new(&format!("row-payload-{i:04}-xyz"))),
+                        ],
+                    )
+                })
+                .collect::<Vec<_>>();
+            for (rowid, values) in &expected_rows {
+                table
+                    .insert_checked(&cx_ok, *rowid, values.clone())
+                    .expect("temp table insert");
+            }
+            assert!(table.has_spilled_rows(), "temp table must spill beyond 256B");
+            assert!(tbl_stats.snapshot().temp_table_spill_events >= 1);
+            let read_back = table
+                .read_row_values_by_rowid(&cx_ok, 13)
+                .expect("read spilled row")
+                .expect("row 13 present");
+            assert_eq!(read_back[0], SqliteValue::Integer(13));
+            assert_eq!(
+                read_back[1],
+                SqliteValue::Text(SmallText::new("row-payload-0013-xyz"))
+            );
+
+            let original_rows = table.rows.as_ref().clone();
+            let spill = table.temp_spill.as_ref().unwrap();
+            let original_accounting = (spill.spilled_row_count, spill.resident_bytes);
+            let original_stats = tbl_stats.snapshot();
+            assert_eq!(original_stats.active_temp_files, 1);
+            let first = original_rows[0].spilled.expect("first row spilled");
+            let second = original_rows[1].spilled.expect("second row spilled");
+            assert!(first.offset < second.offset);
+
+            // A failure on the second read catches rewrites that modify the
+            // first row before discovering that a later read cannot complete.
+            for cancelled in [true, false] {
+                let read_cx = if cancelled {
+                    &cx
+                } else {
+                    fail_read_offset.store(second.offset, Ordering::Relaxed);
+                    &cx_ok
+                };
+                for error in [
+                    table.snapshot_all_rows_owned(read_cx).unwrap_err(),
+                    table
+                        .pad_rows_to_column_count(read_cx, 3, &SqliteValue::Null)
+                        .unwrap_err(),
+                    table.add_unique_column_group(read_cx, vec![1]).unwrap_err(),
+                ] {
+                    if cancelled {
+                        assert!(matches!(error, FrankenError::Abort), "{error:?}");
+                    } else {
+                        assert!(matches!(error, FrankenError::Io(_)), "{error:?}");
+                    }
+                }
+                fail_read_offset.store(u64::MAX, Ordering::Relaxed);
+                assert_eq!(*table.rows, original_rows);
+                assert_eq!(table.num_columns, 2);
+                assert_eq!(table.unique_constraints.len(), 1);
+                let spill = table.temp_spill.as_ref().unwrap();
+                assert_eq!(
+                    (spill.spilled_row_count, spill.resident_bytes),
+                    original_accounting
+                );
+                assert_eq!(tbl_stats.snapshot(), original_stats);
+                assert_eq!(
+                    table.snapshot_all_rows_owned(&cx_ok).unwrap(),
+                    expected_rows
+                );
+                for (rowid, values) in &expected_rows {
+                    assert_eq!(
+                        table.find_unique_conflicts(&cx_ok, values).unwrap(),
+                        vec![*rowid]
+                    );
+                }
+            }
+
+            table.add_unique_column_group(&cx_ok, vec![1]).unwrap();
+            for (rowid, values) in &expected_rows {
+                let lookup = [SqliteValue::Null, values[1].clone()];
+                assert_eq!(
+                    table.find_unique_conflicts(&cx_ok, &lookup).unwrap(),
+                    vec![*rowid]
+                );
+            }
+            let default_value = SqliteValue::Text("added".into());
+            table
+                .pad_rows_to_column_count(&cx_ok, 3, &default_value)
+                .unwrap();
+            let padded_rows = expected_rows
+                .into_iter()
+                .map(|(rowid, mut values)| {
+                    values.push(default_value.clone());
+                    (rowid, values)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                table.snapshot_all_rows_owned(&cx_ok).unwrap(),
+                padded_rows
+            );
+        }
+        let tbl_after_drop = tbl_stats.snapshot();
+        assert_eq!(tbl_after_drop.active_temp_files, 0);
+        assert_eq!(
+            tbl_after_drop.temp_files_opened,
+            tbl_after_drop.temp_files_closed
+        );
+    }
+
     /// bd-bld9w.4: BINARY collation compares in the DB storage encoding. These
     /// orders were verified against stock C SQLite (sqlite3 3.46.1, `PRAGMA
     /// encoding='UTF-16le'`): BINARY on a UTF-16LE DB orders by UTF-16LE bytes;
@@ -40137,6 +43835,332 @@ mod tests {
         assert_eq!(sorted, vec![5, 4, 3]);
     }
 
+    /// The record of `values` as `SorterInsert` hands it to a sorter: its
+    /// first `key_columns` values decoded, and its bytes.
+    fn sorter_runs_record(
+        values: &[SqliteValue],
+        key_columns: usize,
+    ) -> (SorterKeyValues, SorterBlob) {
+        let record = serialize_record(values);
+        (
+            values.iter().take(key_columns).cloned().collect(),
+            SorterBlob::from_slice(&record),
+        )
+    }
+
+    /// Every record a sorter emits from its first, as bytes, through the
+    /// positioning and advance `SorterSort` / `SorterNext` use.
+    fn sorter_runs_emitted(sorter: &mut SorterCursor) -> Vec<Vec<u8>> {
+        let mut emitted = Vec::new();
+        if sorter.position_at_first() {
+            loop {
+                let at = sorter.position.expect("positioned");
+                emitted.push(sorter.rows[at].blob.to_vec());
+                if !sorter.advance() {
+                    break;
+                }
+            }
+        }
+        emitted
+    }
+
+    fn sorter_runs_state(sorter: &SorterCursor) -> &'static str {
+        match sorter.runs {
+            SorterRuns::Undecided => "undecided",
+            SorterRuns::Off => "off",
+            SorterRuns::Collecting { .. } => "collecting",
+            SorterRuns::Sorted { .. } => "sorted",
+        }
+    }
+
+    /// Insert `records` into a sorter that may collect runs (as `SorterInsert`
+    /// does, under `ops`) and into one that keeps a row per record, sort both
+    /// and require the same records, in the same order, and the same sorted
+    /// count. Returns the state the first one sorted in.
+    fn sorter_runs_against_plain(
+        label: &str,
+        records: &[Vec<SqliteValue>],
+        key_columns: usize,
+        orders: &[SortKeyOrder],
+        ops: &[VdbeOp],
+    ) -> &'static str {
+        let mut runs = SorterCursor::new(key_columns, orders.to_vec(), Vec::new());
+        let mut plain = SorterCursor::new(key_columns, orders.to_vec(), Vec::new());
+        for values in records {
+            let (keys, blob) = sorter_runs_record(values, key_columns);
+            runs.insert_program_record(keys.clone(), blob.clone(), ops, 1)
+                .expect("insert");
+            plain.insert_record(keys, blob).expect("insert");
+        }
+        runs.sort().expect("sort");
+        plain.sort().expect("sort");
+        assert_eq!(runs.rows_sorted_total, plain.rows_sorted_total, "{label}");
+        let (emitted, expected) = (
+            sorter_runs_emitted(&mut runs),
+            sorter_runs_emitted(&mut plain),
+        );
+        assert_eq!(emitted.len(), records.len(), "{label}");
+        assert_same_records(label, &emitted, &expected);
+        sorter_runs_state(&runs)
+    }
+
+    /// The same records in the same order; reports the first that differs.
+    fn assert_same_records(label: &str, emitted: &[Vec<u8>], expected: &[Vec<u8>]) {
+        assert_eq!(emitted.len(), expected.len(), "{label}: record count");
+        let first_difference = emitted.iter().zip(expected).position(|(lhs, rhs)| lhs != rhs);
+        assert_eq!(first_difference, None, "{label}: first record that differs");
+    }
+
+    /// bd-w4pr1.13.8 lever G3: a sorter collecting runs emits what a sorter
+    /// holding one row per record emits, in every case that keeps runs and in
+    /// every case that has to give them up. Each case states the state it
+    /// ends in, so none passes without exercising its path.
+    #[test]
+    fn test_sorter_runs_emit_what_one_row_per_record_emits() {
+        let int = SqliteValue::Integer;
+        let text = |s: String| SqliteValue::Text(s.as_str().into());
+        let asc = [SortKeyOrder::Asc];
+        let no_ops: [VdbeOp; 0] = [];
+        let n = 20_000_i64;
+
+        // An INTEGER key repeated in 37 groups: collected and sorted as runs.
+        let groups: Vec<_> = (0..n).map(|i| vec![int(i % 37)]).collect();
+        assert_eq!(
+            sorter_runs_against_plain("groups", &groups, 1, &asc, &no_ops),
+            "sorted"
+        );
+        let desc = [SortKeyOrder::Desc];
+        assert_eq!(
+            sorter_runs_against_plain("groups desc", &groups, 1, &desc, &no_ops),
+            "sorted"
+        );
+
+        // The key turns REAL after the runs started: 3.0 equals 3 in other
+        // bytes, so the runs give way and 3.0 sorts between the 3s it came
+        // between. A collapse by value would move it.
+        let real_after: Vec<_> = (0..n)
+            .map(|i| {
+                if i == 6_000 {
+                    vec![SqliteValue::Float(3.0)]
+                } else {
+                    vec![int(i % 5)]
+                }
+            })
+            .collect();
+        assert_eq!(
+            sorter_runs_against_plain("real after start", &real_after, 1, &asc, &no_ops),
+            "off"
+        );
+        // -0.0 and 0.0 beside 0, after the start.
+        let zeros: Vec<_> = (0..n)
+            .map(|i| match i {
+                7_000 => vec![SqliteValue::Float(-0.0)],
+                7_001 => vec![SqliteValue::Float(0.0)],
+                _ => vec![int(i % 3)],
+            })
+            .collect();
+        assert_eq!(
+            sorter_runs_against_plain("signed zeros", &zeros, 1, &asc, &no_ops),
+            "off"
+        );
+        // A REAL key before the first check: never collects.
+        let reals: Vec<_> = (0..n)
+            .map(|i| vec![SqliteValue::Float(f64::from(u32::try_from(i % 9).unwrap()))])
+            .collect();
+        assert_eq!(
+            sorter_runs_against_plain("real keys", &reals, 1, &asc, &no_ops),
+            "off"
+        );
+
+        // A record wider than its key whose payload is a function of the key
+        // for 6,000 records and then varies: equal keys in other bytes end the
+        // runs, and the payloads of one key keep their insertion order. A
+        // collapse by key alone would reorder them.
+        let payload: Vec<_> = (0..n)
+            .map(|i| {
+                let p = if i < 6_000 { (i % 37) * 10 } else { i };
+                vec![int(i % 37), int(p)]
+            })
+            .collect();
+        assert_eq!(
+            sorter_runs_against_plain("payload changes", &payload, 1, &asc, &no_ops),
+            "off"
+        );
+        // A payload that always follows the key collects.
+        let same_payload: Vec<_> = (0..n)
+            .map(|i| vec![int(i % 37), text(format!("p{}", i % 37))])
+            .collect();
+        assert_eq!(
+            sorter_runs_against_plain("payload follows key", &same_payload, 1, &asc, &no_ops),
+            "sorted"
+        );
+
+        // Ten keys for 8,000 records, then every key new: below 2x at the
+        // 16,384 check, the runs turn back into rows there.
+        let thinning: Vec<_> = (0..n)
+            .map(|i| vec![int(if i < 8_000 { i % 10 } else { i })])
+            .collect();
+        assert_eq!(
+            sorter_runs_against_plain("thinning", &thinning, 1, &asc, &no_ops),
+            "off"
+        );
+        // Unique keys: declined at the first check.
+        let unique: Vec<_> = (0..n).map(|i| vec![int(n - i)]).collect();
+        assert_eq!(
+            sorter_runs_against_plain("unique", &unique, 1, &asc, &no_ops),
+            "off"
+        );
+        // Under 4,096 records nothing is decided.
+        assert_eq!(
+            sorter_runs_against_plain("small", &groups[..4_000], 1, &asc, &no_ops),
+            "off"
+        );
+
+        // NULL, INTEGER, TEXT and BLOB keys of two columns, every direction.
+        let mixed: Vec<_> = (0..n)
+            .map(|i| {
+                let first = match i % 4 {
+                    0 => SqliteValue::Null,
+                    1 => int(i % 7),
+                    2 => text(format!("t{}", i % 5)),
+                    _ => SqliteValue::Blob(Arc::from(vec![u8::try_from(i % 3).unwrap(); 2])),
+                };
+                vec![first, int(i % 2)]
+            })
+            .collect();
+        for orders in [
+            [SortKeyOrder::Asc, SortKeyOrder::Desc],
+            [SortKeyOrder::Desc, SortKeyOrder::Asc],
+            [SortKeyOrder::AscNullsLast, SortKeyOrder::DescNullsFirst],
+        ] {
+            assert_eq!(
+                sorter_runs_against_plain("mixed", &mixed, 2, &orders, &no_ops),
+                "sorted",
+                "{orders:?}"
+            );
+        }
+        // A record shorter than its key (one value under two key columns).
+        let short: Vec<_> = (0..n).map(|i| vec![int(i % 4)]).collect();
+        assert_eq!(
+            sorter_runs_against_plain("short record", &short, 2, &asc, &no_ops),
+            "sorted"
+        );
+
+        // A program that rewinds the sorter without sorting it reads
+        // insertion order: it never collects.
+        let rewinds = [VdbeOp {
+            opcode: Opcode::Rewind,
+            p1: 1,
+            p2: 0,
+            p3: 0,
+            p4: P4::None,
+            p5: 0,
+        }];
+        assert_eq!(
+            sorter_runs_against_plain("rewound", &groups, 1, &asc, &rewinds),
+            "off"
+        );
+        let other_cursor = [VdbeOp {
+            p1: 0,
+            ..rewinds[0].clone()
+        }];
+        assert_eq!(
+            sorter_runs_against_plain("other cursor rewound", &groups, 1, &asc, &other_cursor),
+            "sorted"
+        );
+    }
+
+    /// A sorter collecting runs that spills writes each run's record its
+    /// count times, then keeps one row per record; an insert after the sort
+    /// turns the runs back into rows at the record it was on; ResetSorter
+    /// lets the next fill collect again; the index bulk load sees runs as not
+    /// one row per record.
+    #[test]
+    fn test_sorter_runs_spill_insert_after_sort_and_reset() {
+        let int = SqliteValue::Integer;
+        let no_ops: [VdbeOp; 0] = [];
+        let new_sorter = || SorterCursor::new(1, vec![SortKeyOrder::Asc], Vec::new());
+        let insert_both = |runs: &mut SorterCursor, plain: &mut SorterCursor, key: i64| {
+            let (keys, blob) = sorter_runs_record(&[int(key)], 1);
+            runs.insert_program_record(keys.clone(), blob.clone(), &no_ops, 1)
+                .expect("insert");
+            plain.insert_record(keys, blob).expect("insert");
+        };
+
+        // 1,000 keys for 10,000 records, then a new key each: the runs grow
+        // past the threshold and spill while collecting.
+        let row_size = SorterCursor::estimate_row_size(&[int(1)], &serialize_record(&[int(1)]));
+        let (mut runs, mut plain) = (new_sorter(), new_sorter());
+        runs.spill_threshold = row_size * 5_000;
+        plain.spill_threshold = row_size * 5_000;
+        let mut spilled_while_collecting = false;
+        for i in 0..30_000_i64 {
+            let collecting = matches!(runs.runs, SorterRuns::Collecting { .. });
+            insert_both(&mut runs, &mut plain, if i < 10_000 { i % 1_000 } else { i });
+            spilled_while_collecting |= collecting && !runs.spill_runs.is_empty();
+        }
+        assert!(spilled_while_collecting, "the spill must come while collecting");
+        assert_eq!(sorter_runs_state(&runs), "off");
+        runs.sort().expect("sort");
+        plain.sort().expect("sort");
+        assert_eq!(runs.rows_sorted_total, plain.rows_sorted_total);
+        assert_same_records(
+            "spill",
+            &sorter_runs_emitted(&mut runs),
+            &sorter_runs_emitted(&mut plain),
+        );
+
+        // Insert after the sort, three records into a run of 20.
+        let (mut runs, mut plain) = (new_sorter(), new_sorter());
+        for i in 0..20_000_i64 {
+            insert_both(&mut runs, &mut plain, (i * 7) % 1_000);
+        }
+        runs.sort().expect("sort");
+        plain.sort().expect("sort");
+        assert_eq!(sorter_runs_state(&runs), "sorted");
+        assert!(!runs.rows_are_records(), "the bulk load must decline runs");
+        assert!(runs.position_at_first() && plain.position_at_first());
+        for _ in 0..25 {
+            assert!(runs.advance() && plain.advance());
+        }
+        let current = |sorter: &SorterCursor| sorter.rows[sorter.position.unwrap()].blob.to_vec();
+        assert_eq!(current(&runs), current(&plain));
+        for key in [5, 999, -1] {
+            insert_both(&mut runs, &mut plain, key);
+        }
+        assert_eq!(sorter_runs_state(&runs), "off");
+        assert!(runs.rows_are_records());
+        assert_eq!(runs.position, plain.position, "the expanded place");
+        assert_eq!(current(&runs), current(&plain));
+        let rest = |sorter: &mut SorterCursor| {
+            let mut out = Vec::new();
+            while sorter.advance() {
+                out.push(sorter.rows[sorter.position.unwrap()].blob.to_vec());
+            }
+            out
+        };
+        assert_same_records("after insert", &rest(&mut runs), &rest(&mut plain));
+        runs.sort().expect("sort");
+        plain.sort().expect("sort");
+        assert_same_records(
+            "sorted again",
+            &sorter_runs_emitted(&mut runs),
+            &sorter_runs_emitted(&mut plain),
+        );
+
+        // ResetSorter: the next fill collects again.
+        runs.reset();
+        assert_eq!(sorter_runs_state(&runs), "undecided");
+        assert_eq!(runs.copies_left, 0);
+        for i in 0..5_000_i64 {
+            let (keys, blob) = sorter_runs_record(&[int(i % 3)], 1);
+            runs.insert_program_record(keys, blob, &no_ops, 1)
+                .expect("insert");
+        }
+        assert_eq!(sorter_runs_state(&runs), "collecting");
+        assert_eq!(runs.rows.len(), 3);
+    }
+
     #[test]
     fn test_sorter_top_n_equal_keys_keep_earliest_source_rows() {
         let mut sorter = SorterCursor::with_collation_registry(
@@ -40317,296 +44341,12 @@ mod tests {
         ));
     }
 
-    const ALL_SORT_KEY_ORDERS: [SortKeyOrder; 4] = [
-        SortKeyOrder::Asc,
-        SortKeyOrder::Desc,
-        SortKeyOrder::AscNullsLast,
-        SortKeyOrder::DescNullsFirst,
-    ];
-
-    /// What the general top-N preflight compares: the packed key, decoded.
-    fn decode_packed_key(record: &[u8]) -> Vec<SqliteValue> {
-        fsqlite_types::record::parse_record_with_encoding(record, TextEncoding::Utf8)
-            .expect("test key records are well formed")
-    }
-
-    /// Whether every key column pairs values the packed comparison takes (a
-    /// candidate that is NULL, a number, or TEXT against TEXT or NULL; never a
-    /// BLOB candidate), so it must answer rather than decline.
-    fn packed_key_must_answer(candidate: &[SqliteValue], worst: &[SqliteValue]) -> bool {
-        candidate.len() == worst.len()
-            && candidate.iter().zip(worst).all(|(lhs, rhs)| match lhs {
-                SqliteValue::Text(_) => matches!(rhs, SqliteValue::Null | SqliteValue::Text(_)),
-                SqliteValue::Blob(_) => false,
-                _ => true,
-            })
-    }
-
-    /// Compare `record` both ways under BINARY and return whether the packed
-    /// comparison answered. An answer must equal the decoded comparison; a
-    /// decline is allowed only for pairs it does not take.
-    fn check_packed_key(
-        record: &[u8],
-        candidate: &[SqliteValue],
-        worst: &[SqliteValue],
-        key_columns: usize,
-        orders: &[SortKeyOrder],
-        registry: &CollationRegistry,
-    ) -> bool {
-        let collations = vec![None; key_columns];
-        let expected = compare_sorter_rows(
-            &decode_packed_key(record),
-            worst,
-            key_columns,
-            orders,
-            &collations,
-            registry,
-            TextEncoding::Utf8,
-        );
-        let packed = compare_packed_sorter_key(
-            record,
-            worst,
-            key_columns,
-            orders,
-            &collations,
-            TextEncoding::Utf8,
-        );
-        match packed {
-            Some(ordering) => {
-                assert_eq!(
-                    ordering, expected,
-                    "packed key {candidate:?} ({record:?}) against {worst:?} under {orders:?}"
-                );
-                true
-            }
-            None => {
-                assert!(
-                    !packed_key_must_answer(candidate, worst),
-                    "packed key {candidate:?} ({record:?}) against {worst:?} under {orders:?} declined"
-                );
-                false
-            }
-        }
-    }
-
-    #[test]
-    fn test_packed_sorter_key_compare_agrees_with_decoding_the_key() {
-        let registry = CollationRegistry::new();
-        let wide = "z".repeat(40);
-        let values = [
-            SqliteValue::Null,
-            SqliteValue::Integer(0),
-            SqliteValue::Integer(1),
-            SqliteValue::Integer(-1),
-            SqliteValue::Integer(7),
-            SqliteValue::Integer(1 << 40),
-            SqliteValue::Integer(i64::MAX),
-            SqliteValue::Integer(i64::MIN),
-            SqliteValue::Float(-0.0),
-            SqliteValue::Float(0.5),
-            SqliteValue::Float(7.0),
-            SqliteValue::Float(9.3e18),
-            SqliteValue::Float(-1.5e300),
-            SqliteValue::Text("".into()),
-            SqliteValue::Text("a".into()),
-            SqliteValue::Text("ab".into()),
-            SqliteValue::Text("b".into()),
-            SqliteValue::Text("row-99999".into()),
-            SqliteValue::Text("row-999990".into()),
-            SqliteValue::Text("é".into()),
-            SqliteValue::Text(wide.as_str().into()),
-            SqliteValue::Blob(Arc::from(&[0x00_u8, 0xFF][..])),
-        ];
-        let mut answered = 0_usize;
-
-        // One-column keys: every value against every worst value, every order.
-        for order in ALL_SORT_KEY_ORDERS {
-            for candidate in &values {
-                for worst in &values {
-                    let candidate = std::slice::from_ref(candidate);
-                    let worst = std::slice::from_ref(worst);
-                    let record = serialize_record(candidate);
-                    if check_packed_key(&record, candidate, worst, 1, &[order], &registry) {
-                        answered += 1;
-                    }
-                }
-            }
-        }
-
-        // Two-column keys: a value of every class in each column, every pair of
-        // orders, so a tie in the first column hands the second the decision.
-        let pick = [
-            SqliteValue::Null,
-            SqliteValue::Integer(7),
-            SqliteValue::Float(7.0),
-            SqliteValue::Text("ab".into()),
-            SqliteValue::Text("b".into()),
-            SqliteValue::Blob(Arc::from(&[0x01_u8][..])),
-        ];
-        for first_order in ALL_SORT_KEY_ORDERS {
-            for second_order in ALL_SORT_KEY_ORDERS {
-                let orders = [first_order, second_order];
-                for c0 in &pick {
-                    for c1 in &pick {
-                        let candidate = [c0.clone(), c1.clone()];
-                        let record = serialize_record(&candidate);
-                        for w0 in &pick {
-                            for w1 in &pick {
-                                let worst = [w0.clone(), w1.clone()];
-                                if check_packed_key(
-                                    &record, &candidate, &worst, 2, &orders, &registry,
-                                ) {
-                                    answered += 1;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // A key record shorter or longer than the key, and a worst row
-        // shorter than the key.
-        let short = [SqliteValue::Text("ab".into())];
-        let pair = [SqliteValue::Text("ab".into()), SqliteValue::Integer(3)];
-        for order in ALL_SORT_KEY_ORDERS {
-            let orders = [order, order];
-            for (candidate, worst) in [
-                (&short[..], &pair[..]),
-                (&pair[..], &short[..]),
-                (&short[..], &short[..]),
-            ] {
-                let record = serialize_record(candidate);
-                assert!(
-                    check_packed_key(&record, candidate, worst, 2, &orders, &registry)
-                        || !packed_key_must_answer(candidate, worst)
-                );
-            }
-            let record = serialize_record(&pair);
-            assert!(check_packed_key(
-                &record,
-                &pair,
-                &pair[..1],
-                1,
-                &orders[..1],
-                &registry
-            ));
-        }
-
-        // Records no serializer writes: a NaN REAL (it decodes as NULL), TEXT
-        // bytes that are not UTF-8 (kept and compared as stored), and a
-        // reserved serial type (left to the decoder).
-        let mut nan = vec![2_u8, 7];
-        nan.extend_from_slice(&f64::NAN.to_bits().to_be_bytes());
-        let not_utf8 = [2_u8, 17, 0xFF, 0xFE];
-        let reserved = [2_u8, 10];
-        for order in ALL_SORT_KEY_ORDERS {
-            for worst in &values {
-                let worst = std::slice::from_ref(worst);
-                for record in [&nan[..], &not_utf8[..]] {
-                    let candidate = decode_packed_key(record);
-                    let answer = check_packed_key(record, &candidate, worst, 1, &[order], &registry);
-                    if candidate[0].is_null() {
-                        assert!(answer, "a NaN key is a NULL key");
-                    }
-                }
-                assert_eq!(decode_packed_key(&reserved), vec![SqliteValue::Null]);
-                assert_eq!(
-                    compare_packed_sorter_key(
-                        &reserved,
-                        worst,
-                        1,
-                        &[order],
-                        &[None],
-                        TextEncoding::Utf8
-                    ),
-                    None,
-                    "a reserved serial type takes the decoder"
-                );
-            }
-        }
-
-        assert!(answered > 0);
-    }
-
-    #[test]
-    fn test_packed_sorter_key_compare_leaves_what_it_does_not_take_to_the_decoder() {
-        let utf8 = TextEncoding::Utf8;
-        let asc = [SortKeyOrder::Asc];
-        let a = serialize_record(&[SqliteValue::Text("a".into())]);
-        let text_b = [SqliteValue::Text("b".into())];
-
-        assert_eq!(
-            compare_packed_sorter_key(&a, &text_b, 1, &asc, &[None], utf8),
-            Some(Ordering::Less)
-        );
-        // TEXT under a collation, TEXT in a UTF-16 database, TEXT against a
-        // number, and a BLOB key.
-        assert_eq!(
-            compare_packed_sorter_key(&a, &text_b, 1, &asc, &[Some("NOCASE".to_owned())], utf8),
-            None
-        );
-        assert_eq!(
-            compare_packed_sorter_key(&a, &text_b, 1, &asc, &[None], TextEncoding::Utf16le),
-            None
-        );
-        assert_eq!(
-            compare_packed_sorter_key(&a, &[SqliteValue::Integer(1)], 1, &asc, &[None], utf8),
-            None
-        );
-        let blob = serialize_record(&[SqliteValue::Blob(Arc::from(&[1_u8][..]))]);
-        assert_eq!(
-            compare_packed_sorter_key(&blob, &[SqliteValue::Integer(1)], 1, &asc, &[None], utf8),
-            None
-        );
-        // A collation does not apply to a number, which is still answered.
-        let one = serialize_record(&[SqliteValue::Integer(1)]);
-        assert_eq!(
-            compare_packed_sorter_key(
-                &one,
-                &[SqliteValue::Integer(2)],
-                1,
-                &asc,
-                &[Some("NOCASE".to_owned())],
-                utf8
-            ),
-            Some(Ordering::Less)
-        );
-        // Nine columns: well formed, but past the column limit.
-        let nine = serialize_record(&vec![SqliteValue::Integer(1); 9]);
-        assert!(fsqlite_types::record::parse_record_with_encoding(&nine, utf8).is_some());
-        assert_eq!(
-            compare_packed_sorter_key(&nine, &[SqliteValue::Integer(2)], 1, &asc, &[None], utf8),
-            None
-        );
-        // Records the decoder rejects: empty, a header longer than the record,
-        // a body shorter than its header says, a trailing byte, and serial
-        // type varints cut off by the header's end.
-        let malformed: [&[u8]; 6] = [&[], &[5, 1], &[2, 1], &[2, 1, 5, 0], &[2, 0x81], &[0x80]];
-        for record in malformed {
-            assert!(
-                fsqlite_types::record::parse_record_with_encoding(record, utf8).is_none(),
-                "{record:?} should be malformed"
-            );
-            assert_eq!(
-                compare_packed_sorter_key(record, &[SqliteValue::Integer(2)], 1, &asc, &[None], utf8),
-                None,
-                "{record:?}"
-            );
-        }
-    }
-
-    fn packed_top_n_verdicts() -> u64 {
-        FSQLITE_VDBE_PACKED_TOP_N_VERDICTS_TOTAL.with(Cell::get)
-    }
-
     /// Run top-N preflights against a full bound-2 heap holding `row-5` and
     /// `row-9` under the sorter order `p4` (`-` for DESC, `-|NOCASE` adds a
-    /// collation); one result row per candidate, 1 when it is kept. Returns
-    /// the results and how many preflights were decided from the packed key.
-    fn run_top_n_preflight_candidates(p4: &str) -> (Vec<Vec<SqliteValue>>, u64) {
-        let before = packed_top_n_verdicts();
-        let rows = run_program(|b| {
+    /// collation); one result row per candidate, 1 when it is kept. Each
+    /// preflight judges its key register; none builds a record.
+    fn run_top_n_preflight_candidates(p4: &str) -> Vec<Vec<SqliteValue>> {
+        run_program(|b| {
             let end = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
             let r_bound = b.alloc_reg();
@@ -40630,38 +44370,111 @@ mod tests {
                 b.emit_op(Opcode::SorterInsert, 0, r_record, 0, P4::None, 0);
             }
 
-            // (candidate, read from a copied register instead of the sideband)
+            // (candidate, read from a copy of the key register). A key of
+            // None is NULL; an Integer key is below every TEXT key.
             let candidates = [
-                (Some("row-7"), false),
-                (Some("row-1"), false),
-                (Some("row-5"), false),
-                (Some("row-8"), true),
+                (Some(SqliteValue::Text("row-7".into())), false),
+                (Some(SqliteValue::Text("row-1".into())), false),
+                (Some(SqliteValue::Text("row-5".into())), false),
+                (Some(SqliteValue::Text("row-8".into())), true),
                 (None, false),
+                (Some(SqliteValue::Integer(5)), false),
+                (Some(SqliteValue::Text("ROW-7".into())), false),
             ];
-            for (candidate, copied) in candidates {
-                match candidate {
-                    Some(text) => {
-                        b.emit_op(Opcode::String8, 0, r_key, 0, P4::Str(text.to_owned()), 0);
-                    }
-                    None => {
-                        b.emit_op(Opcode::Null, 0, r_key, 0, P4::None, 0);
-                    }
-                }
-                b.emit_op(Opcode::MakeRecord, r_key, 1, r_record, P4::None, 0);
-                let probe = if copied {
-                    b.emit_op(Opcode::Copy, r_record, r_copy, 0, P4::None, 0);
-                    r_copy
-                } else {
-                    r_record
-                };
+            let emit_verdict = |b: &mut ProgramBuilder, key_reg: i32| {
                 let rejected = b.emit_label();
                 let done = b.emit_label();
                 b.emit_jump_to_label(
                     Opcode::SorterCompare,
                     0,
-                    probe,
+                    key_reg,
                     rejected,
-                    P4::None,
+                    P4::Int(1),
+                    SORTER_COMPARE_TOP_N_PREFLIGHT,
+                );
+                b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+                b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+                b.resolve_label(rejected);
+                b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+                b.resolve_label(done);
+                b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            };
+            for (candidate, copied) in candidates {
+                match candidate {
+                    Some(SqliteValue::Text(text)) => {
+                        b.emit_op(
+                            Opcode::String8,
+                            0,
+                            r_key,
+                            0,
+                            P4::Str(text.as_str().to_owned()),
+                            0,
+                        );
+                    }
+                    Some(SqliteValue::Integer(value)) => {
+                        let value = i32::try_from(value).unwrap_or(0);
+                        b.emit_op(Opcode::Integer, value, r_key, 0, P4::None, 0);
+                    }
+                    _ => {
+                        b.emit_op(Opcode::Null, 0, r_key, 0, P4::None, 0);
+                    }
+                }
+                let key_reg = if copied {
+                    b.emit_op(Opcode::Copy, r_key, r_copy, 0, P4::None, 0);
+                    r_copy
+                } else {
+                    r_key
+                };
+                emit_verdict(b, key_reg);
+            }
+            // A key register that holds MakeRecord's armed sideband is judged
+            // as the BLOB it stands for, which sorts above every TEXT key.
+            b.emit_op(Opcode::String8, 0, r_key, 0, P4::Str("row-0".to_owned()), 0);
+            b.emit_op(Opcode::MakeRecord, r_key, 1, r_record, P4::None, 0);
+            emit_verdict(b, r_record);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        })
+    }
+
+    /// A two-column top-N preflight reads both key registers: a bound-1
+    /// heap ordered `a ASC, b DESC` holding (2, 'm') keeps (1, 'a'), turns
+    /// away (2, 'a') and the tie (2, 'm'), and keeps (2, 'z') on its second
+    /// key.
+    #[test]
+    fn test_top_n_preflight_judges_every_key_register() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_bound = b.alloc_reg();
+            let r_a = b.alloc_reg();
+            let r_b = b.alloc_reg();
+            let r_record = b.alloc_reg();
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 1, r_bound, 0, P4::None, 0);
+            b.emit_op(
+                Opcode::SorterOpen,
+                0,
+                2,
+                r_bound,
+                P4::Str("+-".to_owned()),
+                SORTER_OPEN_TOP_N_REGISTER,
+            );
+            b.emit_op(Opcode::Integer, 2, r_a, 0, P4::None, 0);
+            b.emit_op(Opcode::String8, 0, r_b, 0, P4::Str("m".to_owned()), 0);
+            b.emit_op(Opcode::MakeRecord, r_a, 2, r_record, P4::None, 0);
+            b.emit_op(Opcode::SorterInsert, 0, r_record, 0, P4::None, 0);
+            for (a, text) in [(1, "a"), (2, "a"), (2, "m"), (2, "z")] {
+                b.emit_op(Opcode::Integer, a, r_a, 0, P4::None, 0);
+                b.emit_op(Opcode::String8, 0, r_b, 0, P4::Str(text.to_owned()), 0);
+                let rejected = b.emit_label();
+                let done = b.emit_label();
+                b.emit_jump_to_label(
+                    Opcode::SorterCompare,
+                    0,
+                    r_a,
+                    rejected,
+                    P4::Int(2),
                     SORTER_COMPARE_TOP_N_PREFLIGHT,
                 );
                 b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
@@ -40671,57 +44484,29 @@ mod tests {
                 b.resolve_label(done);
                 b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
             }
-            // An integer candidate: below every TEXT key, so worse under DESC.
-            b.emit_op(Opcode::Integer, 5, r_key, 0, P4::None, 0);
-            b.emit_op(Opcode::MakeRecord, r_key, 1, r_record, P4::None, 0);
-            let rejected = b.emit_label();
-            let done = b.emit_label();
-            b.emit_jump_to_label(
-                Opcode::SorterCompare,
-                0,
-                r_record,
-                rejected,
-                P4::None,
-                SORTER_COMPARE_TOP_N_PREFLIGHT,
-            );
-            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
-            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
-            b.resolve_label(rejected);
-            b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
-            b.resolve_label(done);
-            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
-        (rows, packed_top_n_verdicts() - before)
+        let kept: Vec<i64> = rows.iter().map(|row| row[0].to_integer()).collect();
+        assert_eq!(kept, vec![1, 0, 0, 1]);
     }
 
     #[test]
-    fn test_top_n_preflight_decides_from_the_packed_key_and_leaves_collations_to_the_decoder() {
-        let _guard = VDBE_OBSERVABILITY_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let metrics_were_enabled = vdbe_metrics_enabled();
-        set_vdbe_metrics_enabled(false);
-
-        // Kept: row-7 (above the worst, row-5) and row-8 (from a copied
-        // register). Rejected: row-1, the tie row-5, NULL (last under DESC)
-        // and the integer 5.
-        let expected: Vec<Vec<SqliteValue>> = [1, 0, 0, 1, 0, 0]
-            .into_iter()
-            .map(|kept| vec![SqliteValue::Integer(kept)])
-            .collect();
-
-        let (binary_rows, binary_packed) = run_top_n_preflight_candidates("-");
-        let (nocase_rows, nocase_packed) = run_top_n_preflight_candidates("-|NOCASE");
-        set_vdbe_metrics_enabled(metrics_were_enabled);
-
-        assert_eq!(binary_rows, expected);
-        assert_eq!(binary_packed, 6, "every BINARY preflight reads the packed key");
-        assert_eq!(nocase_rows, expected);
+    fn test_top_n_preflight_judges_key_registers_under_the_sorter_collation() {
+        let kept = |rows: Vec<Vec<SqliteValue>>| -> Vec<i64> {
+            rows.iter().map(|row| row[0].to_integer()).collect()
+        };
+        // Kept: row-7 (above the worst, row-5), row-8 (from a copied
+        // register) and the record BLOB. Rejected: row-1, the tie row-5, NULL
+        // (last under DESC) and the integer 5. ROW-7 is below row-5 in BINARY
+        // order and above it under NOCASE.
         assert_eq!(
-            nocase_packed, 0,
-            "a sorter with a collation leaves every preflight to the decoder"
+            kept(run_top_n_preflight_candidates("-")),
+            vec![1, 0, 0, 1, 0, 0, 0, 1]
+        );
+        assert_eq!(
+            kept(run_top_n_preflight_candidates("-|NOCASE")),
+            vec![1, 0, 0, 1, 0, 0, 1, 1]
         );
     }
 
@@ -41581,7 +45366,7 @@ mod tests {
         // - counter == 1: decrement to 0, jump to p2
         // - counter == 0: fall through (no write, no jump)
         //
-        // `ResultRow` drains its source registers via `take_reg_range`, so
+        // `ResultRow` drains its source registers via `take_reg_range_into`, so
         // the asserts below reflect that move-out.
         //
         // Trace (r_counter seeded to 2, r_hit to 0):
@@ -41643,7 +45428,7 @@ mod tests {
         // - val == 0: fall through (no write, no jump)
         // - val < 0: fall through (no write, no jump)
         //
-        // `ResultRow` drains its source register via `take_reg_range`, so
+        // `ResultRow` drains its source register via `take_reg_range_into`, so
         // the asserts below reflect that move-out.
         //
         // Trace (r_offset seeded to 2, r_hit to 0; each IfPos has p3=1):
@@ -41708,7 +45493,7 @@ mod tests {
         // mutates the source register, so the seeded value stays put
         // across each IsNull dispatch.
         //
-        // `ResultRow` drains its source register via `take_reg_range`,
+        // `ResultRow` drains its source register via `take_reg_range_into`,
         // so the asserts below reflect that move-out.
         //
         // Trace (r_null seeded to NULL, r_int seeded to 7, r_hit to 0):
@@ -42138,6 +45923,16 @@ mod tests {
         cancel_on_filter: bool,
         interrupt_on_filter: bool,
         cancel_on_column: Option<Cx>,
+        faults: Option<MockVtabFaults>,
+    }
+
+    /// Module errors a [`MockVtabCursor`] raises, and a count of its column
+    /// and next calls.
+    #[derive(Clone)]
+    struct MockVtabFaults {
+        column_fails_on_row: Option<usize>,
+        next_fails_on_row: Option<usize>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl MockVtabCursor {
@@ -42150,6 +45945,14 @@ mod tests {
                 cancel_on_filter: false,
                 interrupt_on_filter: false,
                 cancel_on_column: None,
+                faults: None,
+            }
+        }
+
+        fn with_faults(rows: Vec<Vec<SqliteValue>>, faults: MockVtabFaults) -> Self {
+            Self {
+                faults: Some(faults),
+                ..Self::new(rows)
             }
         }
 
@@ -42165,6 +45968,7 @@ mod tests {
                 cancel_on_filter: false,
                 interrupt_on_filter: false,
                 cancel_on_column: None,
+                faults: None,
             }
         }
 
@@ -42177,6 +45981,7 @@ mod tests {
                 cancel_on_filter: true,
                 interrupt_on_filter: false,
                 cancel_on_column: None,
+                faults: None,
             }
         }
 
@@ -42189,6 +45994,7 @@ mod tests {
                 cancel_on_filter: false,
                 interrupt_on_filter: true,
                 cancel_on_column: None,
+                faults: None,
             }
         }
 
@@ -42201,6 +46007,7 @@ mod tests {
                 cancel_on_filter: false,
                 interrupt_on_filter: false,
                 cancel_on_column: Some(cancel_cx),
+                faults: None,
             }
         }
     }
@@ -42232,6 +46039,14 @@ mod tests {
             Ok(())
         }
         fn next(&mut self, _cx: &Cx) -> Result<()> {
+            if let Some(faults) = &self.faults {
+                faults
+                    .calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if faults.next_fails_on_row == Some(self.pos) {
+                    return Err(FrankenError::internal("mock next failed"));
+                }
+            }
             self.pos += 1;
             Ok(())
         }
@@ -42241,6 +46056,14 @@ mod tests {
         fn column(&self, ctx: &mut ColumnContext, col: i32) -> Result<()> {
             if let Some(cancel_cx) = &self.cancel_on_column {
                 cancel_cx.cancel();
+            }
+            if let Some(faults) = &self.faults {
+                faults
+                    .calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if faults.column_fails_on_row == Some(self.pos) {
+                    return Err(FrankenError::internal("mock column failed"));
+                }
             }
             #[allow(clippy::cast_sign_loss)]
             let val = self
@@ -42666,6 +46489,102 @@ mod tests {
                 vec![SqliteValue::Integer(20), SqliteValue::Text("b".into())],
             ]
         );
+    }
+
+    /// A module error from a `VColumn` or `VNext` the synchronous lane runs
+    /// (bd-w4pr1.13.21, lever S) ends the program with the main arm's outcome
+    /// and text, after the rows before it, and the failing call is made once.
+    #[test]
+    fn test_vcolumn_vnext_module_errors_report_once_from_the_main_arm() {
+        let rows_in = vec![
+            vec![SqliteValue::Integer(10)],
+            vec![SqliteValue::Integer(20)],
+            vec![SqliteValue::Integer(30)],
+        ];
+        let scan = |b: &mut ProgramBuilder| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r1 = b.alloc_reg();
+            let done_label = b.emit_label();
+            let loop_label = b.emit_label();
+            b.emit_op(Opcode::VOpen, 0, 0, 0, P4::None, 0);
+            emit_vfilter_noargs(b, 0, done_label);
+            b.resolve_label(loop_label);
+            b.emit_op(Opcode::VColumn, 0, 0, r1, P4::None, 0);
+            b.emit_op(Opcode::MustBeInt, r1, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r1, 1, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::VNext, 0, 0, loop_label, P4::None, 0);
+            b.resolve_label(done_label);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        };
+        for (column_fails_on_row, next_fails_on_row, opcode, message, rows_out, calls) in [
+            (Some(1), None, "VColumn", "mock column failed", 1, 3),
+            (None, Some(1), "VNext", "mock next failed", 2, 4),
+            (None, None, "", "", 3, 6),
+        ] {
+            let faults = MockVtabFaults {
+                column_fails_on_row,
+                next_fails_on_row,
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            };
+            let cursor = MockVtabCursor::with_faults(rows_in.clone(), faults.clone());
+            let (rows, outcome) = run_vtab_program(0, cursor, scan);
+            assert_eq!(rows, rows_in[..rows_out].to_vec(), "{opcode} rows");
+            let expected = if opcode.is_empty() {
+                ExecOutcome::Done
+            } else {
+                ExecOutcome::Error {
+                    code: 1,
+                    message: format!("{opcode} error: {}", FrankenError::internal(message)),
+                }
+            };
+            assert_eq!(outcome, expected, "{opcode} outcome");
+            assert_eq!(
+                faults.calls.load(std::sync::atomic::Ordering::Relaxed),
+                calls,
+                "{opcode}: each module call is made once"
+            );
+        }
+    }
+
+    /// `CursorIdSet` answers as the `HashSet<i32>` it replaced
+    /// (bd-w4pr1.13.20, lever D), past its inline capacity too.
+    #[test]
+    fn test_cursor_id_set_matches_hash_set() {
+        let mut set = CursorIdSet::default();
+        let mut model = HashSet::new();
+        let ops: &[(bool, i32)] = &[
+            (true, 3),
+            (true, 3),
+            (true, -1),
+            (false, 7),
+            (true, 0),
+            (true, 9),
+            (true, 12),
+            (true, 40),
+            (false, 3),
+            (false, 3),
+            (true, 3),
+            (false, -1),
+            (false, 40),
+            (true, 41),
+        ];
+        for &(insert, id) in ops {
+            if insert {
+                assert_eq!(set.insert(id), model.insert(id), "insert {id}");
+            } else {
+                assert_eq!(set.remove(id), model.remove(&id), "remove {id}");
+            }
+            assert_eq!(set.is_empty(), model.is_empty());
+            for probe in -2..45 {
+                let held = set.0.contains(&probe);
+                assert_eq!(held, model.contains(&probe), "membership of {probe}");
+            }
+        }
+        set.clear();
+        assert!(set.is_empty());
+        assert!(!set.remove(3));
     }
 
     #[test]

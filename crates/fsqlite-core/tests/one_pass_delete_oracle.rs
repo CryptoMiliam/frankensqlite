@@ -104,6 +104,234 @@ const FK_SELF: &[&str] = &[
     "INSERT INTO t VALUES (1, NULL, 0), (2, 1, 1), (3, 2, 0), (4, NULL, 1), (5, 4, 0), (6, 5, 1), (7, NULL, 0)",
 ];
 
+// bd-fqud7 / bd-n8g76: FK programs have observable per-parent ordering even
+// when the parent itself has no triggers. A child's trigger must see later
+// parents still present, and a cascade may remove a later DELETE target.
+const FK_CASCADE_ORDER: &[&str] = &[
+    "PRAGMA foreign_keys = ON",
+    "CREATE TABLE p(id INTEGER PRIMARY KEY)",
+    "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE CASCADE)",
+    "CREATE TABLE audit(seq INTEGER PRIMARY KEY, child INTEGER, parents INTEGER)",
+    "INSERT INTO p VALUES (1), (2), (3)",
+    "INSERT INTO c VALUES (10, 1), (11, 1), (20, 2), (30, 3)",
+    "CREATE TRIGGER c_bd BEFORE DELETE ON c BEGIN \
+     INSERT INTO audit(child, parents) VALUES (old.id, (SELECT count(*) FROM p)); END",
+];
+const FK_CASCADE_ORDER_STATE: &[&str] = &[
+    "SELECT changes(), total_changes()",
+    "SELECT * FROM p ORDER BY id",
+    "SELECT * FROM c ORDER BY id",
+    "SELECT child, parents FROM audit ORDER BY seq",
+    "PRAGMA foreign_key_check",
+    "PRAGMA integrity_check",
+];
+const FK_SET_NULL_ORDER: &[&str] = &[
+    "PRAGMA foreign_keys = ON",
+    "CREATE TABLE p(id INTEGER PRIMARY KEY)",
+    "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE SET NULL)",
+    "CREATE TABLE audit(seq INTEGER PRIMARY KEY, child INTEGER, old_pid INTEGER, new_pid INTEGER, parents INTEGER)",
+    "INSERT INTO p VALUES (1), (2), (3)",
+    "INSERT INTO c VALUES (10, 1), (20, 2), (30, 3)",
+    "CREATE TRIGGER c_bu BEFORE UPDATE ON c BEGIN \
+     INSERT INTO audit(child, old_pid, new_pid, parents) \
+     VALUES (old.id, old.pid, new.pid, (SELECT count(*) FROM p)); END",
+];
+const FK_SET_DEFAULT_ORDER: &[&str] = &[
+    "PRAGMA foreign_keys = ON",
+    "CREATE TABLE p(id INTEGER PRIMARY KEY)",
+    "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER DEFAULT 3 REFERENCES p(id) ON DELETE SET DEFAULT)",
+    "CREATE TABLE audit(seq INTEGER PRIMARY KEY, child INTEGER, old_pid INTEGER, new_pid INTEGER, parents INTEGER)",
+    "INSERT INTO p VALUES (1), (2), (3)",
+    "INSERT INTO c VALUES (10, 1), (20, 2), (30, 3)",
+    "CREATE TRIGGER c_bu BEFORE UPDATE ON c BEGIN \
+     INSERT INTO audit(child, old_pid, new_pid, parents) \
+     VALUES (old.id, old.pid, new.pid, (SELECT count(*) FROM p)); END",
+];
+const FK_SET_ORDER_STATE: &[&str] = &[
+    "SELECT changes(), total_changes()",
+    "SELECT * FROM p ORDER BY id",
+    "SELECT * FROM c ORDER BY id",
+    "SELECT child, old_pid, new_pid, parents FROM audit ORDER BY seq",
+    "PRAGMA foreign_key_check",
+    "PRAGMA integrity_check",
+];
+const FK_WITHOUT_ROWID_ORDER: &[&str] = &[
+    "PRAGMA foreign_keys = ON",
+    "CREATE TABLE p(kind TEXT, id INTEGER, PRIMARY KEY(kind, id)) WITHOUT ROWID",
+    "CREATE TABLE c(id INTEGER PRIMARY KEY, kind TEXT, pid INTEGER, \
+     FOREIGN KEY(kind, pid) REFERENCES p(kind, id) ON DELETE CASCADE) WITHOUT ROWID",
+    "CREATE TABLE audit(seq INTEGER PRIMARY KEY, child INTEGER, parents INTEGER)",
+    "INSERT INTO p VALUES ('a', 1), ('a', 2), ('b', 1)",
+    "INSERT INTO c VALUES (10, 'a', 1), (20, 'a', 2), (30, 'b', 1)",
+    "CREATE TRIGGER c_bd BEFORE DELETE ON c BEGIN \
+     INSERT INTO audit(child, parents) VALUES (old.id, (SELECT count(*) FROM p)); END",
+];
+const FK_WITHOUT_ROWID_ORDER_STATE: &[&str] = &[
+    "SELECT changes(), total_changes()",
+    "SELECT * FROM p ORDER BY kind, id",
+    "SELECT * FROM c ORDER BY id",
+    "SELECT child, parents FROM audit ORDER BY seq",
+    "PRAGMA foreign_key_check",
+    "PRAGMA integrity_check",
+];
+const FK_NESTED_CASCADE_ORDER: &[&str] = &[
+    "PRAGMA foreign_keys = ON",
+    "CREATE TABLE g(id INTEGER PRIMARY KEY)",
+    "CREATE TABLE p(id INTEGER PRIMARY KEY, gid INTEGER REFERENCES g(id) ON DELETE CASCADE)",
+    "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE CASCADE)",
+    "CREATE TABLE audit(seq INTEGER PRIMARY KEY, child INTEGER, parents INTEGER)",
+    "INSERT INTO g VALUES (1)",
+    "INSERT INTO p VALUES (10, 1), (20, 1)",
+    "INSERT INTO c VALUES (100, 10), (200, 20)",
+    "CREATE TRIGGER c_bd BEFORE DELETE ON c BEGIN \
+     INSERT INTO audit(child, parents) VALUES (old.id, (SELECT count(*) FROM p)); END",
+];
+const FK_ACTION_CASES: &[Case] = &[
+    // Direct changes belong to the whole DELETE and become visible only
+    // when it finishes, even if an action-capable FK has no child rows.
+    Case {
+        setup: &[
+            "PRAGMA foreign_keys = ON",
+            "CREATE TABLE p(id INTEGER PRIMARY KEY)",
+            "CREATE TABLE c(pid INTEGER REFERENCES p(id) ON DELETE CASCADE)",
+            "INSERT INTO p VALUES (1), (2)",
+        ],
+        statement: "DELETE FROM p RETURNING id, changes(), total_changes()",
+        states: &[
+            "SELECT changes(), total_changes()",
+            "SELECT * FROM p ORDER BY id",
+            "PRAGMA foreign_key_check",
+        ],
+    },
+    // Completed child actions and trigger statements do contribute to
+    // total_changes() while earlier direct parent deletions stay pending.
+    Case {
+        setup: &[
+            "PRAGMA foreign_keys = ON",
+            "CREATE TABLE p(id INTEGER PRIMARY KEY)",
+            "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE CASCADE)",
+            "CREATE TABLE audit(seq INTEGER PRIMARY KEY, stage TEXT, child INTEGER, changed INTEGER, total INTEGER)",
+            "INSERT INTO p VALUES (1), (2)",
+            "INSERT INTO c VALUES (10, 1), (20, 2)",
+            "CREATE TRIGGER c_bd BEFORE DELETE ON c BEGIN \
+             INSERT INTO audit(stage, child, changed, total) \
+             VALUES ('before', old.id, changes(), total_changes()); END",
+            "CREATE TRIGGER c_ad AFTER DELETE ON c BEGIN \
+             INSERT INTO audit(stage, child, changed, total) \
+             VALUES ('after', old.id, changes(), total_changes()); END",
+        ],
+        statement: "DELETE FROM p",
+        states: &[
+            "SELECT changes(), total_changes()",
+            "SELECT stage, child, changed, total FROM audit ORDER BY seq",
+            "SELECT * FROM p ORDER BY id",
+            "SELECT * FROM c ORDER BY id",
+            "PRAGMA foreign_key_check",
+            "PRAGMA integrity_check",
+        ],
+    },
+    Case {
+        setup: FK_SELF,
+        statement: "DELETE FROM t WHERE k = 1",
+        states: &[
+            "SELECT changes(), total_changes()",
+            "SELECT * FROM t ORDER BY id",
+            "PRAGMA foreign_key_check",
+        ],
+    },
+    Case {
+        setup: FK_SELF,
+        statement: "DELETE FROM t WHERE k = 1 RETURNING id, parent, changes(), total_changes()",
+        states: &[
+            "SELECT changes(), total_changes()",
+            "SELECT * FROM t ORDER BY id",
+            "PRAGMA foreign_key_check",
+        ],
+    },
+    Case {
+        setup: FK_CASCADE_ORDER,
+        statement: "DELETE FROM p WHERE id < 3",
+        states: FK_CASCADE_ORDER_STATE,
+    },
+    Case {
+        setup: FK_CASCADE_ORDER,
+        statement: "DELETE FROM p WHERE id < 3 RETURNING id, changes(), total_changes()",
+        states: FK_CASCADE_ORDER_STATE,
+    },
+    Case {
+        setup: FK_SET_NULL_ORDER,
+        statement: "DELETE FROM p WHERE id < 3",
+        states: FK_SET_ORDER_STATE,
+    },
+    Case {
+        setup: FK_SET_DEFAULT_ORDER,
+        statement: "DELETE FROM p WHERE id < 3",
+        states: FK_SET_ORDER_STATE,
+    },
+    Case {
+        setup: FK_WITHOUT_ROWID_ORDER,
+        statement: "DELETE FROM p WHERE kind = 'a'",
+        states: FK_WITHOUT_ROWID_ORDER_STATE,
+    },
+    // The outer DELETE pins one row; only its nested FK program deletes
+    // multiple parents. Propagation must retain row order at cascade depth > 0.
+    Case {
+        setup: FK_NESTED_CASCADE_ORDER,
+        statement: "DELETE FROM g WHERE id = 1",
+        states: FK_CASCADE_ORDER_STATE,
+    },
+    Case {
+        setup: FK_NESTED_CASCADE_ORDER,
+        statement: "DELETE FROM g WHERE id = 1 RETURNING id, changes(), total_changes()",
+        states: FK_CASCADE_ORDER_STATE,
+    },
+    Case {
+        setup: &[
+            "PRAGMA foreign_keys = ON",
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id) ON DELETE CASCADE, k INTEGER)",
+            "INSERT INTO t VALUES (1, NULL, 0), (2, 1, 1), (3, 2, 0), (4, NULL, 1), (5, 4, 0), (6, 5, 1), (7, NULL, 0)",
+            "BEGIN",
+            "SAVEPOINT before_delete",
+        ],
+        statement: "DELETE FROM t WHERE k = 1",
+        states: &[
+            "SELECT changes(), total_changes()",
+            "SELECT * FROM t ORDER BY id",
+            "ROLLBACK TO before_delete",
+            "SELECT * FROM t ORDER BY id",
+            "RELEASE before_delete",
+            "COMMIT",
+            "PRAGMA foreign_key_check",
+            "PRAGMA integrity_check",
+        ],
+    },
+    Case {
+        setup: &[
+            "PRAGMA foreign_keys = ON",
+            "CREATE TABLE p(id INTEGER PRIMARY KEY)",
+            "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE CASCADE)",
+            "CREATE TABLE audit(id INTEGER)",
+            "INSERT INTO p VALUES (1), (2), (3)",
+            "INSERT INTO c VALUES (10, 1), (20, 2), (30, 3)",
+            "CREATE TRIGGER c_bd BEFORE DELETE ON c WHEN old.id = 20 \
+             BEGIN SELECT RAISE(ABORT, 'stop second cascade'); END",
+            "CREATE TRIGGER c_ad AFTER DELETE ON c \
+             BEGIN INSERT INTO audit VALUES (old.id); END",
+            "BEGIN",
+            "INSERT INTO audit VALUES (99)",
+        ],
+        statement: "DELETE FROM p WHERE id < 3",
+        states: &[
+            "SELECT * FROM p ORDER BY id",
+            "SELECT * FROM c ORDER BY id",
+            "SELECT * FROM audit ORDER BY rowid",
+            "COMMIT",
+            "PRAGMA foreign_key_check",
+            "PRAGMA integrity_check",
+        ],
+    },
+];
+
 const WITHOUT_ROWID: &[&str] = &[
     "CREATE TABLE t(k INTEGER PRIMARY KEY, v TEXT) WITHOUT ROWID",
     "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e'), (6, 'f')",
@@ -234,6 +462,159 @@ const CASES: &[Case] = &[
         setup: WITHOUT_ROWID,
         statement: "DELETE FROM t WHERE k % 2 = 0",
         states: WITHOUT_ROWID_STATE,
+    },
+];
+
+/// Lever SD (bd-w4pr1.13.20): a plain DELETE's row on a leaf the transaction
+/// already holds staged is deleted on the synchronous lane. MANY's rows with
+/// a partial and an expression index, so each deleted row also loses its
+/// index entries.
+const SD_INDEXED: &[&str] = &[
+    "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)",
+    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3000) \
+     INSERT INTO t SELECT i, (i * 7919) % 1000, printf('%0100d', i) FROM n",
+    "CREATE INDEX t_p ON t(a) WHERE a > 500",
+    "CREATE INDEX t_e ON t(a + length(b))",
+];
+const SD_INDEXED_STATE: &[&str] = &[
+    "SELECT changes(), total_changes()",
+    "SELECT count(*), sum(id), sum(a) FROM t",
+    "SELECT count(*), sum(id) FROM t INDEXED BY t_p WHERE a > 500",
+    "SELECT count(*), sum(id) FROM t INDEXED BY t_e WHERE a + length(b) > 0",
+    "PRAGMA integrity_check",
+];
+const SD_STATE: &[&str] = &[
+    "SELECT changes(), total_changes()",
+    "SELECT count(*), sum(id), sum(a), min(id), max(id) FROM t",
+    "SELECT group_concat(id) FROM (SELECT id FROM t ORDER BY id LIMIT 40)",
+    "PRAGMA integrity_check",
+];
+/// The DELETE inside a transaction, under a savepoint the states roll back
+/// to: the rows removed in place come back, and a second DELETE commits.
+const SD_SAVEPOINT: &[&str] = &[
+    "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)",
+    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3000) \
+     INSERT INTO t SELECT i, (i * 7919) % 1000, printf('%0100d', i) FROM n",
+    "BEGIN",
+    "SAVEPOINT s1",
+];
+const SD_SAVEPOINT_STATE: &[&str] = &[
+    "SELECT changes(), total_changes(), count(*), sum(id) FROM t",
+    "ROLLBACK TO s1",
+    "SELECT count(*), sum(id) FROM t",
+    "DELETE FROM t WHERE id % 11 = 0",
+    "COMMIT",
+    "SELECT total_changes(), count(*), sum(id), sum(a) FROM t",
+    "PRAGMA integrity_check",
+];
+/// A WHERE with a correlated subquery over another table.
+const SD_CORRELATED: &[&str] = &[
+    "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)",
+    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3000) \
+     INSERT INTO t SELECT i, (i * 7919) % 1000, printf('%0100d', i) FROM n",
+    "CREATE TABLE u(k INTEGER PRIMARY KEY, m INTEGER)",
+    "INSERT INTO u VALUES (0, 900), (1, 100), (2, 500), (3, 0), (4, 999)",
+];
+
+const SD_CASES: &[Case] = &[
+    // Every third row stays: two deletes in a row on one leaf, with the
+    // cursor on the successor between them (a lane that forgot the pending
+    // Next would skip the second).
+    Case {
+        setup: MANY,
+        statement: "DELETE FROM t WHERE id % 3 <> 1",
+        states: SD_STATE,
+    },
+    // The scorecard's shape, with index entries to remove.
+    Case {
+        setup: SD_INDEXED,
+        statement: "DELETE FROM t WHERE id % 7 = 0",
+        states: SD_INDEXED_STATE,
+    },
+    Case {
+        setup: SD_SAVEPOINT,
+        statement: "DELETE FROM t WHERE id % 5 = 0",
+        states: SD_SAVEPOINT_STATE,
+    },
+    // Two passes: the second pass's SeekRowid + Delete take the lane.
+    Case {
+        setup: SD_CORRELATED,
+        statement: "DELETE FROM t WHERE a > (SELECT m FROM u WHERE u.k = t.id % 5)",
+        states: MANY_STATE,
+    },
+    Case {
+        setup: MANY,
+        statement: "DELETE FROM t WHERE id % 9 = 4 RETURNING id, a",
+        states: MANY_STATE,
+    },
+];
+
+/// Lever UR (bd-w4pr1.13.20): an UPDATE that keeps its rowid on a table
+/// without a UNIQUE index cannot conflict, and its Delete keeps no copy of the
+/// old row. The twin tables: `t` with a plain index only (the flag set), `u`
+/// with a UNIQUE index on a column the UPDATEs below may or may not touch (the
+/// flag absent; a conflict restores the old row).
+const UR_TWINS: &[&str] = &[
+    "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)",
+    "CREATE INDEX t_a ON t(a)",
+    "CREATE TABLE u(id INTEGER PRIMARY KEY, a INTEGER, b TEXT UNIQUE)",
+    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000) \
+     INSERT INTO t SELECT i, i % 13, 'k' || i FROM n",
+    "INSERT INTO u SELECT * FROM t",
+];
+const UR_STATE: &[&str] = &[
+    "SELECT count(*), sum(id), sum(a), sum(length(b)) FROM t",
+    "SELECT a, count(*) FROM t INDEXED BY t_a WHERE a >= 0 GROUP BY a ORDER BY a",
+    "SELECT count(*), sum(id), sum(a), sum(length(b)) FROM u",
+    "SELECT group_concat(b) FROM (SELECT b FROM u WHERE id % 97 = 0 ORDER BY id)",
+    "PRAGMA integrity_check",
+];
+
+const UR_CASES: &[Case] = &[
+    // The flag set: same-size rewrites, rows that grow (the deferred delete
+    // is materialized), and conflict clauses with nothing to conflict on.
+    Case {
+        setup: UR_TWINS,
+        statement: "UPDATE t SET a = a + 1 WHERE id % 10 = 0",
+        states: UR_STATE,
+    },
+    Case {
+        setup: UR_TWINS,
+        statement: "UPDATE t SET b = b || printf('%0200d', id) WHERE id % 7 = 0",
+        states: UR_STATE,
+    },
+    Case {
+        setup: UR_TWINS,
+        statement: "UPDATE OR IGNORE t SET b = 'k1' WHERE id % 13 = 5",
+        states: UR_STATE,
+    },
+    Case {
+        setup: UR_TWINS,
+        statement: "UPDATE OR REPLACE t SET a = NULL, b = 'k7' WHERE id % 13 = 5",
+        states: UR_STATE,
+    },
+    // The flag absent: a UNIQUE conflict under IGNORE keeps each old row,
+    // under REPLACE removes the victims, under ABORT fails mid-scan and rolls
+    // the statement back; an UPDATE of another column on that table.
+    Case {
+        setup: UR_TWINS,
+        statement: "UPDATE OR IGNORE u SET b = 'k1' WHERE id % 13 = 5",
+        states: UR_STATE,
+    },
+    Case {
+        setup: UR_TWINS,
+        statement: "UPDATE OR REPLACE u SET b = 'k7' WHERE id % 13 = 5",
+        states: UR_STATE,
+    },
+    Case {
+        setup: UR_TWINS,
+        statement: "UPDATE u SET b = 'k5' WHERE id > 3",
+        states: UR_STATE,
+    },
+    Case {
+        setup: UR_TWINS,
+        statement: "UPDATE u SET a = a * 2 WHERE id % 3 = 0",
+        states: UR_STATE,
     },
 ];
 
@@ -373,6 +754,311 @@ const UPDATE_CASES: &[Case] = &[
     },
 ];
 
+/// Rowid reads beside column reads of the same rows (bd-w4pr1.13.20, lever R:
+/// the scan's Rowid reads the leaf cell without the row-decode cache). The
+/// INTEGER PRIMARY KEY column `id` fills the cache's rowid for a row, so a
+/// Rowid that trusted the cache without checking the cursor's position would
+/// return the previous row's rowid after Next; Column reads after a Rowid on a
+/// moved, rewritten or regrown row must still see that row. `u` has an
+/// implicit rowid and rows that grow past their cell when rewritten.
+const ROWID_MIX: &[&str] = &[
+    "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)",
+    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1500) \
+     INSERT INTO t SELECT i * 3, i % 11, printf('%040d', i) FROM n",
+    "CREATE TABLE u(a INTEGER, b TEXT)",
+    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1500) \
+     INSERT INTO u SELECT i % 7, 'u' || i FROM n",
+];
+const ROWID_MIX_STATE: &[&str] = &[
+    "SELECT rowid, a, rowid, id, b, rowid FROM t WHERE rowid % 9 = 0 ORDER BY rowid",
+    "SELECT count(*), sum(rowid), sum(a * rowid), sum(id - rowid) FROM t WHERE a % 2 = rowid % 2",
+    "SELECT id, rowid, a, rowid FROM t WHERE id % 7 = 1 ORDER BY id",
+    "SELECT rowid, a, rowid, b FROM u WHERE rowid % 13 = 1 ORDER BY rowid",
+    "SELECT count(*), sum(rowid), sum(a + rowid), max(length(b)) FROM u WHERE a = rowid % 5",
+    "PRAGMA integrity_check",
+];
+
+const ROWID_CASES: &[Case] = &[
+    Case {
+        setup: ROWID_MIX,
+        statement: "UPDATE t SET a = a + rowid % 5 WHERE id % 4 = 0",
+        states: ROWID_MIX_STATE,
+    },
+    Case {
+        setup: ROWID_MIX,
+        statement: "UPDATE t SET b = b || rowid WHERE rowid % 6 = 0",
+        states: ROWID_MIX_STATE,
+    },
+    Case {
+        setup: ROWID_MIX,
+        statement: "DELETE FROM t WHERE rowid % 6 = 3",
+        states: ROWID_MIX_STATE,
+    },
+    Case {
+        setup: ROWID_MIX,
+        statement: "UPDATE u SET b = b || rowid || rowid WHERE rowid % 3 = 0",
+        states: ROWID_MIX_STATE,
+    },
+    Case {
+        setup: ROWID_MIX,
+        statement: "DELETE FROM u WHERE a = rowid % 7",
+        states: ROWID_MIX_STATE,
+    },
+];
+
+/// INSERT ... SELECT row bodies whose second Affinity (after CHECK and NOT
+/// NULL) still matters (bd-w4pr1.13.21, lever A): a NOT NULL ... ON CONFLICT
+/// REPLACE column stores its DEFAULT over a NULL, and each DEFAULT here has
+/// another storage class than its column (TEXT '7' into INTEGER, 3 into TEXT,
+/// '2.5' into REAL), so only the second Affinity gives the stored value the
+/// column's type; `d` has no constraint. `k` carries a CHECK over a row column,
+/// and `p` none of them (its second Affinity is skipped).
+const ROW_AFFINITY: &[&str] = &[
+    "CREATE TABLE r(id INTEGER PRIMARY KEY, \
+     a INTEGER NOT NULL ON CONFLICT REPLACE DEFAULT '7', \
+     b TEXT NOT NULL ON CONFLICT REPLACE DEFAULT 3, \
+     c REAL NOT NULL ON CONFLICT REPLACE DEFAULT '2.5', d)",
+    "CREATE TABLE k(id INTEGER PRIMARY KEY, a TEXT CHECK (length(a) >= 1 AND a <> 7), b NUMERIC)",
+    "CREATE TABLE p(id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c REAL, d NUMERIC)",
+    "CREATE TABLE src(x, y)",
+    "INSERT INTO src VALUES (NULL, NULL), (1, 'q'), (NULL, 'z'), ('8', NULL), (9, 10), ('3.0', '4.5')",
+];
+const ROW_AFFINITY_STATE: &[&str] = &[
+    "SELECT id, a, typeof(a), b, typeof(b), c, typeof(c), d, typeof(d) FROM r ORDER BY id",
+    "SELECT id, a, typeof(a), b, typeof(b) FROM k ORDER BY id",
+    "SELECT id, a, typeof(a), b, typeof(b), c, typeof(c), d, typeof(d) FROM p ORDER BY id",
+];
+
+/// Lever I (bd-w4pr1.13.21): an INSERT ... SELECT into a table with an
+/// INTEGER PRIMARY KEY uses the alias register as the rowid register. The
+/// sources give the alias NULL, an INTEGER, TEXT '7', REAL 8.0, a negative and
+/// a value the table holds already; CHECKs read the alias and the rowid, and a
+/// partial index covers the alias.
+const IPK_SETUP: &[&str] = &[
+    "CREATE TABLE s(k, v)",
+    "INSERT INTO s VALUES (NULL, 'n1'), (5, 'i5'), ('7', 't7'), (8.0, 'r8'), (-3, 'neg'), \
+     (NULL, 'n2'), (12, 'i12')",
+    "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT CHECK (id <> 99), \
+     w INTEGER DEFAULT 1 CHECK (rowid <> 98))",
+    "CREATE INDEX t_part ON t(id) WHERE id > 6",
+    "INSERT INTO t(id, v) VALUES (12, 'old12')",
+    "CREATE TABLE ta(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)",
+];
+const IPK_STATE: &[&str] = &[
+    "SELECT rowid, id, typeof(id), v, w FROM t ORDER BY rowid",
+    "SELECT count(*), sum(id) FROM t INDEXED BY t_part WHERE id > 6",
+    "SELECT rowid, id, v FROM ta ORDER BY rowid",
+    "SELECT seq FROM sqlite_sequence WHERE name = 'ta'",
+    "PRAGMA integrity_check",
+];
+
+const IPK_CASES: &[Case] = &[
+    Case {
+        setup: IPK_SETUP,
+        statement: "INSERT INTO t(id, v) SELECT k, v FROM s WHERE k IS NOT 12",
+        states: IPK_STATE,
+    },
+    Case {
+        setup: IPK_SETUP,
+        statement: "INSERT OR IGNORE INTO t(id, v) SELECT k, v FROM s",
+        states: IPK_STATE,
+    },
+    Case {
+        setup: IPK_SETUP,
+        statement: "INSERT OR REPLACE INTO t(id, v) SELECT k, v FROM s",
+        states: IPK_STATE,
+    },
+    // The duplicate 12 aborts the statement; 5.5 is not an integer key; the
+    // CHECKs on the alias and on the rowid.
+    Case {
+        setup: IPK_SETUP,
+        statement: "INSERT INTO t(id, v) SELECT k, v FROM s",
+        states: IPK_STATE,
+    },
+    Case {
+        setup: IPK_SETUP,
+        statement: "INSERT INTO t(id, v) SELECT k + 0.5, v FROM s WHERE k = 5",
+        states: IPK_STATE,
+    },
+    Case {
+        setup: IPK_SETUP,
+        statement: "INSERT INTO t(id, v) SELECT k + 94, v FROM s WHERE k = 5",
+        states: IPK_STATE,
+    },
+    Case {
+        setup: IPK_SETUP,
+        statement: "INSERT INTO t(id, v) SELECT k + 93, v FROM s WHERE k = 5",
+        states: IPK_STATE,
+    },
+    // The alias left out (every key generated), AUTOINCREMENT, RETURNING.
+    Case {
+        setup: IPK_SETUP,
+        statement: "INSERT INTO t(v) SELECT v FROM s",
+        states: IPK_STATE,
+    },
+    Case {
+        setup: IPK_SETUP,
+        statement: "INSERT INTO ta(id, v) SELECT k, v FROM s",
+        states: IPK_STATE,
+    },
+    Case {
+        setup: IPK_SETUP,
+        statement: "INSERT INTO t(id, v) SELECT k, v FROM s WHERE k IS NOT 12 RETURNING rowid, id, v",
+        states: IPK_STATE,
+    },
+    // Many rows from a recursive CTE, as the bulk row's generator.
+    Case {
+        setup: IPK_SETUP,
+        statement: "INSERT INTO t(id, v, w) WITH RECURSIVE n(i) AS (SELECT 20 UNION ALL \
+                    SELECT i + 1 FROM n WHERE i < 3000) SELECT i, 'g' || i, i % 7 FROM n",
+        states: IPK_STATE,
+    },
+];
+
+const ROW_AFFINITY_CASES: &[Case] = &[
+    Case {
+        setup: ROW_AFFINITY,
+        statement: "INSERT INTO r(a, b, c, d) SELECT x, y, x, y FROM src",
+        states: ROW_AFFINITY_STATE,
+    },
+    Case {
+        setup: ROW_AFFINITY,
+        statement: "INSERT INTO r(a, b, c, d) SELECT NULL, NULL, NULL, x FROM src",
+        states: ROW_AFFINITY_STATE,
+    },
+    Case {
+        setup: ROW_AFFINITY,
+        statement: "INSERT OR REPLACE INTO r(a, b, c, d) SELECT y, x, y, x FROM src",
+        states: ROW_AFFINITY_STATE,
+    },
+    Case {
+        setup: ROW_AFFINITY,
+        statement: "INSERT INTO k(a, b) SELECT y, x FROM src WHERE y IS NOT NULL AND x IS NOT NULL",
+        states: ROW_AFFINITY_STATE,
+    },
+    Case {
+        setup: ROW_AFFINITY,
+        statement: "INSERT INTO p(a, b, c, d) SELECT x, x, y, y FROM src",
+        states: ROW_AFFINITY_STATE,
+    },
+];
+
+/// UPDATE row bodies (bd-w4pr1.13.20, lever U): only unassigned columns are
+/// preloaded, a kept INTEGER PRIMARY KEY alias register is the re-insert's
+/// rowid (and the one-pass scan reads no rowid of its own on such a table),
+/// and the second Affinity runs only when a CHECK or a NOT NULL ... REPLACE
+/// column can change a register. `t` has an IPK alias and mixed storage
+/// classes, `u` an implicit rowid, `g` a STORED generated column over an
+/// unassigned column, `r` NOT NULL ... REPLACE columns whose DEFAULT has
+/// another storage class than the column, `k` a CHECK. A body that dropped
+/// an unassigned column's preload stores NULL there (and computes `g.s`
+/// from it); one that read the one-pass rowid from a skipped `Rowid` on `u`
+/// re-inserts at the wrong key; one that skipped the second Affinity on `r`
+/// stores TEXT '7' in the INTEGER column.
+const UPDATE_BODY: &[&str] = &[
+    "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c REAL, d)",
+    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 400) \
+     INSERT INTO t SELECT i, i % 9, 'b' || i, i * 0.5, \
+     CASE i % 4 WHEN 0 THEN NULL WHEN 1 THEN i WHEN 2 THEN 'd' || i ELSE x'0102' END FROM n",
+    "CREATE TABLE u(a INTEGER, b TEXT, c)",
+    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 400) \
+     INSERT INTO u SELECT i % 5, 'u' || i, i * 3 FROM n",
+    "CREATE TABLE g(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, \
+     s INTEGER GENERATED ALWAYS AS (a * 100 + b) STORED)",
+    "INSERT INTO g(id, a, b) SELECT id, a, id FROM t WHERE id <= 60",
+    "CREATE TABLE r(id INTEGER PRIMARY KEY, \
+     a INTEGER NOT NULL ON CONFLICT REPLACE DEFAULT '7', \
+     b TEXT NOT NULL ON CONFLICT REPLACE DEFAULT 3, \
+     c REAL NOT NULL ON CONFLICT REPLACE DEFAULT '2.5', d)",
+    "INSERT INTO r(id, a, b, c, d) SELECT id, a, b, c, d FROM t WHERE id <= 40",
+    "CREATE TABLE k(id INTEGER PRIMARY KEY, a TEXT CHECK (length(a) >= 1 AND a <> 7), b NUMERIC)",
+    "INSERT INTO k(id, a, b) SELECT id, 'k' || id, id FROM t WHERE id <= 40",
+];
+const UPDATE_BODY_STATE: &[&str] = &[
+    "SELECT rowid, id, a, typeof(a), b, typeof(b), c, typeof(c), d, typeof(d) FROM t ORDER BY id",
+    "SELECT rowid, a, typeof(a), b, c, typeof(c) FROM u ORDER BY rowid",
+    "SELECT id, a, b, s, typeof(s) FROM g ORDER BY id",
+    "SELECT id, a, typeof(a), b, typeof(b), c, typeof(c), d, typeof(d) FROM r ORDER BY id",
+    "SELECT id, a, typeof(a), b, typeof(b) FROM k ORDER BY id",
+    "PRAGMA integrity_check",
+];
+
+const UPDATE_BODY_CASES: &[Case] = &[
+    // Two columns swapped: each SET reads the old row, not a register.
+    Case {
+        setup: UPDATE_BODY,
+        statement: "UPDATE t SET a = b, b = a WHERE id % 3 = 0",
+        states: UPDATE_BODY_STATE,
+    },
+    Case {
+        setup: UPDATE_BODY,
+        statement: "UPDATE t SET (c, d) = (d, c) WHERE id % 5 = 1",
+        states: UPDATE_BODY_STATE,
+    },
+    // A SET that reads the column it assigns, a column assigned twice (the
+    // later one wins), and unassigned columns of every storage class kept.
+    Case {
+        setup: UPDATE_BODY,
+        statement: "UPDATE t SET c = c + 0.25, a = a + 1, a = a * 10 WHERE id % 4 = 2",
+        states: UPDATE_BODY_STATE,
+    },
+    // Affinity of the assigned value: TEXT into INTEGER / REAL, INTEGER into
+    // TEXT, the rowid read through its alias.
+    Case {
+        setup: UPDATE_BODY,
+        statement: "UPDATE t SET a = '0' || id, b = id, c = '1e1' WHERE id % 7 = 3",
+        states: UPDATE_BODY_STATE,
+    },
+    // RETURNING the rowid and the alias (two passes, the alias register as the
+    // re-insert rowid), on an alias table and on an implicit-rowid table.
+    Case {
+        setup: UPDATE_BODY,
+        statement: "UPDATE t SET b = 'r' || rowid WHERE id % 50 = 7 RETURNING rowid, id, a, b, d",
+        states: UPDATE_BODY_STATE,
+    },
+    Case {
+        setup: UPDATE_BODY,
+        statement: "UPDATE u SET b = b || '-' || rowid WHERE rowid % 60 = 1 RETURNING rowid, a, b, c",
+        states: UPDATE_BODY_STATE,
+    },
+    // One pass on the implicit-rowid table: the scan's own Rowid is the key.
+    Case {
+        setup: UPDATE_BODY,
+        statement: "UPDATE u SET c = c + rowid, a = a + 1 WHERE rowid % 3 = 0",
+        states: UPDATE_BODY_STATE,
+    },
+    // The alias assigned: the row moves to the new key.
+    Case {
+        setup: UPDATE_BODY,
+        statement: "UPDATE t SET id = id + 1000, a = -a WHERE id % 40 = 0",
+        states: UPDATE_BODY_STATE,
+    },
+    // A STORED generated column over an unassigned column.
+    Case {
+        setup: UPDATE_BODY,
+        statement: "UPDATE g SET a = a + 1 WHERE id % 2 = 0",
+        states: UPDATE_BODY_STATE,
+    },
+    // NOT NULL ... REPLACE: the DEFAULT replaces the NULL and the second
+    // Affinity gives it the column's type; and a plain assignment there.
+    Case {
+        setup: UPDATE_BODY,
+        statement: "UPDATE r SET a = NULL, b = NULL, c = NULL WHERE id % 3 = 0",
+        states: UPDATE_BODY_STATE,
+    },
+    Case {
+        setup: UPDATE_BODY,
+        statement: "UPDATE r SET a = '12', d = a WHERE id % 3 = 1",
+        states: UPDATE_BODY_STATE,
+    },
+    // A CHECK over the assigned column.
+    Case {
+        setup: UPDATE_BODY,
+        statement: "UPDATE k SET a = id * 2, b = '5' WHERE id % 4 = 0",
+        states: UPDATE_BODY_STATE,
+    },
+];
+
 fn tag_f(v: &SqliteValue) -> String {
     match v {
         SqliteValue::Null => "NULL".to_owned(),
@@ -457,16 +1143,6 @@ async fn frank_outcome(f: &Connection, sql: &str, prepared: bool) -> String {
     }
 }
 
-/// The one statement whose change count differs from stock for a reason
-/// older than the one-pass delete (bd-n8g76, the same on the two-pass base):
-/// a self-referencing cascade removes a row the statement also matches, stock
-/// does not count that row and this engine, which runs FK actions after the
-/// program, does. Its table state is still compared.
-fn count_differs_by_bd_n8g76(case: &Case) -> bool {
-    // By content: a `const` slice has no single address to compare.
-    case.setup == FK_SELF && case.statement == "DELETE FROM t WHERE k = 1"
-}
-
 async fn check_case(case: &Case, file_backed: bool, prepared: bool) -> Vec<String> {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = if file_backed {
@@ -491,7 +1167,7 @@ async fn check_case(case: &Case, file_backed: bool, prepared: bool) -> Vec<Strin
     );
     let fo = frank_outcome(&f, case.statement, prepared).await;
     let so = stock_outcome(&r, case.statement);
-    if fo != so && !count_differs_by_bd_n8g76(case) {
+    if fo != so {
         failures.push(format!("{label}: frank {fo:?} vs stock {so:?}"));
     }
     for state in case.states {
@@ -531,6 +1207,19 @@ async fn check_cases(cases: &[Case]) -> Vec<String> {
 }
 
 #[test]
+fn foreign_key_delete_actions_match_stock_row_order() {
+    asupersync::test_utils::run_test(|| async {
+        let failures = check_cases(FK_ACTION_CASES).await;
+        assert!(
+            failures.is_empty(),
+            "{} FK action differences from SQLite:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    });
+}
+
+#[test]
 fn scan_delete_matches_stock_in_one_pass_and_two() {
     asupersync::test_utils::run_test(|| async {
         let failures = check_cases(CASES).await;
@@ -544,9 +1233,151 @@ fn scan_delete_matches_stock_in_one_pass_and_two() {
 }
 
 #[test]
+fn staged_leaf_delete_matches_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let failures = check_cases(SD_CASES).await;
+        assert!(
+            failures.is_empty(),
+            "{} differences from SQLite:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    });
+}
+
+/// Lever SD: a second connection's open snapshot keeps the rows another
+/// connection's transaction deletes in place, before and after that commits,
+/// and its next transaction sees the deletes; the deleting connection sees
+/// its own. Compared step by step with stock on the same steps in WAL mode.
+#[test]
+fn staged_leaf_delete_is_invisible_to_an_open_snapshot_as_in_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let frank_path = dir
+            .path()
+            .join("frank.db")
+            .to_str()
+            .expect("utf-8 path")
+            .to_owned();
+        let stock_path = dir.path().join("stock.db");
+        let f1 = Connection::open(&frank_path).await.expect("open");
+        let s1 = rusqlite::Connection::open(&stock_path).expect("stock open");
+        f1.query("PRAGMA journal_mode=WAL").await.expect("frank wal");
+        stock_rows(&s1, "PRAGMA journal_mode=WAL").expect("stock wal");
+        for setup in MANY {
+            f1.execute(setup).await.expect("frank setup");
+            s1.execute_batch(setup).expect("stock setup");
+        }
+        let f2 = Connection::open(&frank_path).await.expect("open second");
+        let s2 = rusqlite::Connection::open(&stock_path).expect("stock open second");
+        let steps: &[(u8, &str)] = &[
+            (2, "BEGIN"),
+            (2, "SELECT count(*), sum(id) FROM t"),
+            (1, "BEGIN"),
+            (1, "DELETE FROM t WHERE id % 7 = 0"),
+            (1, "SELECT count(*), sum(id) FROM t"),
+            (2, "SELECT count(*), sum(id) FROM t"),
+            (1, "DELETE FROM t WHERE id % 3 = 0"),
+            (1, "COMMIT"),
+            (2, "SELECT count(*), sum(id) FROM t"),
+            (2, "COMMIT"),
+            (2, "SELECT count(*), sum(id) FROM t"),
+            (1, "PRAGMA integrity_check"),
+        ];
+        let mut failures = Vec::new();
+        for &(which, sql) in steps {
+            let (f, s) = if which == 1 { (&f1, &s1) } else { (&f2, &s2) };
+            let fv = match f.query(sql).await {
+                Ok(rows) => Ok(frank_rows(&rows)),
+                Err(e) => Err(e.to_string()),
+            };
+            let sv = stock_rows(s, sql);
+            if fv != sv {
+                failures.push(format!(
+                    "connection {which}, `{sql}`: frank {fv:?} vs stock {sv:?}"
+                ));
+            }
+        }
+        f2.close().await.expect("close second");
+        f1.close().await.expect("close");
+        assert!(
+            failures.is_empty(),
+            "{} differences from SQLite:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    });
+}
+
+#[test]
+fn insert_select_alias_rowid_register_matches_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let failures = check_cases(IPK_CASES).await;
+        assert!(
+            failures.is_empty(),
+            "{} differences from SQLite:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    });
+}
+
+#[test]
+fn update_without_restore_matches_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let failures = check_cases(UR_CASES).await;
+        assert!(
+            failures.is_empty(),
+            "{} differences from SQLite:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    });
+}
+
+#[test]
 fn scan_update_matches_stock_in_one_pass_and_two() {
     asupersync::test_utils::run_test(|| async {
         let failures = check_cases(UPDATE_CASES).await;
+        assert!(
+            failures.is_empty(),
+            "{} differences from SQLite:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    });
+}
+
+#[test]
+fn insert_select_affinity_after_constraints_matches_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let failures = check_cases(ROW_AFFINITY_CASES).await;
+        assert!(
+            failures.is_empty(),
+            "{} differences from SQLite:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    });
+}
+
+#[test]
+fn update_row_body_matches_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let failures = check_cases(UPDATE_BODY_CASES).await;
+        assert!(
+            failures.is_empty(),
+            "{} differences from SQLite:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    });
+}
+
+#[test]
+fn rowid_reads_beside_column_reads_match_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let failures = check_cases(ROWID_CASES).await;
         assert!(
             failures.is_empty(),
             "{} differences from SQLite:\n{}",

@@ -467,3 +467,314 @@ fn scans_and_column_reads_match_sqlite_on_both_sides_of_every_sync_lane_boundary
         );
     });
 }
+
+/// bd-w4pr1.13.8 lever G2: `Column` on a sorter cursor runs on the
+/// synchronous lane. On a file database under strict mode each GROUP BY below
+/// runs its sorter program. Arithmetic on a projected aggregate in HAVING
+/// exercises strict fallback refusal on the same connection. The queries read sorter key and
+/// non-key columns over NULL, INTEGER, REAL, TEXT and BLOB keys and several
+/// key columns, on rows that change from one sorter row to the next (a lane
+/// that kept a previous row's decoded column, or read a non-key column from
+/// the key prefix, fails here).
+const SORTER_COLUMN_QUERIES: [&str; 9] = [
+    "SELECT k, count(*) FROM g GROUP BY k HAVING count(*) > 1 ORDER BY k",
+    "SELECT k, count(*), sum(n), min(r), max(r) FROM g GROUP BY k ORDER BY k",
+    "SELECT k, n, count(*) FROM g GROUP BY k, n ORDER BY k, n",
+    "SELECT b, count(*), sum(n) FROM g GROUP BY b ORDER BY b",
+    "SELECT r, count(*) FROM g GROUP BY r ORDER BY r",
+    "SELECT k, count(*) FROM g WHERE n > 40 GROUP BY k ORDER BY k",
+    "SELECT k, n, count(*), sum(r), max(b), min(id) FROM g GROUP BY k, n ORDER BY k, n",
+    "SELECT b, k, min(n), max(r), count(r) FROM g GROUP BY b, k ORDER BY b, k",
+    "SELECT n, min(k), max(k), total(r) FROM g GROUP BY n ORDER BY n",
+];
+
+/// GROUP BY shapes that strict mode refuses on the same file (an expression
+/// key with DISTINCT aggregates, `typeof(k)`, a descending ORDER BY over the
+/// key with `max(s)`, a grouped derived table): they do not run the sorter
+/// program, so they are compared with strict mode off, as plain answers.
+/// (`GROUP BY s` over the NOCASE column is left out: on main it prints the
+/// first row's spelling of a group where stock prints the last row's, a
+/// divergence of the grouped evaluator reported on bd-w4pr1.13.8.)
+const SORTER_REFUSED_IN_STRICT_QUERIES: [&str; 6] = [
+    "SELECT k, count(*) FROM g GROUP BY k HAVING count(*) + 0 > 1 ORDER BY k",
+    "SELECT n % 7, count(DISTINCT k), sum(DISTINCT n), avg(r) FROM g GROUP BY n % 7 ORDER BY 1",
+    "SELECT typeof(k), count(*), min(k), max(k) FROM g GROUP BY typeof(k) ORDER BY 1",
+    "SELECT n, count(*), sum(length(s)), max(s) FROM g GROUP BY n ORDER BY n DESC",
+    "SELECT count(*), sum(c) FROM (SELECT n, count(*) c FROM g GROUP BY n)",
+    "SELECT count(*), sum(c) FROM (SELECT k, s, count(*) c FROM g GROUP BY k, s)",
+];
+
+fn sorter_column_setup() -> String {
+    let mut rows = Vec::new();
+    for i in 0..1500_i64 {
+        let k = match i % 9 {
+            0 => "NULL".to_owned(),
+            1 => format!("{}", i % 13),
+            2 => format!("{}.5", i % 11),
+            3 => format!("'{}'", i % 13),
+            4 => format!("x'{:02x}'", i % 7),
+            5 => format!("{}", -(i % 5)),
+            6 => "9223372036854775807".to_owned(),
+            _ => format!("'k-{}'", i % 17),
+        };
+        let s = match i % 4 {
+            0 => format!("'Name-{}'", i % 23),
+            1 => format!("'name-{}'", i % 23),
+            2 => "NULL".to_owned(),
+            _ => format!("'NAME-{}'", i % 19),
+        };
+        let r = if i % 6 == 0 {
+            "NULL".to_owned()
+        } else {
+            format!("{}.25", i % 31)
+        };
+        let b = if i % 5 == 0 {
+            "NULL".to_owned()
+        } else {
+            format!("x'{:04x}'", i % 29)
+        };
+        rows.push(format!("({i}, {k}, {}, {r}, {s}, {b})", i % 61));
+    }
+    format!(
+        "CREATE TABLE g(id INTEGER PRIMARY KEY, k, n INTEGER, r REAL, s TEXT COLLATE NOCASE, b BLOB);
+         INSERT INTO g VALUES {};",
+        rows.join(", ")
+    )
+}
+
+#[test]
+fn sorter_column_reads_match_sqlite_on_a_strict_file_database() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("sorter.db");
+        let frank = Connection::open(path.to_str().expect("utf-8 path"))
+            .await
+            .expect("open");
+        let stock = rusqlite::Connection::open_in_memory().expect("stock open");
+        let setup = sorter_column_setup();
+        frank.execute_batch(&setup).await.expect("frank setup");
+        stock.execute_batch(&setup).expect("stock setup");
+        frank
+            .execute("PRAGMA fsqlite.parity_cert_strict = ON;")
+            .await
+            .expect("strict");
+        let error = frank
+            .query(SORTER_REFUSED_IN_STRICT_QUERIES[0])
+            .await
+            .expect_err("arithmetic on the aggregate needs the grouped evaluator");
+        assert!(
+            error
+                .to_string()
+                .contains("decision_reason=group_by_fallback"),
+            "{error}"
+        );
+        let mut failures = Vec::new();
+        compare(
+            "[strict file] sorter",
+            &frank,
+            &stock,
+            &SORTER_COLUMN_QUERIES,
+            &mut failures,
+        )
+        .await;
+        frank
+            .execute("PRAGMA fsqlite.parity_cert_strict = OFF;")
+            .await
+            .expect("strict off");
+        compare(
+            "[file] grouped",
+            &frank,
+            &stock,
+            &SORTER_REFUSED_IN_STRICT_QUERIES,
+            &mut failures,
+        )
+        .await;
+        frank.close().await.expect("close");
+        assert!(
+            failures.is_empty(),
+            "{} queries differ from SQLite:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    });
+}
+
+/// bd-w4pr1.13.8 lever G3: a sorter whose records repeat keeps one row and a
+/// count per distinct record once it holds 4,096 records. The 20,000 rows of
+/// `r` take every sorter below past that first check. Columns, by the path
+/// they drive:
+/// - `a` (37 groups), `t` (TEXT), `bk` (BLOB), `n` (with NULLs): runs kept;
+/// - `k1` turns REAL (3.0) at row 6,001 and `k2` holds -0.0 and 0.0 at rows
+///   7,001 and 7,002, after the runs started: they must give way, so 3.0 sorts
+///   among the 3s and `sum(k1)` of that group is REAL (a collapse by value
+///   prints 4,001 INTEGER 3s and an INTEGER sum);
+/// - `p` is a function of `a` for 6,000 rows and then varies: a record
+///   `(a, p)` repeats its key in other bytes, so `ORDER BY a` and
+///   `group_concat(p)` keep each group's insertion order (a collapse by key
+///   alone repeats the first `p`);
+/// - `q` has ten values for 8,000 rows and is then unique (the runs turn back
+///   into rows at the 16,384 check), `u` is unique at first (declined at
+///   4,096), `c` is REAL (never collected);
+/// - `s` is NOCASE (a collation: never collected); only its group count is
+///   compared, since which spelling a group prints is bd-ukvhn's divergence.
+///
+/// On the strict file database each query of the first list runs its sorter
+/// program; the second list holds shapes strict mode refuses there, compared
+/// with strict mode off. Then CREATE INDEX over duplicated values, a CREATE
+/// UNIQUE INDEX that must fail, and the index contents.
+const SORTER_RUNS_SETUP: &str = "
+    CREATE TABLE r(id INTEGER PRIMARY KEY, a INTEGER, k1, k2, t TEXT, bk BLOB, p, q, n, u,
+                   c REAL, s TEXT COLLATE NOCASE);
+    WITH RECURSIVE seq(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < 20000)
+    INSERT INTO r SELECT i,
+      i % 37,
+      CASE WHEN i = 6001 THEN 3.0 ELSE i % 5 END,
+      CASE WHEN i = 7001 THEN -0.0 WHEN i = 7002 THEN 0.0 ELSE i % 3 END,
+      'v' || (i % 23),
+      CAST('b' || (i % 11) AS BLOB),
+      CASE WHEN i <= 6000 THEN (i % 37) * 10 ELSE i END,
+      CASE WHEN i <= 8000 THEN i % 10 ELSE i END,
+      CASE WHEN i % 7 = 0 THEN NULL ELSE i % 3 END,
+      i % 9000,
+      (i % 37) * 0.5,
+      CASE i % 3 WHEN 0 THEN 'Name' || (i % 5) WHEN 1 THEN 'name' || (i % 5)
+                 ELSE 'NAME' || (i % 5) END
+    FROM seq;";
+
+const SORTER_RUNS_QUERIES: [&str; 28] = [
+    "SELECT a, count(*) FROM r GROUP BY a HAVING count(*) > 1 ORDER BY a",
+    "SELECT a, count(*), min(a), max(a), sum(a) FROM r GROUP BY a ORDER BY a",
+    "SELECT k1, count(*) FROM r GROUP BY k1 ORDER BY k1",
+    "SELECT k1, count(*), sum(k1), max(k1) FROM r GROUP BY k1 ORDER BY k1",
+    "SELECT k2, count(*), sum(k2), min(k2) FROM r GROUP BY k2 ORDER BY k2",
+    "SELECT t, count(*) FROM r GROUP BY t ORDER BY t",
+    "SELECT bk, count(*) FROM r GROUP BY bk ORDER BY bk",
+    "SELECT a, group_concat(p) FROM r GROUP BY a ORDER BY a",
+    "SELECT a, sum(p), count(p), min(p), max(p) FROM r GROUP BY a ORDER BY a",
+    "SELECT q, count(*) FROM r GROUP BY q ORDER BY q",
+    "SELECT n, count(*) FROM r GROUP BY n ORDER BY n",
+    "SELECT a, t, count(*) FROM r GROUP BY a, t ORDER BY a, t",
+    "SELECT n, a, count(*) FROM r GROUP BY n, a ORDER BY n, a",
+    "SELECT c, count(*) FROM r GROUP BY c ORDER BY c",
+    "SELECT u, count(*) FROM r GROUP BY u ORDER BY u",
+    "SELECT a FROM r ORDER BY a",
+    "SELECT a FROM r ORDER BY a DESC",
+    "SELECT a, id FROM r ORDER BY a",
+    "SELECT a, p FROM r ORDER BY a",
+    "SELECT n, a FROM r ORDER BY n, a",
+    "SELECT k1 FROM r ORDER BY k1",
+    "SELECT k2 FROM r ORDER BY k2",
+    "SELECT k1, k2 FROM r ORDER BY k1, k2",
+    "SELECT q FROM r ORDER BY q",
+    "SELECT bk, t FROM r ORDER BY bk, t",
+    "SELECT DISTINCT a FROM r ORDER BY a",
+    "SELECT DISTINCT t, n FROM r ORDER BY t, n",
+    "SELECT t, count(*), min(t), max(t) FROM r WHERE a > 3 GROUP BY t ORDER BY t",
+];
+
+const SORTER_RUNS_REFUSED_IN_STRICT_QUERIES: [&str; 7] = [
+    "SELECT a, count(*) FROM r GROUP BY a HAVING count(*) + 0 > 1 ORDER BY a",
+    "SELECT a, count(*) FROM r GROUP BY a ORDER BY a DESC",
+    "SELECT a % 5, count(*) FROM r GROUP BY a % 5 ORDER BY 1",
+    "SELECT k1, count(*), typeof(k1) FROM r GROUP BY k1 ORDER BY k1",
+    "SELECT count(*), sum(c2) FROM (SELECT a, count(*) c2 FROM r GROUP BY a)",
+    "SELECT count(*) FROM (SELECT s FROM r GROUP BY s)",
+    "SELECT count(*) FROM (SELECT DISTINCT s FROM r)",
+];
+
+/// Read after the indexes are built: the index entries in their order, a
+/// count through each index, and the integrity check.
+const SORTER_RUNS_INDEX_QUERIES: [&str; 5] = [
+    "SELECT a, id FROM r INDEXED BY r_a WHERE a BETWEEN 3 AND 9 ORDER BY a, id",
+    "SELECT t, k1, id FROM r INDEXED BY r_t_k1 WHERE t >= 'v1' ORDER BY t, k1, id",
+    "SELECT count(*) FROM r INDEXED BY r_a WHERE a = 5",
+    "SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name",
+    "PRAGMA integrity_check",
+];
+
+#[test]
+fn sorter_runs_match_sqlite_on_a_strict_file_database() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("runs.db");
+        let frank = Connection::open(path.to_str().expect("utf-8 path"))
+            .await
+            .expect("open");
+        let stock = rusqlite::Connection::open_in_memory().expect("stock open");
+        frank
+            .execute_batch(SORTER_RUNS_SETUP)
+            .await
+            .expect("frank setup");
+        stock.execute_batch(SORTER_RUNS_SETUP).expect("stock setup");
+        let mut failures = Vec::new();
+        compare(
+            "[file] runs setup",
+            &frank,
+            &stock,
+            &["SELECT count(*), sum(a), total(k1), sum(p), sum(q), sum(length(s)) FROM r"],
+            &mut failures,
+        )
+        .await;
+        frank
+            .execute("PRAGMA fsqlite.parity_cert_strict = ON;")
+            .await
+            .expect("strict");
+        let error = frank
+            .query(SORTER_RUNS_REFUSED_IN_STRICT_QUERIES[0])
+            .await
+            .expect_err("arithmetic on the aggregate needs the grouped evaluator");
+        assert!(
+            error
+                .to_string()
+                .contains("decision_reason=group_by_fallback"),
+            "{error}"
+        );
+        compare(
+            "[strict file] runs",
+            &frank,
+            &stock,
+            &SORTER_RUNS_QUERIES,
+            &mut failures,
+        )
+        .await;
+        frank
+            .execute("PRAGMA fsqlite.parity_cert_strict = OFF;")
+            .await
+            .expect("strict off");
+        compare(
+            "[file] runs, refused in strict",
+            &frank,
+            &stock,
+            &SORTER_RUNS_REFUSED_IN_STRICT_QUERIES,
+            &mut failures,
+        )
+        .await;
+        for ddl in [
+            "CREATE INDEX r_a ON r(a)",
+            "CREATE INDEX r_t_k1 ON r(t, k1)",
+        ] {
+            frank.execute(ddl).await.expect("frank index");
+            stock.execute_batch(ddl).expect("stock index");
+        }
+        let unique = "CREATE UNIQUE INDEX r_a_unique ON r(a)";
+        assert!(
+            frank.execute(unique).await.is_err() && stock.execute_batch(unique).is_err(),
+            "a UNIQUE index over duplicated values must fail on both"
+        );
+        compare(
+            "[file] runs, indexes",
+            &frank,
+            &stock,
+            &SORTER_RUNS_INDEX_QUERIES,
+            &mut failures,
+        )
+        .await;
+        frank.close().await.expect("close");
+        assert!(
+            failures.is_empty(),
+            "{} queries differ from SQLite:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    });
+}

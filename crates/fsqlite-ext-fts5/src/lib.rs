@@ -6,6 +6,8 @@
 //! modes, schema validation, and secure-delete / contentless-delete /
 //! contentless-unindexed / insttoken / locale blob / tokendata configuration.
 
+mod unicode61_data;
+
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::AsyncFnMut;
@@ -4691,36 +4693,88 @@ impl Unicode61Tokenizer {
         }
     }
 
-    fn is_token_char(&self, ch: char) -> bool {
-        if !self.token_chars.is_empty() && Self::option_contains(&self.token_chars, ch) {
-            return true;
+    fn is_token_char(&self, ch: char, categories: u32) -> bool {
+        // Tokenizer exceptions cannot turn a combining diacritic into a
+        // leading token character. Its base category can, e.g. categories Mn.
+        let in_category = if categories == DEFAULT_UNICODE61_CATEGORIES && ch.is_ascii() {
+            ch.is_ascii_alphanumeric()
+        } else {
+            categories & (1 << unicode61_data::category(ch)) != 0
+        };
+        if (self.token_chars.is_empty() && self.separators.is_empty())
+            || unicode61_combining_diacritic(ch)
+        {
+            return in_category;
         }
-        if !self.separators.is_empty() && Self::option_contains(&self.separators, ch) {
-            return false;
+        let extra = Self::option_contains(&self.token_chars, ch);
+        let separator = Self::option_contains(&self.separators, ch);
+        // Stock records non-ASCII exceptions relative to the base category.
+        // If both options name a character, only the exception that changes
+        // that base classification takes effect.
+        if !ch.is_ascii() && extra && separator {
+            !in_category
+        } else {
+            extra || (in_category && !separator)
         }
-        ch.is_alphanumeric()
-    }
-
-    fn normalized_char(&self, ch: char) -> char {
-        if self.remove_diacritics == 0 {
-            return ch;
-        }
-        latin_diacritic_base(ch).unwrap_or(ch)
     }
 }
 
-impl Fts5Tokenizer for Unicode61Tokenizer {
-    fn name(&self) -> &'static str {
-        "unicode61"
-    }
+// Category 31 represents scalars that unicode61 admits for every nonempty
+// category selection. The default class set is L*, N* and Co.
+const DEFAULT_UNICODE61_CATEGORIES: u32 = (1 << 31) | (1 << 4) | (0b11111 << 6) | (0b111 << 14);
 
-    fn visit_tokens(&self, text: &str, sink: &mut dyn FnMut(&str, usize, usize, bool)) {
+fn unicode61_categories(spec: &str) -> Option<u32> {
+    let mut mask = 0;
+    for pattern in spec.split_ascii_whitespace() {
+        if pattern.len() != 2 || !pattern.is_ascii() {
+            return None;
+        }
+        let mut selected = 0;
+        for (index, name) in unicode61_data::CATEGORY_NAMES.iter().enumerate() {
+            if pattern == *name
+                || (pattern.ends_with('*') && pattern.as_bytes()[0] == name.as_bytes()[0])
+            {
+                selected |= 1 << (index + 1);
+            }
+        }
+        if selected == 0 {
+            return None;
+        }
+        mask |= selected | (1 << 31);
+    }
+    Some(mask)
+}
+
+/// Combining marks that unicode61 admits after a token character. Other
+/// combining marks follow the ordinary tokenizer character-class rules.
+fn unicode61_combining_diacritic(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{0300}'..='\u{0304}'
+            | '\u{0306}'..='\u{030c}'
+            | '\u{030f}'
+            | '\u{0311}'
+            | '\u{031b}'
+            | '\u{0323}'..='\u{0328}'
+            | '\u{032d}'..='\u{032e}'
+            | '\u{0330}'..='\u{0331}'
+    )
+}
+
+impl Unicode61Tokenizer {
+    fn visit_with_categories(
+        &self,
+        text: &str,
+        categories: u32,
+        sink: &mut dyn FnMut(&str, usize, usize, bool),
+    ) {
         let mut token_start = None;
         let mut current_term = String::new();
         let mut borrowed_ascii_token = false;
 
         for (byte_idx, ch) in text.char_indices() {
-            if self.is_token_char(ch) {
+            let diacritic = unicode61_combining_diacritic(ch);
+            if (diacritic && token_start.is_some()) || self.is_token_char(ch, categories) {
                 if token_start.is_none() {
                     token_start = Some(byte_idx);
                     current_term.clear();
@@ -4735,13 +4789,13 @@ impl Fts5Tokenizer for Unicode61Tokenizer {
                         current_term.push_str(&text[start..byte_idx]);
                     }
                 }
-                for lc in self.normalized_char(ch).to_lowercase() {
-                    current_term.push(lc);
+                if !diacritic || self.remove_diacritics == 0 {
+                    current_term.push(unicode61_data::fold(ch, self.remove_diacritics));
                 }
             } else if let Some(start) = token_start.take() {
                 if borrowed_ascii_token {
                     sink(&text[start..byte_idx], start, byte_idx, false);
-                } else if !current_term.is_empty() {
+                } else {
                     sink(current_term.as_str(), start, byte_idx, false);
                     current_term.clear();
                 }
@@ -4752,10 +4806,36 @@ impl Fts5Tokenizer for Unicode61Tokenizer {
         if let Some(start) = token_start {
             if borrowed_ascii_token {
                 sink(&text[start..], start, text.len(), false);
-            } else if !current_term.is_empty() {
+            } else {
                 sink(current_term.as_str(), start, text.len(), false);
             }
         }
+    }
+}
+
+impl Fts5Tokenizer for Unicode61Tokenizer {
+    fn name(&self) -> &'static str {
+        "unicode61"
+    }
+
+    fn visit_tokens(&self, text: &str, sink: &mut dyn FnMut(&str, usize, usize, bool)) {
+        self.visit_with_categories(text, DEFAULT_UNICODE61_CATEGORIES, sink);
+    }
+}
+
+struct CategorizedUnicode61Tokenizer {
+    tokenizer: Unicode61Tokenizer,
+    categories: u32,
+}
+
+impl Fts5Tokenizer for CategorizedUnicode61Tokenizer {
+    fn name(&self) -> &'static str {
+        "unicode61"
+    }
+
+    fn visit_tokens(&self, text: &str, sink: &mut dyn FnMut(&str, usize, usize, bool)) {
+        self.tokenizer
+            .visit_with_categories(text, self.categories, sink);
     }
 }
 
@@ -4764,19 +4844,10 @@ impl Fts5Tokenizer for Unicode61Tokenizer {
 #[derive(Debug, Default)]
 pub struct AsciiTokenizer;
 
-impl AsciiTokenizer {
-    #[inline]
-    fn normalized_token_char(ch: char) -> Option<char> {
-        if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
-            Some(ch)
-        } else if ch.is_ascii_uppercase() {
-            Some(ch.to_ascii_lowercase())
-        } else if ch.is_ascii() {
-            None
-        } else {
-            Some(ch)
-        }
-    }
+/// SQLite applies ASCII overrides in declaration order, before case folding.
+/// Every non-ASCII codepoint remains a token character.
+struct ConfiguredAsciiTokenizer {
+    token_chars: [bool; 128],
 }
 
 impl Fts5Tokenizer for AsciiTokenizer {
@@ -4785,44 +4856,63 @@ impl Fts5Tokenizer for AsciiTokenizer {
     }
 
     fn visit_tokens(&self, text: &str, sink: &mut dyn FnMut(&str, usize, usize, bool)) {
-        let mut token_start = None;
-        let mut token_buf: Option<String> = None;
+        visit_ascii_tokens(text, |byte| byte.is_ascii_alphanumeric(), sink);
+    }
+}
 
-        for (byte_idx, ch) in text.char_indices() {
-            if let Some(term_ch) = Self::normalized_token_char(ch) {
-                let start = if let Some(start) = token_start {
-                    start
-                } else {
-                    token_start = Some(byte_idx);
-                    token_buf = None;
-                    byte_idx
-                };
+impl Fts5Tokenizer for ConfiguredAsciiTokenizer {
+    fn name(&self) -> &'static str {
+        "ascii"
+    }
 
-                if term_ch != ch {
-                    let buf = token_buf.get_or_insert_with(|| {
-                        let mut folded = String::new();
-                        folded.push_str(&text[start..byte_idx]);
-                        folded
-                    });
-                    buf.push(term_ch);
-                } else if let Some(buf) = token_buf.as_mut() {
-                    buf.push(term_ch);
-                }
-            } else if let Some(start) = token_start.take() {
-                if let Some(buf) = token_buf.take() {
-                    sink(buf.as_str(), start, byte_idx, false);
-                } else {
-                    sink(&text[start..byte_idx], start, byte_idx, false);
-                }
+    fn visit_tokens(&self, text: &str, sink: &mut dyn FnMut(&str, usize, usize, bool)) {
+        visit_ascii_tokens(text, |byte| self.token_chars[usize::from(byte)], sink);
+    }
+}
+
+fn visit_ascii_tokens(
+    text: &str,
+    is_ascii_token: impl Fn(u8) -> bool,
+    sink: &mut dyn FnMut(&str, usize, usize, bool),
+) {
+    let mut token_start = None;
+    let mut token_buf: Option<String> = None;
+
+    for (byte_idx, ch) in text.char_indices() {
+        if !ch.is_ascii() || is_ascii_token(ch as u8) {
+            let term_ch = ch.to_ascii_lowercase();
+            let start = if let Some(start) = token_start {
+                start
+            } else {
+                token_start = Some(byte_idx);
+                token_buf = None;
+                byte_idx
+            };
+
+            if term_ch != ch {
+                let buf = token_buf.get_or_insert_with(|| {
+                    let mut folded = String::new();
+                    folded.push_str(&text[start..byte_idx]);
+                    folded
+                });
+                buf.push(term_ch);
+            } else if let Some(buf) = token_buf.as_mut() {
+                buf.push(term_ch);
+            }
+        } else if let Some(start) = token_start.take() {
+            if let Some(buf) = token_buf.take() {
+                sink(buf.as_str(), start, byte_idx, false);
+            } else {
+                sink(&text[start..byte_idx], start, byte_idx, false);
             }
         }
+    }
 
-        if let Some(start) = token_start {
-            if let Some(buf) = token_buf {
-                sink(buf.as_str(), start, text.len(), false);
-            } else {
-                sink(&text[start..], start, text.len(), false);
-            }
+    if let Some(start) = token_start {
+        if let Some(buf) = token_buf {
+            sink(buf.as_str(), start, text.len(), false);
+        } else {
+            sink(&text[start..], start, text.len(), false);
         }
     }
 }
@@ -5192,9 +5282,10 @@ fn latin_diacritic_base(ch: char) -> Option<char> {
     })
 }
 
-fn split_fts5_tokenizer_spec(spec: &str) -> Vec<String> {
+fn split_fts5_tokenizer_spec(spec: &str) -> Option<Vec<String>> {
     let mut parts = Vec::new();
     let mut current = String::new();
+    let mut started = false;
     let mut quote: Option<char> = None;
     let mut chars = spec.chars().peekable();
 
@@ -5211,21 +5302,27 @@ fn split_fts5_tokenizer_spec(spec: &str) -> Vec<String> {
                 current.push(ch);
             }
         } else if ch == '\'' || ch == '"' {
+            started = true;
             quote = Some(ch);
         } else if ch.is_ascii_whitespace() {
-            if !current.is_empty() {
+            if started {
+                started = false;
                 parts.push(std::mem::take(&mut current));
             }
         } else {
+            started = true;
             current.push(ch);
         }
     }
 
-    if !current.is_empty() {
+    if quote.is_some() {
+        return None;
+    }
+    if started {
         parts.push(current);
     }
 
-    parts
+    Some(parts)
 }
 
 fn take_tokenizer_option<'a>(parts: &'a [String], index: &mut usize) -> Option<(&'a str, &'a str)> {
@@ -5240,15 +5337,26 @@ fn take_tokenizer_option<'a>(parts: &'a [String], index: &mut usize) -> Option<(
     Some((raw.as_str(), value.as_str()))
 }
 
-fn unicode61_tokenizer_from_args(args: &[String]) -> Option<Unicode61Tokenizer> {
+fn unicode61_tokenizer_from_args(args: &[String]) -> Option<Box<dyn Fts5Tokenizer>> {
     let mut tokenizer = Unicode61Tokenizer::new();
+    let mut categories = DEFAULT_UNICODE61_CATEGORIES;
     let mut index = 0;
 
     while index < args.len() {
         let (key, value) = take_tokenizer_option(args, &mut index)?;
         match key.to_ascii_lowercase().as_str() {
-            "tokenchars" | "token_chars" => value.clone_into(&mut tokenizer.token_chars),
-            "separators" => value.clone_into(&mut tokenizer.separators),
+            "categories" => categories = unicode61_categories(value)?,
+            "tokenchars" | "token_chars" | "separators" => {
+                let (set, opposite) = if key.eq_ignore_ascii_case("separators") {
+                    (&mut tokenizer.separators, &mut tokenizer.token_chars)
+                } else {
+                    (&mut tokenizer.token_chars, &mut tokenizer.separators)
+                };
+                // ASCII exceptions are assigned in declaration order. For
+                // non-ASCII, preserve all exceptions for the final category set.
+                opposite.retain(|ch| !ch.is_ascii() || !value.contains(ch));
+                set.push_str(value);
+            }
             "remove_diacritics" => {
                 let remove_diacritics = value.parse::<u8>().ok()?;
                 if remove_diacritics > 2 {
@@ -5260,7 +5368,30 @@ fn unicode61_tokenizer_from_args(args: &[String]) -> Option<Unicode61Tokenizer> 
         }
     }
 
-    Some(tokenizer)
+    Some(Box::new(CategorizedUnicode61Tokenizer {
+        tokenizer,
+        categories,
+    }))
+}
+
+fn ascii_tokenizer_from_args(args: &[String]) -> Option<Box<dyn Fts5Tokenizer>> {
+    if args.is_empty() {
+        return Some(Box::new(AsciiTokenizer));
+    }
+    let mut token_chars = std::array::from_fn(|i| (i as u8).is_ascii_alphanumeric());
+    let mut index = 0;
+    while index < args.len() {
+        let (key, chars) = take_tokenizer_option(args, &mut index)?;
+        let include = match key.to_ascii_lowercase().as_str() {
+            "tokenchars" => true,
+            "separators" => false,
+            _ => return None,
+        };
+        for byte in chars.bytes().filter(u8::is_ascii) {
+            token_chars[usize::from(byte)] = include;
+        }
+    }
+    Some(Box::new(ConfiguredAsciiTokenizer { token_chars }))
 }
 
 fn trigram_tokenizer_from_args(args: &[String]) -> Option<TrigramTokenizer> {
@@ -5291,8 +5422,8 @@ fn create_tokenizer_from_parts(parts: &[String]) -> Option<Box<dyn Fts5Tokenizer
     let args = &parts[1..];
 
     match name.as_str() {
-        "unicode61" => Some(Box::new(unicode61_tokenizer_from_args(args)?)),
-        "ascii" => Some(Box::new(AsciiTokenizer)),
+        "unicode61" => unicode61_tokenizer_from_args(args),
+        "ascii" => ascii_tokenizer_from_args(args),
         "porter" => {
             let inner = if args.is_empty() {
                 Box::new(Unicode61Tokenizer::new()) as Box<dyn Fts5Tokenizer>
@@ -5309,7 +5440,7 @@ fn create_tokenizer_from_parts(parts: &[String]) -> Option<Box<dyn Fts5Tokenizer
 /// Create a tokenizer by name with optional arguments.
 #[must_use]
 pub fn create_tokenizer(name: &str) -> Option<Box<dyn Fts5Tokenizer>> {
-    let parts = split_fts5_tokenizer_spec(name);
+    let parts = split_fts5_tokenizer_spec(name)?;
     create_tokenizer_from_parts(&parts)
 }
 
@@ -5425,13 +5556,8 @@ impl Fts5ExtensionApi {
     #[must_use]
     pub fn with_builtins() -> Self {
         let mut api = Self::new();
-        let _ = api.register_tokenizer("unicode61", |args| {
-            Some(Box::new(unicode61_tokenizer_from_args(args)?))
-        });
-        let _ = api.register_tokenizer("ascii", |args| {
-            args.is_empty()
-                .then_some(Box::new(AsciiTokenizer) as Box<dyn Fts5Tokenizer>)
-        });
+        let _ = api.register_tokenizer("unicode61", unicode61_tokenizer_from_args);
+        let _ = api.register_tokenizer("ascii", ascii_tokenizer_from_args);
         let _ = api.register_tokenizer("porter", |args| {
             let inner = if args.is_empty() {
                 Box::new(Unicode61Tokenizer::new()) as Box<dyn Fts5Tokenizer>
@@ -5475,7 +5601,7 @@ impl Fts5ExtensionApi {
 
     #[must_use]
     pub fn create_tokenizer(&self, spec: &str) -> Option<Box<dyn Fts5Tokenizer>> {
-        let parts = split_fts5_tokenizer_spec(spec);
+        let parts = split_fts5_tokenizer_spec(spec)?;
         let name = parts.first()?;
         self.find_tokenizer(name)?.as_ref()(&parts[1..])
     }
@@ -5654,6 +5780,21 @@ fn tokenize_fts5_query(query: &str) -> std::result::Result<Vec<Fts5QueryToken>, 
             continue;
         }
 
+        if ch == '*' {
+            let _ = chars.next();
+            let Some(previous) = tokens.last_mut() else {
+                return Err(Fts5QueryError::InvalidPhraseSyntax);
+            };
+            if !matches!(
+                previous.kind,
+                Fts5QueryTokenKind::Term | Fts5QueryTokenKind::Phrase
+            ) {
+                return Err(Fts5QueryError::InvalidPhraseSyntax);
+            }
+            previous.kind = Fts5QueryTokenKind::Prefix;
+            continue;
+        }
+
         if ch == '^' {
             let _ = chars.next();
             tokens.push(Fts5QueryToken {
@@ -5686,19 +5827,18 @@ fn tokenize_fts5_query(query: &str) -> std::result::Result<Vec<Fts5QueryToken>, 
             if !closed {
                 return Err(Fts5QueryError::UnclosedPhrase);
             }
-            if !phrase.is_empty() {
-                tokens.push(Fts5QueryToken {
-                    kind: Fts5QueryTokenKind::Phrase,
-                    lexeme: phrase,
-                });
-            }
+            tokens.push(Fts5QueryToken {
+                kind: Fts5QueryTokenKind::Phrase,
+                lexeme: phrase,
+            });
             continue;
         }
 
         // Read a word.
         let mut word = String::new();
         while let Some(word_ch) = chars.peek().copied() {
-            if word_ch.is_ascii_whitespace() || matches!(word_ch, '(' | ')' | '"' | '+' | '^') {
+            if word_ch.is_ascii_whitespace() || matches!(word_ch, '(' | ')' | '"' | '+' | '^' | '*')
+            {
                 break;
             }
             let _ = chars.next();
@@ -5838,17 +5978,6 @@ fn push_query_word_tokens(word: &str, tokens: &mut Vec<Fts5QueryToken>) {
         return;
     }
 
-    if word.ends_with('*') {
-        let base = word.trim_end_matches('*');
-        if !base.is_empty() {
-            tokens.push(Fts5QueryToken {
-                kind: Fts5QueryTokenKind::Prefix,
-                lexeme: base.to_owned(),
-            });
-            return;
-        }
-    }
-
     let upper = word.to_ascii_uppercase();
     let kind = match upper.as_str() {
         "AND" => Fts5QueryTokenKind::And,
@@ -5970,6 +6099,7 @@ pub enum Fts5NearOperand {
     Term(String),
     Prefix(String),
     Phrase(Vec<String>),
+    PhrasePrefix(Vec<String>, String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6016,16 +6146,10 @@ fn near_operand_from_token(token: &Fts5QueryToken) -> Option<Fts5NearOperand> {
         Fts5QueryTokenKind::Term if !token.lexeme.trim().is_empty() => {
             Some(Fts5NearOperand::Term(token.lexeme.trim().to_owned()))
         }
-        Fts5QueryTokenKind::Prefix if !token.lexeme.trim().is_empty() => {
-            Some(Fts5NearOperand::Prefix(token.lexeme.trim().to_owned()))
-        }
+        Fts5QueryTokenKind::Prefix => Some(Fts5NearOperand::Prefix(token.lexeme.trim().to_owned())),
         Fts5QueryTokenKind::Phrase => {
-            let terms: Vec<String> = token
-                .lexeme
-                .split_whitespace()
-                .map(str::to_lowercase)
-                .collect();
-            (!terms.is_empty()).then_some(Fts5NearOperand::Phrase(terms))
+            let terms: Vec<String> = token.lexeme.split_whitespace().map(str::to_owned).collect();
+            Some(Fts5NearOperand::Phrase(terms))
         }
         _ => None,
     }
@@ -6049,15 +6173,12 @@ fn append_phrase_token(
             let phrase_words = token
                 .lexeme
                 .split_whitespace()
-                .map(str::to_lowercase)
+                .map(str::to_owned)
                 .collect::<Vec<_>>();
-            if phrase_words.is_empty() {
-                return Err(Fts5QueryError::InvalidPhraseSyntax);
-            }
             words.extend(phrase_words);
             Ok(())
         }
-        Fts5QueryTokenKind::Prefix if !token.lexeme.trim().is_empty() => {
+        Fts5QueryTokenKind::Prefix => {
             *prefix = Some(token.lexeme.trim().to_owned());
             Ok(())
         }
@@ -6718,6 +6839,45 @@ impl InvertedIndex {
         }
     }
 
+    /// Lay `fresh` (one document's postings, built in a scratch index) on top
+    /// of what `docid` already holds. This is how stock SQLite reads a rowid
+    /// inserted twice into a contentless or external-content table (bd-qxdk4):
+    /// the second insert's segment is newer, and reads are newest-wins per
+    /// (term, rowid). So each term of the new row takes the new row's
+    /// postings, a term only the old row had keeps its postings, and the
+    /// document's length becomes the new row's (stock replaces its
+    /// `_docsize` row). The on-disk reader
+    /// (`collect_live_term_groups_from_shadow_rows`) applies the same rule.
+    #[allow(clippy::mutable_key_type)]
+    fn overlay_document_postings(&mut self, docid: i64, fresh: DocumentPostings) {
+        self.doc_ids.insert(docid);
+        if let Some(doc_lengths) = self.doc_lengths.as_mut() {
+            doc_lengths.insert(docid, fresh.doc_length.unwrap_or(0));
+        }
+        let doc_refs = self.doc_terms.entry(docid).or_default();
+        for (term, postings) in fresh.terms {
+            let list = self.index.entry(term.clone()).or_default();
+            list.retain(|posting| posting.docid != docid);
+            list.extend(postings);
+            doc_refs.terms.insert(term);
+        }
+        for (prefix_length, prefix, postings) in fresh.prefix_terms {
+            let list = self
+                .prefix_indexes
+                .entry(prefix_length)
+                .or_default()
+                .entry(prefix.clone())
+                .or_default();
+            list.retain(|posting| posting.docid != docid);
+            list.extend(postings);
+            doc_refs
+                .prefix_terms
+                .entry(prefix_length)
+                .or_default()
+                .insert(prefix);
+        }
+    }
+
     /// Look up postings for a term.
     #[must_use]
     pub fn get_postings(&self, term: &str) -> &[Posting] {
@@ -6923,6 +7083,23 @@ impl InvertedIndex {
 
         pending.row_count = self.doc_ids.len();
         Ok(pending)
+    }
+}
+
+/// Tokenize one document's indexed columns into `index`.
+fn index_document_columns(
+    index: &mut InvertedIndex,
+    indexed_columns: &[bool],
+    rowid: i64,
+    column_values: &[String],
+    tokenizer: &dyn Fts5Tokenizer,
+) {
+    #[allow(clippy::cast_possible_truncation)]
+    for (col_idx, text) in column_values.iter().enumerate() {
+        if matches!(indexed_columns.get(col_idx), Some(false)) {
+            continue;
+        }
+        index.add_text(rowid, col_idx as u32, tokenizer, text);
     }
 }
 
@@ -7137,23 +7314,57 @@ fn tokenize_query_leaf(tokenizer: &dyn Fts5Tokenizer, text: &str) -> Vec<String>
 }
 
 fn normalize_query_term_expr(term: String, tokenizer: &dyn Fts5Tokenizer) -> Fts5Expr {
-    let mut terms = tokenize_query_leaf(tokenizer, &term).into_iter();
-    let Some(first) = terms.next() else {
-        return Fts5Expr::Term(term.to_lowercase());
-    };
-
-    terms.fold(Fts5Expr::Term(first), |left, right| {
-        Fts5Expr::And(Box::new(left), Box::new(Fts5Expr::Term(right)))
-    })
+    let tokens = tokenizer.tokenize(&term);
+    let has_colocated_tokens = tokens.iter().any(|token| token.colocated);
+    let mut terms: Vec<_> = tokens.into_iter().map(|token| token.term).collect();
+    if has_colocated_tokens {
+        // Preserve the existing handling of custom tokenizer synonym groups.
+        let mut terms = terms.into_iter();
+        let first = terms.next().expect("a colocated token is present");
+        return terms.fold(Fts5Expr::Term(first), |left, right| {
+            Fts5Expr::And(Box::new(left), Box::new(Fts5Expr::Term(right)))
+        });
+    }
+    if terms.len() == 1 {
+        Fts5Expr::Term(terms.pop().unwrap_or_default())
+    } else {
+        Fts5Expr::Phrase(terms)
+    }
 }
 
 fn normalize_query_phrase_terms(phrase: &[String], tokenizer: &dyn Fts5Tokenizer) -> Vec<String> {
-    let joined = phrase.join(" ");
-    let terms = tokenize_query_leaf(tokenizer, &joined);
-    if terms.is_empty() {
-        phrase.iter().map(|term| term.to_lowercase()).collect()
+    tokenize_query_leaf(tokenizer, &phrase.join(" "))
+}
+
+fn query_phrase(mut terms: Vec<String>) -> Fts5NearOperand {
+    if terms.len() == 1 {
+        Fts5NearOperand::Term(terms.pop().unwrap_or_default())
     } else {
-        terms
+        Fts5NearOperand::Phrase(terms)
+    }
+}
+
+fn normalize_query_prefix(
+    mut words: Vec<String>,
+    prefix: String,
+    tokenizer: &dyn Fts5Tokenizer,
+) -> Fts5NearOperand {
+    let tokens = tokenizer.tokenize(&prefix);
+    let has_colocated_tokens = tokens.iter().any(|token| token.colocated);
+    let mut terms: Vec<_> = tokens.into_iter().map(|token| token.term).collect();
+    // Preserve existing custom-tokenizer synonym handling.
+    if has_colocated_tokens {
+        terms.truncate(1);
+    }
+    // FTS5 applies '*' only to the last token from the preceding string.
+    let Some(last) = terms.pop() else {
+        return query_phrase(words);
+    };
+    words.extend(terms);
+    if words.is_empty() {
+        Fts5NearOperand::Prefix(last)
+    } else {
+        Fts5NearOperand::PhrasePrefix(words, last)
     }
 }
 
@@ -7162,24 +7373,26 @@ fn normalize_near_operand_with_tokenizer(
     tokenizer: &dyn Fts5Tokenizer,
 ) -> Fts5NearOperand {
     match operand {
-        Fts5NearOperand::Term(term) => {
-            let terms = tokenize_query_leaf(tokenizer, &term);
-            match terms.as_slice() {
-                [] => Fts5NearOperand::Term(term.to_lowercase()),
-                [single] => Fts5NearOperand::Term(single.clone()),
-                _ => Fts5NearOperand::Phrase(terms),
-            }
-        }
-        Fts5NearOperand::Prefix(prefix) => {
-            let terms = tokenize_query_leaf(tokenizer, &prefix);
-            let normalized = terms
-                .first()
-                .cloned()
-                .unwrap_or_else(|| prefix.to_lowercase());
-            Fts5NearOperand::Prefix(normalized)
-        }
+        Fts5NearOperand::Term(term) => query_phrase(tokenize_query_leaf(tokenizer, &term)),
+        Fts5NearOperand::Prefix(prefix) => normalize_query_prefix(Vec::new(), prefix, tokenizer),
         Fts5NearOperand::Phrase(words) => {
-            Fts5NearOperand::Phrase(normalize_query_phrase_terms(&words, tokenizer))
+            query_phrase(normalize_query_phrase_terms(&words, tokenizer))
+        }
+        Fts5NearOperand::PhrasePrefix(words, prefix) => normalize_query_prefix(
+            normalize_query_phrase_terms(&words, tokenizer),
+            prefix,
+            tokenizer,
+        ),
+    }
+}
+
+impl From<Fts5NearOperand> for Fts5Expr {
+    fn from(operand: Fts5NearOperand) -> Self {
+        match operand {
+            Fts5NearOperand::Term(term) => Self::Term(term),
+            Fts5NearOperand::Prefix(prefix) => Self::Prefix(prefix),
+            Fts5NearOperand::Phrase(words) => Self::Phrase(words),
+            Fts5NearOperand::PhrasePrefix(words, prefix) => Self::PhrasePrefix(words, prefix),
         }
     }
 }
@@ -7187,26 +7400,16 @@ fn normalize_near_operand_with_tokenizer(
 fn normalize_query_expr_with_tokenizer(expr: Fts5Expr, tokenizer: &dyn Fts5Tokenizer) -> Fts5Expr {
     match expr {
         Fts5Expr::Term(term) => normalize_query_term_expr(term, tokenizer),
-        Fts5Expr::Prefix(prefix) => {
-            let terms = tokenize_query_leaf(tokenizer, &prefix);
-            let normalized = terms
-                .first()
-                .cloned()
-                .unwrap_or_else(|| prefix.to_lowercase());
-            Fts5Expr::Prefix(normalized)
-        }
+        Fts5Expr::Prefix(prefix) => normalize_query_prefix(Vec::new(), prefix, tokenizer).into(),
         Fts5Expr::Phrase(words) => {
-            Fts5Expr::Phrase(normalize_query_phrase_terms(&words, tokenizer))
+            query_phrase(normalize_query_phrase_terms(&words, tokenizer)).into()
         }
-        Fts5Expr::PhrasePrefix(words, prefix) => {
-            let normalized_words = normalize_query_phrase_terms(&words, tokenizer);
-            let terms = tokenize_query_leaf(tokenizer, &prefix);
-            let normalized_prefix = terms
-                .first()
-                .cloned()
-                .unwrap_or_else(|| prefix.to_lowercase());
-            Fts5Expr::PhrasePrefix(normalized_words, normalized_prefix)
-        }
+        Fts5Expr::PhrasePrefix(words, prefix) => normalize_query_prefix(
+            normalize_query_phrase_terms(&words, tokenizer),
+            prefix,
+            tokenizer,
+        )
+        .into(),
         Fts5Expr::And(left, right) => Fts5Expr::And(
             Box::new(normalize_query_expr_with_tokenizer(*left, tokenizer)),
             Box::new(normalize_query_expr_with_tokenizer(*right, tokenizer)),
@@ -7219,13 +7422,22 @@ fn normalize_query_expr_with_tokenizer(expr: Fts5Expr, tokenizer: &dyn Fts5Token
             Box::new(normalize_query_expr_with_tokenizer(*left, tokenizer)),
             Box::new(normalize_query_expr_with_tokenizer(*right, tokenizer)),
         ),
-        Fts5Expr::Near(operands, distance) => Fts5Expr::Near(
-            operands
+        Fts5Expr::Near(operands, distance) => {
+            let mut operands: Vec<_> = operands
                 .into_iter()
                 .map(|operand| normalize_near_operand_with_tokenizer(operand, tokenizer))
-                .collect(),
-            distance,
-        ),
+                .filter(
+                    |operand| !matches!(operand, Fts5NearOperand::Phrase(words) if words.is_empty()),
+                )
+                .collect();
+            if operands.len() > 1 {
+                Fts5Expr::Near(operands, distance)
+            } else {
+                operands
+                    .pop()
+                    .map_or_else(|| Fts5Expr::Phrase(Vec::new()), Fts5Expr::from)
+            }
+        }
         Fts5Expr::ColumnFilter(column_name, inner) => Fts5Expr::ColumnFilter(
             column_name,
             Box::new(normalize_query_expr_with_tokenizer(*inner, tokenizer)),
@@ -7610,6 +7822,7 @@ fn validate_detail_mode(
             validate_detail_mode(left, detail)?;
             validate_detail_mode(right, detail)
         }
+        Fts5Expr::Phrase(words) if words.is_empty() => Ok(()),
         Fts5Expr::Phrase(_) | Fts5Expr::PhrasePrefix(_, _) => {
             if detail == DetailMode::Full {
                 Ok(())
@@ -7813,6 +8026,9 @@ fn near_operand_spans(
             })
             .collect(),
         Fts5NearOperand::Phrase(words) => phrase_near_spans(index, words, allowed_columns),
+        Fts5NearOperand::PhrasePrefix(words, prefix) => {
+            phrase_prefix_spans(index, words, prefix, allowed_columns)
+        }
     }
 }
 
@@ -8330,6 +8546,9 @@ pub(crate) trait Fts5DoclistProvider {
             Fts5NearOperand::Term(term) => self.term_spans(term, allowed_columns),
             Fts5NearOperand::Prefix(prefix) => self.prefix_spans(prefix, allowed_columns),
             Fts5NearOperand::Phrase(words) => self.phrase_spans(words, allowed_columns),
+            Fts5NearOperand::PhrasePrefix(words, prefix) => {
+                self.phrase_prefix_spans(words, prefix, allowed_columns)
+            }
         }
     }
 
@@ -9103,6 +9322,10 @@ impl<'a, R: Fts5OnDiskReader> Fts5LazyQuery<'a, R> {
                             Fts5NearOperand::Phrase(words) => {
                                 exact.extend(words.iter().cloned());
                             }
+                            Fts5NearOperand::PhrasePrefix(words, prefix) => {
+                                exact.extend(words.iter().cloned());
+                                prefixes.insert(prefix.clone());
+                            }
                         }
                     }
                 }
@@ -9602,13 +9825,13 @@ impl Fts5Table {
         column_values: &[String],
         tokenizer: &dyn Fts5Tokenizer,
     ) {
-        #[allow(clippy::cast_possible_truncation)]
-        for (col_idx, text) in column_values.iter().enumerate() {
-            if matches!(self.indexed_columns.get(col_idx), Some(false)) {
-                continue;
-            }
-            self.index.add_text(rowid, col_idx as u32, tokenizer, text);
-        }
+        index_document_columns(
+            &mut self.index,
+            &self.indexed_columns,
+            rowid,
+            column_values,
+            tokenizer,
+        );
     }
 
     fn store_document_with_tokenizer_and_locales(
@@ -9623,6 +9846,51 @@ impl Fts5Table {
         if self.documents.contains_key(&rowid) {
             self.index.remove_document(rowid);
         }
+        self.index_document_with_tokenizer(rowid, &column_values, tokenizer);
+        self.finish_document_write(rowid, &column_values, locales);
+        debug!(rowid, "fts5: indexed document");
+    }
+
+    /// bd-qxdk4: a second INSERT of the live `rowid` into a contentless or
+    /// external-content table, which stock accepts (only a table with its own
+    /// `%_content` has a PRIMARY KEY to refuse it). The new row is laid over
+    /// the old one, as [`InvertedIndex::overlay_document_postings`] describes.
+    fn overlay_document_with_tokenizer_and_locales(
+        &mut self,
+        rowid: i64,
+        column_values: Vec<String>,
+        locales: Vec<(usize, SmallText)>,
+        tokenizer: &dyn Fts5Tokenizer,
+    ) {
+        self.materialize_shadow_rows_for_mutation();
+        self.record_row_mutation_for_undo(rowid);
+        let mut fresh = InvertedIndex::with_options_and_tokendata(
+            self.index.tracks_column_sizes(),
+            &self.prefix_lengths,
+            self.index.detail_mode(),
+            self.index.tokendata_enabled(),
+        );
+        index_document_columns(
+            &mut fresh,
+            &self.indexed_columns,
+            rowid,
+            &column_values,
+            tokenizer,
+        );
+        self.index
+            .overlay_document_postings(rowid, fresh.document_postings(rowid));
+        self.finish_document_write(rowid, &column_values, locales);
+        debug!(rowid, "fts5: laid a document over a live rowid");
+    }
+
+    /// The row-level bookkeeping every document write ends with: the row's
+    /// locales, the rowid allocator, and the stored column values.
+    fn finish_document_write(
+        &mut self,
+        rowid: i64,
+        column_values: &[String],
+        locales: Vec<(usize, SmallText)>,
+    ) {
         self.row_locales.retain(|(existing_rowid, _column), _| {
             !matches!(existing_rowid.cmp(&rowid), std::cmp::Ordering::Equal)
         });
@@ -9631,12 +9899,27 @@ impl Fts5Table {
                 .into_iter()
                 .map(|(column, tag)| ((rowid, column), tag)),
         );
-        self.index_document_with_tokenizer(rowid, &column_values, tokenizer);
         self.next_rowid = self.next_rowid.max(rowid.saturating_add(1));
-        let stored_values = self.content_values_for_storage(&column_values);
+        let stored_values = self.content_values_for_storage(column_values);
         self.documents.insert(rowid, stored_values);
         self.shadow_rows = None;
-        debug!(rowid, "fts5: indexed document");
+    }
+
+    /// Whether this table keeps its own `%_content` rows. Their INTEGER
+    /// PRIMARY KEY is the only rowid check stock FTS5 makes: a contentless or
+    /// external-content table accepts any rowid, live or not (bd-qxdk4).
+    fn owns_content_rows(&self) -> bool {
+        self.config.content_mode == ContentMode::Stored && !self.external_content
+    }
+
+    /// Whether stock honours a statement's `OR REPLACE` against this table.
+    /// `fts5UpdateMethod` reads the conflict mode only for a table with its
+    /// own content or one declared `contentless_delete=1`; for an
+    /// external-content or legacy contentless table it stays ABORT, so
+    /// `INSERT OR REPLACE` is a plain insert there (bd-qxdk4).
+    #[must_use]
+    pub fn honors_conflict_replace(&self) -> bool {
+        self.owns_content_rows() || self.config.contentless_delete
     }
 
     fn content_values_for_storage(&self, column_values: &[String]) -> Vec<String> {
@@ -9837,7 +10120,10 @@ impl Fts5Table {
         Ok(())
     }
 
-    fn has_document_or_shadow_rowid(&self, rowid: i64) -> bool {
+    /// Whether `rowid` is a live row of this table, in memory or in its bound
+    /// shadow rows (a lazily reopened table answers from neither).
+    #[must_use]
+    pub fn has_document_or_shadow_rowid(&self, rowid: i64) -> bool {
         self.documents.contains_key(&rowid)
             || self.shadow_rows.as_ref().is_some_and(|rows| {
                 rows.content.iter().any(|row| row.rowid == rowid)
@@ -10093,11 +10379,13 @@ impl Fts5Table {
     /// only materialize the current INSERT delta in memory.  Once the host has
     /// persisted that delta, the cached count and rowid allocator must advance
     /// without clearing lazy mode or hydrating the historical corpus.
-    pub fn note_lazy_inserted_rows(&mut self, rowids: &[i64]) {
+    /// `new_row_count` is how many of `rowids` were not live before: a rowid
+    /// written again lies over its row instead of adding one (bd-qxdk4).
+    pub fn note_lazy_inserted_rows(&mut self, rowids: &[i64], new_row_count: usize) {
         if !self.lazy_on_disk {
             return;
         }
-        self.lazy_doc_count = self.lazy_doc_count.saturating_add(rowids.len());
+        self.lazy_doc_count = self.lazy_doc_count.saturating_add(new_row_count);
         if let Some(max_rowid) = rowids.iter().copied().max() {
             self.next_rowid = self.next_rowid.max(max_rowid.saturating_add(1));
         }
@@ -10768,6 +11056,11 @@ fn extract_query_terms(expr: &Fts5Expr) -> Vec<String> {
         match operand {
             Fts5NearOperand::Term(term) | Fts5NearOperand::Prefix(term) => vec![term.clone()],
             Fts5NearOperand::Phrase(terms) => terms.clone(),
+            Fts5NearOperand::PhrasePrefix(words, prefix) => words
+                .iter()
+                .chain(std::iter::once(prefix))
+                .cloned()
+                .collect(),
         }
     }
 
@@ -10807,6 +11100,12 @@ fn extract_score_terms(expr: &Fts5Expr) -> Vec<Fts5ScoreTerm> {
             Fts5NearOperand::Phrase(terms) => {
                 terms.iter().cloned().map(Fts5ScoreTerm::Exact).collect()
             }
+            Fts5NearOperand::PhrasePrefix(words, prefix) => words
+                .iter()
+                .cloned()
+                .map(Fts5ScoreTerm::Exact)
+                .chain(std::iter::once(Fts5ScoreTerm::Prefix(prefix.clone())))
+                .collect(),
         }
     }
 
@@ -10924,6 +11223,11 @@ fn extract_highlight_terms(expr: &Fts5Expr) -> Vec<Fts5HighlightTerm> {
                 .iter()
                 .map(|term| Fts5HighlightTerm::exact(term))
                 .collect(),
+            Fts5NearOperand::PhrasePrefix(words, prefix) => words
+                .iter()
+                .map(|term| Fts5HighlightTerm::exact(term))
+                .chain(std::iter::once(Fts5HighlightTerm::prefix(prefix)))
+                .collect(),
         }
     }
 
@@ -10970,6 +11274,9 @@ fn extract_highlight_patterns(expr: &Fts5Expr) -> Vec<Fts5HighlightPattern> {
             }
             Fts5NearOperand::Phrase(terms) => {
                 vec![Fts5HighlightPattern::exact_phrase(terms)]
+            }
+            Fts5NearOperand::PhrasePrefix(words, prefix) => {
+                vec![Fts5HighlightPattern::phrase_prefix(words, prefix)]
             }
         }
     }
@@ -11313,7 +11620,11 @@ impl VirtualTable for Fts5Table {
                 self.next_rowid += 1;
                 r
             };
-            if self.has_document_or_shadow_rowid(rowid) {
+            // bd-qxdk4: only a table with its own `%_content` refuses a live
+            // rowid; a contentless or external-content table takes the new
+            // row on top of the old one, as stock does.
+            let rowid_is_live = self.has_document_or_shadow_rowid(rowid);
+            if rowid_is_live && self.owns_content_rows() {
                 return Err(FrankenError::PrimaryKeyViolation {
                     columns: String::new(),
                 });
@@ -11329,12 +11640,21 @@ impl VirtualTable for Fts5Table {
                 locales,
             } = self.decode_column_values(column_args)?;
             let tokenizer = self.create_tokenizer_instance();
-            self.store_document_with_tokenizer_and_locales(
-                rowid,
-                col_values,
-                locales,
-                tokenizer.as_ref(),
-            );
+            if rowid_is_live {
+                self.overlay_document_with_tokenizer_and_locales(
+                    rowid,
+                    col_values,
+                    locales,
+                    tokenizer.as_ref(),
+                );
+            } else {
+                self.store_document_with_tokenizer_and_locales(
+                    rowid,
+                    col_values,
+                    locales,
+                    tokenizer.as_ref(),
+                );
+            }
             return Ok(Some(rowid));
         }
 
@@ -16300,7 +16620,7 @@ mod tests {
                 "the current batch must materialize postings before persistence"
             );
 
-            table.note_lazy_inserted_rows(&rowids);
+            table.note_lazy_inserted_rows(&rowids, rowids.len());
 
             assert!(table.is_lazy_on_disk());
             assert_eq!(
@@ -17396,6 +17716,33 @@ mod tests {
         let tokens = tok.tokenize("Hello World 123");
         let terms: Vec<&str> = tokens.iter().map(|t| t.term.as_str()).collect();
         assert_eq!(terms, vec!["hello", "world", "123"]);
+    }
+
+    #[test]
+    fn ascii_tokenizer_options_apply_in_order_in_both_factories() {
+        let api = Fts5ExtensionApi::with_builtins();
+        let spec = "ascii TokenChars '-_' separators 'xé' separators '_' tokenchars ''";
+        for tok in [
+            create_tokenizer(spec).unwrap(),
+            api.create_tokenizer(spec).unwrap(),
+        ] {
+            let tokens = tok.tokenize("Co-op_XxÉé");
+            assert_eq!(
+                tokens
+                    .iter()
+                    .map(|t| (t.term.as_str(), t.start, t.end))
+                    .collect::<Vec<_>>(),
+                [("co-op", 0, 5), ("x", 6, 7), ("Éé", 8, 12)]
+            );
+        }
+        for bad in [
+            "ascii separators",
+            "ascii unknown 1",
+            "ascii tokenchars 'abc",
+        ] {
+            assert!(create_tokenizer(bad).is_none());
+            assert!(api.create_tokenizer(bad).is_none());
+        }
     }
 
     #[test]
@@ -22603,10 +22950,13 @@ mod tests {
     }
 
     #[test]
-    fn test_query_empty_phrase_ignored() {
-        // Empty phrase (just "") should be ignored and result in EmptyQuery.
-        let err = parse_fts5_query(r#""""#).unwrap_err();
-        assert_eq!(err, Fts5QueryError::EmptyQuery);
+    fn test_query_empty_phrase_matches_no_documents() {
+        let tokens = parse_fts5_query(r#""""#).unwrap();
+        let expr = build_expr(&tokens).unwrap();
+        assert!(matches!(&expr, Fts5Expr::Phrase(words) if words.is_empty()));
+        let mut table = Fts5Table::with_columns(vec!["body".to_owned()]);
+        table.insert_document(1, &["hello world".to_owned()]);
+        assert!(table.search(r#""""#).unwrap().is_empty());
     }
 
     #[test]

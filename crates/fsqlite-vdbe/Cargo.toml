@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-vdbe"
-version = "0.5.0"
+version = "0.5.1"
 description = "Virtual database engine bytecode interpreter"
 edition.workspace = true
 license-file.workspace = true
@@ -44,6 +44,9 @@ crossbeam-deque = { workspace = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]
+# test-internals: asupersync::Cx::for_testing{,_with_budget} for the aggregate
+# boundary keepers' native-runtime and budget signals (bd-w4pr1.12, lever AFC).
+asupersync = { workspace = true, features = ["test-internals"] }
 criterion = { workspace = true }
 insta = { workspace = true }
 proptest = { workspace = true }

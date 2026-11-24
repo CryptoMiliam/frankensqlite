@@ -31,6 +31,50 @@ pub(super) struct CompiledInsertReplayOutcome {
     pub(super) returning_rows: Vec<Row>,
 }
 
+/// bd-fpr5g lever 3b: the compiled program of one trigger body statement
+/// (a `TriggerBodyTemplate`'s), run without the dispatcher's per-statement
+/// validation and rewriting.
+///
+/// The program is the compiled cache's own entry for the text the ordinary
+/// dispatcher compiles for this statement, taken after that dispatcher ran
+/// the statement and it succeeded. It stays usable while the replay identity
+/// is unchanged and the cache still holds that same entry, which is exactly
+/// when the ordinary dispatcher would run it too.
+pub(super) struct TriggerBodyKernel {
+    program: Arc<VdbeProgram>,
+    sql_key: u64,
+    sql_text: Rc<str>,
+    identity: InsertReplayIdentity,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Trigger body statements this thread ran through a kernel, for the lib
+    /// tests that prove the kernel path is the one taken.
+    static TRIGGER_BODY_KERNEL_RUNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Rows this thread replayed through a compiled INSERT row program
+    /// (`execute_compiled_insert_replay_row` with its identity unchanged), for
+    /// the lib tests of which streams take it (bd-fpr5g lever 5).
+    static COMPILED_INSERT_REPLAY_ROWS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether a trigger body template's statement runs through a kernel.
+pub(super) enum TriggerBodyKernelSlot {
+    /// None yet: the next ordinary run that succeeds captures one.
+    Pending,
+    Ready(Rc<TriggerBodyKernel>),
+    /// The statement's shape is not admitted; it always runs the ordinary way.
+    Refused,
+}
+
+/// The row image returned by the write program is the source of FK values.
+/// Candidate INSERT values and interpreted SET expressions can differ from
+/// the row actually written by the DO UPDATE arm.
+struct UpsertForeignKeySnapshot {
+    columns: Vec<ResultColumn>,
+    updated_keys: Vec<usize>,
+}
+
 /// Admission only: expressions are still evaluated by the ordinary INSERT
 /// program for each written row. In particular, do not evaluate RETURNING
 /// against stored rows after AFTER triggers have changed them.
@@ -96,6 +140,75 @@ fn reusable_insert_returning(columns: &[fsqlite_ast::ResultColumn]) -> bool {
 }
 
 impl Connection {
+    /// Capture actual child FK values for a rowid UPSERT with one update arm.
+    ///
+    /// A rowid program reports whether this execution inserted a row through
+    /// its last-insert receipt; UPDATE deliberately leaves that receipt empty.
+    ///
+    /// With one DO UPDATE arm, that also identifies exactly which child keys
+    /// the update assigns without evaluating its SET expressions a second time.
+    ///
+    /// WITHOUT ROWID and multiple DO UPDATE arms need a richer program receipt
+    /// to identify the action and taken arm. Keep their existing enforcement
+    /// path until that information is available.
+    fn upsert_foreign_key_snapshot(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+    ) -> Option<UpsertForeignKeySnapshot> {
+        if !self.fk_enforcement_enabled()
+            || !self.temp_storage_roots().is_empty()
+            || self.targets_shadowed_main(&insert.table)
+            || insert
+                .table
+                .schema
+                .as_deref()
+                .is_some_and(|schema| !schema.eq_ignore_ascii_case("main"))
+        {
+            return None;
+        }
+        let mut updates = insert.upsert.iter().filter_map(|clause| match &clause.action {
+            fsqlite_ast::UpsertAction::Update { assignments, .. } => Some(assignments.as_slice()),
+            fsqlite_ast::UpsertAction::Nothing => None,
+        });
+        let assignments = updates.next()?;
+        if updates.next().is_some() {
+            return None;
+        }
+        let columns = {
+            let schema = self.schema.borrow();
+            let table = schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(&insert.table.name))?;
+            if table.without_rowid || table.foreign_keys.is_empty() {
+                return None;
+            }
+            // Generated child keys need dependency-aware SET-column tracking;
+            // the existing helper tracks directly assigned columns only.
+            if table.foreign_keys.iter().any(|fk| {
+                fk.child_columns.iter().any(|&column| {
+                    table
+                        .columns
+                        .get(column)
+                        .is_none_or(|column| column.generated_expr.is_some())
+                })
+            }) {
+                return None;
+            }
+            table
+                .columns
+                .iter()
+                .map(|column| ResultColumn::Expr {
+                    expr: Expr::Column(ColumnRef::bare(column.name.clone()), Span::ZERO),
+                    alias: None,
+                })
+                .collect()
+        };
+        Some(UpsertForeignKeySnapshot {
+            columns,
+            updated_keys: self.fk_keys_modified_by_update(&insert.table.name, assignments),
+        })
+    }
+
     pub(super) fn insert_replay_identity(&self) -> InsertReplayIdentity {
         InsertReplayIdentity {
             schema_cookie: self.schema_cookie(),
@@ -110,13 +223,25 @@ impl Connection {
         &self,
         original: &fsqlite_ast::InsertStatement,
         row_sql: &str,
+        source_rows_materialized: bool,
     ) -> Result<Option<CompiledInsertReplay>> {
         // Keep SELECT streaming, UPSERT OLD/NEW routing, non-row-local
         // RETURNING, virtual tables, and attached/TEMP ownership on their established
         // paths. FAIL/ROLLBACK also retain their historical replay entry until
         // their independently nested failure boundaries have a fast-path proof.
         // This is a positive admission rule, not a global fallback bypass.
-        if !matches!(&original.source, InsertSource::Values(rows) if rows.len() > 1)
+        //
+        // bd-fpr5g lever 5: a SELECT source is admitted when the stream's rows
+        // were all evaluated before it started (a materialized chunk): such a
+        // row is the same input as an evaluated VALUES row, and nothing is read
+        // between rows. A stream whose producer reads its source while rows are
+        // inserted keeps the prepared replay.
+        let source_admitted = match &original.source {
+            InsertSource::Values(rows) => rows.len() > 1,
+            InsertSource::Select(_) => source_rows_materialized,
+            InsertSource::DefaultValues => false,
+        };
+        if !source_admitted
             || original.with.is_some()
             || !reusable_insert_returning(&original.returning)
             || !original.upsert.is_empty()
@@ -134,7 +259,10 @@ impl Connection {
             || self.has_live_vtab_instance(&original.table.name)
             || self.view_index_of(&original.table.name).is_some()
             || self.targets_shadowed_main(&original.table)
-            || !self.temp_storage_roots().is_empty()
+            || self
+                .temp_table_names
+                .borrow()
+                .contains(&original.table.name.to_ascii_lowercase())
             || !self.active_txn_is_open_or_borrowed()
             || self.internal_statement_savepoint_depth.get() == 0
         {
@@ -170,6 +298,22 @@ impl Connection {
         let identity = self.insert_replay_identity();
         let program = self.compile_table_insert(insert, None).await?;
         if self.insert_replay_identity() != identity {
+            return Ok(None);
+        }
+        // bd-fpr5g lever 5: TEMP tables and materialized WITH / view bindings
+        // are MemDatabase roots from the connection's TEMP namespace, which no
+        // main root shares, and the routing and index suppression a compile
+        // applies under them touch only those roots. A main target's template
+        // (whose CHECK, DEFAULT and generated expressions read no table) opens
+        // none of them, so their presence leaves its program as it is. Checked
+        // here rather than assumed: a template that would open one stays on the
+        // prepared replay.
+        let temp_roots = self.temp_storage_roots();
+        if !temp_roots.is_empty()
+            && program
+                .storage_root_usages()
+                .any(|usage| temp_roots.contains(&usage.root_page))
+        {
             return Ok(None);
         }
         Ok(Some(CompiledInsertReplay {
@@ -210,6 +354,8 @@ impl Connection {
                     "compiled INSERT row lost its statement",
                 ));
             };
+            #[cfg(test)]
+            COMPILED_INSERT_REPLAY_ROWS.with(|rows| rows.set(rows.get() + 1));
             self.clear_table_program_error_state();
             self.forget_constraint_failure_action_at_top_level();
             self.sync_change_tracking_context();
@@ -233,6 +379,7 @@ impl Connection {
                 self.flush_pending_direct_write_runs(&plan.cx).await?;
             }
             self.clear_prepared_direct_insert_append_hint();
+            let previous_changes = self.last_changes.get();
             let previous_total = self.total_changes.get();
             let previous_trigger_steps = self.trigger_step_changes.get();
             let previous_rowid = self.current_last_insert_rowid();
@@ -257,6 +404,7 @@ impl Connection {
                     self.restore_failed_statement_tracking(
                         statement_preserves_prior_changes_on_constraint(&plan.statement),
                         &error,
+                        previous_changes,
                         previous_total,
                         previous_trigger_steps,
                         previous_rowid,
@@ -273,6 +421,360 @@ impl Connection {
                 }
             }
         }))
+    }
+
+    /// bd-fpr5g lever 3b: whether a trigger body statement's shape runs
+    /// through a [`TriggerBodyKernel`]. Checked once per template, after the
+    /// ordinary dispatcher ran the statement and it succeeded.
+    ///
+    /// Admitted: a one-row INSERT ... VALUES, an UPDATE or a DELETE with no
+    /// WITH, FROM, RETURNING, ORDER BY, LIMIT, upsert, subquery or row value,
+    /// already in canonical placeholder form, that no outer-layer rewrite
+    /// changes, on a MAIN table that is not a view, a virtual table, a sqlite_
+    /// table or a TEMP name, and that has no triggers of its own. For such a
+    /// statement every validation and rewrite the dispatcher runs before the
+    /// program is a function of the statement and the schema, which the
+    /// kernel's identity pins; what it does with the program is the arm's
+    /// tail the kernel runs. Everything else (nested triggers among it) keeps
+    /// the ordinary path.
+    fn trigger_body_kernel_admits(&self, statement: &Statement) -> bool {
+        let no_subquery = |expr: &Expr| !expr_contains_subquery_match(expr, &mut |_| true);
+        let (target, canonical) = match statement {
+            Statement::Insert(insert) => {
+                let InsertSource::Values(rows) = &insert.source else {
+                    return false;
+                };
+                if insert.with.is_some()
+                    || !insert.upsert.is_empty()
+                    || !insert.returning.is_empty()
+                    || rows.len() != 1
+                    || !rows.iter().flatten().all(no_subquery)
+                    || insert_values_have_subquery(insert)
+                {
+                    return false;
+                }
+                let canonical = insert_is_plain(insert)
+                    || canonicalize_insert_placeholders(insert).is_ok_and(|c| c == *insert);
+                (&insert.table, canonical)
+            }
+            Statement::Update(update) => {
+                if update.with.is_some()
+                    || update.from.is_some()
+                    || !update.returning.is_empty()
+                    || !update.order_by.is_empty()
+                    || update.limit.is_some()
+                    || update.table.time_travel.is_some()
+                    || !update
+                        .assignments
+                        .iter()
+                        .all(|assignment| no_subquery(&assignment.value))
+                    || !update.where_clause.as_ref().is_none_or(no_subquery)
+                {
+                    return false;
+                }
+                let canonical = update_is_plain(update)
+                    || canonicalize_update_placeholders(update).is_ok_and(|c| c == *update);
+                (&update.table.name, canonical)
+            }
+            Statement::Delete(delete) => {
+                if delete.with.is_some()
+                    || !delete.returning.is_empty()
+                    || !delete.order_by.is_empty()
+                    || delete.limit.is_some()
+                    || delete.table.time_travel.is_some()
+                    || !delete.where_clause.as_ref().is_none_or(no_subquery)
+                {
+                    return false;
+                }
+                let canonical = delete_is_plain(delete)
+                    || canonicalize_delete_placeholders(delete).is_ok_and(|c| c == *delete);
+                (&delete.table.name, canonical)
+            }
+            _ => return false,
+        };
+        let name = target.name.as_str();
+        canonical
+            && target
+                .schema
+                .as_deref()
+                .is_none_or(|schema| schema.eq_ignore_ascii_case("main"))
+            && !is_sqlite_schema_name(name)
+            && !name.eq_ignore_ascii_case("sqlite_sequence")
+            && !self
+                .temp_table_names
+                .borrow()
+                .contains(&name.to_ascii_lowercase())
+            && self.view_index_of(name).is_none()
+            && !self.has_live_vtab_instance(name)
+            && !self.table_name_is_virtual(name)
+            && self
+                .schema
+                .borrow()
+                .iter()
+                .any(|table| table.name.eq_ignore_ascii_case(name))
+            && !self
+                .triggers
+                .borrow()
+                .iter()
+                .any(|trigger| trigger.table_name.eq_ignore_ascii_case(name))
+            // The dispatcher delegates to an attached connection only when
+            // this names one (statement_may_target_attached_schema is a
+            // coarser gate: it holds for every UPDATE and DELETE).
+            && matches!(self.attached_target_schema(target), Ok(None))
+            && matches!(
+                fsqlite_ast::row_value::check_statement_row_values(statement),
+                Ok(false)
+            )
+            && !statement_contains_rewritable_subquery(statement)
+            && !statement_requires_in_table_name_rewrite(statement)
+            && !statement_contains_deferred_values(statement)
+            && expand_statement_hidden_table_function_stars(statement).is_none()
+            && matches!(
+                self.rewrite_statement_bare_pragma_table_functions(statement),
+                Cow::Borrowed(_)
+            )
+            && matches!(self.bind_schema_qualified_columns(statement), Ok(None))
+    }
+
+    /// The kernel for a template's `statement`, after the ordinary dispatcher
+    /// ran it with `params` and it succeeded: the compiled cache's entry for
+    /// the text that dispatcher compiled. `Pending` when the cache no longer
+    /// holds it (the next successful run tries again).
+    pub(super) fn capture_trigger_body_kernel(
+        &self,
+        statement: &Statement,
+        params: Option<&[SqliteValue]>,
+    ) -> TriggerBodyKernelSlot {
+        if !self.trigger_body_kernel_admits(statement) {
+            return TriggerBodyKernelSlot::Refused;
+        }
+        // The same tree and text list each arm passes when it compiles.
+        let (sql_text, sql_key) = match statement {
+            Statement::Insert(_) => {
+                self.dispatch_statement_text(params, statement, |seen| &mut seen.inserts)
+            }
+            Statement::Update(update) => {
+                self.dispatch_statement_text(params, update, |seen| &mut seen.updates)
+            }
+            Statement::Delete(delete) => {
+                self.dispatch_statement_text(params, delete, |seen| &mut seen.deletes)
+            }
+            _ => return TriggerBodyKernelSlot::Refused,
+        };
+        let Some(entry) = self.lookup_compiled_cache(sql_key, &sql_text) else {
+            return TriggerBodyKernelSlot::Pending;
+        };
+        TriggerBodyKernelSlot::Ready(Rc::new(TriggerBodyKernel {
+            program: Arc::clone(&entry.program),
+            sql_key,
+            sql_text: Rc::from(&*sql_text),
+            identity: self.insert_replay_identity(),
+        }))
+    }
+
+    /// Whether `kernel`'s program is still the one the ordinary dispatcher
+    /// would run: the replay identity is unchanged and the compiled cache
+    /// still holds that entry.
+    pub(super) fn trigger_body_kernel_is_current(&self, kernel: &TriggerBodyKernel) -> bool {
+        self.insert_replay_identity() == kernel.identity
+            && self
+                .lookup_compiled_cache(kernel.sql_key, &kernel.sql_text)
+                .is_some_and(|entry| Arc::ptr_eq(&entry.program, &kernel.program))
+    }
+
+    /// Whether a kernel may run in the connection's current state. Each of
+    /// these makes the ordinary dispatcher do something for a body statement
+    /// that the kernel does not: compile without the cache, enforce foreign
+    /// keys through its validation scope, retry at an autocommit boundary,
+    /// refresh committed pager state, refuse an encryption-locked database,
+    /// or emit per-statement trace events.
+    pub(super) fn trigger_body_kernel_allowed(&self) -> bool {
+        !self.pragma_state.borrow().foreign_keys
+            && !self.bypass_compiled_cache.get()
+            && !self.autocommit_conflict_retry_boundary()
+            && !self.committed_pager_refresh_allowed()
+            && !self.is_encryption_locked()
+            && self.trace_registration.borrow().is_none()
+            && !tracing::enabled!(target: "fsqlite.statement", tracing::Level::DEBUG)
+            && !tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
+            && !tracing::enabled!(target: "fsqlite.statement_reuse", tracing::Level::INFO)
+    }
+
+    /// Run a trigger body statement through `kernel`. The caller checked
+    /// [`Self::trigger_body_kernel_allowed`] and
+    /// [`Self::trigger_body_kernel_is_current`].
+    ///
+    /// The steps with effects are the ordinary dispatcher's, in its order:
+    /// `execute_statement`'s entry, `execute_statement_impl_body`'s
+    /// bookkeeping and `plan_statement_execution`, its statement savepoint,
+    /// failure restore, conflict rollback and autocommit resolve, and the
+    /// dispatch gates (encoding, read-only). What is skipped is fixed for an
+    /// admitted statement under an unchanged identity: the rewrites (none
+    /// applies), the relation and semantic validation (it passed), and the
+    /// arm's compile (this is its program). An INSERT then runs the shared
+    /// INSERT kernel with the program; an UPDATE or DELETE runs its arm's
+    /// tail for a target without triggers.
+    pub(super) fn execute_trigger_body_kernel<'a>(
+        &'a self,
+        kernel: &'a TriggerBodyKernel,
+        statement: &'a Statement,
+        params: Option<&'a [SqliteValue]>,
+    ) -> FallbackStatementFuture<'a, Result<()>> {
+        self.with_fallback_statement(Box::pin(async move {
+            #[cfg(test)]
+            TRIGGER_BODY_KERNEL_RUNS.with(|runs| runs.set(runs.get() + 1));
+            self.background_status()?;
+            self.txn_replay_note_statement(statement);
+            self.retained_flush_dropped_pending_writes.set(false);
+            let _record_profile_scope =
+                enter_record_profile_scope(RecordProfileScope::CoreConnection);
+            self.clear_table_program_error_state();
+            self.forget_constraint_failure_action_at_top_level();
+            self.sync_change_tracking_context();
+            let _statement_exec_depth_guard = self.enter_statement_exec();
+            let _dml_conflict_clause_guard = DmlConflictClauseGuard::new(
+                &self.dml_conflict_clause,
+                statement_dml_conflict_clause(statement),
+            );
+            let StatementExecutionPlan {
+                op_cx,
+                capture_time_travel_snapshot,
+                schema_change_boundary,
+                was_auto,
+                ..
+            } = self.plan_statement_execution(statement).await?;
+            let previous_changes = self.last_changes.get();
+            let previous_total_changes = self.total_changes.get();
+            let previous_trigger_step_changes = self.trigger_step_changes.get();
+            let previous_last_insert_rowid = self.current_last_insert_rowid();
+            self.txn_metrics_note_write();
+            let preserve_prior_changes =
+                statement_preserves_prior_changes_on_constraint(statement);
+            let rollback_on_constraint_violation =
+                statement_rolls_back_transaction_on_constraint(statement);
+            let result = if self.should_use_statement_savepoint(was_auto) {
+                let purpose = match statement {
+                    Statement::Insert(_) => "insert",
+                    Statement::Update(_) => "update",
+                    _ => "delete",
+                };
+                self.with_internal_statement_savepoint_and_cx(
+                    &op_cx,
+                    purpose,
+                    preserve_prior_changes,
+                    false,
+                    async || {
+                        self.run_trigger_body_kernel_program(&op_cx, kernel, statement, params)
+                            .await
+                            .map_err(|error| Self::qualify_missing_target_table(error, statement))
+                    },
+                )
+                .await
+            } else {
+                self.run_trigger_body_kernel_program(&op_cx, kernel, statement, params)
+                    .await
+                    .map_err(|error| Self::qualify_missing_target_table(error, statement))
+            };
+            let mut preserved_constraint_failure_rows = false;
+            let result = match result {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    preserved_constraint_failure_rows = self.restore_failed_statement_tracking(
+                        preserve_prior_changes,
+                        &error,
+                        previous_changes,
+                        previous_total_changes,
+                        previous_trigger_step_changes,
+                        previous_last_insert_rowid,
+                    );
+                    match self
+                        .maybe_rollback_transaction_for_conflict_action(
+                            rollback_on_constraint_violation,
+                            was_auto,
+                            &error,
+                        )
+                        .await
+                    {
+                        Ok(()) => Err(error),
+                        Err(rollback_error) => Err(rollback_error),
+                    }
+                }
+            };
+            let commit_autocommit_on_error = was_auto
+                && (preserved_constraint_failure_rows
+                    || matches!(result.as_ref(), Err(FrankenError::RaiseFail(_))));
+            let ok = result.is_ok() || commit_autocommit_on_error;
+            self.resolve_autocommit_txn_with_dirty_table_and_capture_and_cx(
+                was_auto,
+                ok,
+                Self::extract_written_table_name(statement),
+                capture_time_travel_snapshot,
+                schema_change_boundary,
+                &op_cx,
+            )
+            .await?;
+            result
+        }))
+    }
+
+    /// The dispatch of a kernel's statement: the gates
+    /// `execute_statement_dispatch_with_fk_scope` and `_impl` apply to it, then
+    /// its program. The caller qualifies a missing-table error as that
+    /// dispatcher does.
+    async fn run_trigger_body_kernel_program(
+        &self,
+        cx: &Cx,
+        kernel: &TriggerBodyKernel,
+        statement: &Statement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<()> {
+        self.guard_mutation_encoding_supported(statement)?;
+        if self.pager.is_readonly() {
+            return Err(FrankenError::ReadOnly);
+        }
+        self.clear_prepared_direct_insert_append_hint();
+        match statement {
+            Statement::Insert(insert) => {
+                lean_future(|| {
+                    self.execute_insert_dispatch(
+                        cx,
+                        statement,
+                        insert,
+                        params,
+                        Some(&kernel.program),
+                        Some(kernel.identity),
+                    )
+                })
+                .await?;
+            }
+            Statement::Update(_) | Statement::Delete(_) => {
+                let (_, affected, _) = lean_future(|| {
+                    self.execute_table_program_with_cx(
+                        &kernel.program,
+                        params,
+                        false,
+                        TableExecutionRuntimeRequirements::read_path(),
+                        cx,
+                        true,
+                        Vec::new(),
+                        None,
+                    )
+                })
+                .await?;
+                if let Statement::Update(update) = statement {
+                    // UPDATE OR REPLACE may delete another row: the arm's
+                    // victim pass (a no-op without victims).
+                    boxed_future(|| self.enforce_fk_on_replace_victims(&update.table.name)).await?;
+                }
+                self.record_statement_changes(affected);
+            }
+            _ => {
+                return Err(FrankenError::internal(
+                    "trigger body kernel holds a statement that is not INSERT, UPDATE or DELETE",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// bd-i3csr.1 (GH#491): whether `INSERT INTO t [(cols)] SELECT ... FROM s
@@ -572,6 +1074,30 @@ impl Connection {
         Ok(instances)
     }
 
+    /// A RETURNING subquery left for execution must retain its own lexical
+    /// scope even when it is not correlated. The scalar/EXISTS emitters do
+    /// not handle WITH, derived tables or every LIMIT/aggregate shape; those
+    /// expressions are projected through SELECT at the changed-row boundary.
+    fn returning_has_uncompiled_subquery(&self, returning: &[ResultColumn]) -> bool {
+        returning.iter().any(|column| {
+            let ResultColumn::Expr { expr, .. } = column else {
+                return false;
+            };
+            expr_contains_subquery_matching_deep(expr, self, &|subquery, conn| match subquery {
+                SubqueryExprRef::Scalar(inner) => {
+                    !scalar_subquery_answered_by_table_scan(inner, conn)
+                }
+                SubqueryExprRef::Exists(inner) => {
+                    !exists_subquery_answered_by_table_scan(inner, conn)
+                }
+                SubqueryExprRef::In(inner) => {
+                    !in_subquery_supported_by_vdbe(inner, conn)
+                        || is_correlated_subquery_with_schema(inner, &conn.schema.borrow())
+                }
+            })
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn execute_insert_dispatch(
         &self,
@@ -597,15 +1123,20 @@ impl Connection {
                 insert.table.name
             )));
         }
-        if Box::pin(self.execute_fts5_maintenance_insert(insert)).await? {
-            return Ok(Vec::new());
-        }
-        #[cfg(feature = "ext-fts5")]
-        if let Some(affected) =
-            Box::pin(self.execute_fts5_magic_delete_insert(insert, params)).await?
-        {
-            self.record_statement_changes(affected);
-            return Ok(Vec::new());
+        // Both FTS5 command forms name the table itself as the first column
+        // (`INSERT INTO ft(ft, ...)`). Any other INSERT is neither, so it does
+        // not allocate their futures (bd-w4pr1.13.35).
+        if fts5_insert_uses_command_column(insert) {
+            if Box::pin(self.execute_fts5_maintenance_insert(insert)).await? {
+                return Ok(Vec::new());
+            }
+            #[cfg(feature = "ext-fts5")]
+            if let Some(affected) =
+                Box::pin(self.execute_fts5_magic_delete_insert(insert, params)).await?
+            {
+                self.record_statement_changes(affected);
+                return Ok(Vec::new());
+            }
         }
         if insert.with.is_some() {
             self.log_mem_execution_fallback("insert", "with_clause_materialization")?;
@@ -660,13 +1191,21 @@ impl Connection {
                 fsqlite_ast::TriggerTiming::After,
                 &coarse_update_event,
             ));
+        // bd-d8s37: a conflicting DO UPDATE on a foreign-key parent table must
+        // enforce ON UPDATE RESTRICT / NO ACTION and execute ON UPDATE CASCADE /
+        // SET NULL / SET DEFAULT before the parent's AFTER UPDATE triggers fire.
+        let table_has_upsert_fk_parent_work = is_do_update_upsert
+            && self.fk_cascade_propagation_enabled()
+            && self.table_is_foreign_key_parent(table_name);
         // The conflict/OLD-NEW plan is needed whenever a conflicting row
-        // would change which triggers fire: BEFORE/AFTER UPDATE must fire
-        // for the update, and AFTER INSERT must be SUPPRESSED because no
-        // insert happened — the latter matters even with no UPDATE triggers
-        // (stock fires only BEFORE INSERT on a conflict/update path).
-        let upsert_needs_conflict_plan =
-            is_do_update_upsert && (has_after_insert || table_has_upsert_update_trigger);
+        // would change which triggers fire or enforce parent-side FK actions:
+        // BEFORE/AFTER UPDATE must fire for the update, AFTER INSERT must be
+        // SUPPRESSED because no insert happened, and parent-side ON UPDATE FK
+        // checks/cascades must run on the updated parent key.
+        let upsert_needs_conflict_plan = is_do_update_upsert
+            && (has_after_insert
+                || table_has_upsert_update_trigger
+                || table_has_upsert_fk_parent_work);
         if is_live_vtab {
             if !insert.returning.is_empty() {
                 return Err(FrankenError::NotImplemented(
@@ -689,6 +1228,30 @@ impl Connection {
                 ));
             }
         }
+        // bd-d8fxs: INSERT needs the same changed-row projection boundary as
+        // UPDATE/DELETE. In particular, a nested WITH or derived table must
+        // not reach emit_scalar_subquery, which cannot preserve that scope.
+        // bd-ow713, bd-j9tg3: nor may a subquery the fold left in place: one
+        // that re-reads the target, which stock evaluates again after each
+        // row is inserted, or one that may read what the first row changes,
+        // which stock evaluates once at that row.
+        let returning_projection = if !is_live_vtab
+            && (self.returning_has_uncompiled_subquery(&insert.returning)
+                || self.returning_defers_fold(&insert.returning, table_name))
+        {
+            self.log_mem_execution_fallback("insert", "insert_row_by_row_returning_fallback")?;
+            Some(self.prepare_dml_returning_projection(
+                &fsqlite_ast::QualifiedTableRef {
+                    name: insert.table.clone(),
+                    alias: None,
+                    index_hint: None,
+                    time_travel: None,
+                },
+                &insert.returning,
+            )?)
+        } else {
+            None
+        };
         if !is_live_vtab
             && let fsqlite_ast::InsertSource::Select(select_stmt) = &insert.source
         {
@@ -747,6 +1310,7 @@ impl Connection {
             let needs_row_by_row_replay = has_before_insert
                 || has_after_insert
                 || upsert_needs_conflict_plan
+                || returning_projection.is_some()
                 || self.fk_enforcement_enabled();
             // bd-i3csr.1: a source the INSERT program can scan itself runs
             // as that one program (the VDBE path below), not materialized
@@ -780,6 +1344,7 @@ impl Connection {
             && (has_before_insert
                 || has_after_insert
                 || upsert_needs_conflict_plan
+                || returning_projection.is_some()
                 || self.fk_enforcement_enabled())
             && let fsqlite_ast::InsertSource::Values(rows) = &insert.source
             && rows.len() > 1
@@ -797,18 +1362,31 @@ impl Connection {
             // must first be resolved against the ORIGINAL statement's
             // globally numbered/named slots (as INSERT SELECT does).
             let resolved_insert;
-            let replay_insert = match params {
-                Some(params) if !insert.upsert.is_empty() || !insert.returning.is_empty() => {
-                    let mut cloned = insert.clone();
-                    bind_placeholders_in_insert_statement(
-                        &mut cloned,
-                        &mut BindParamState::default(),
-                        params,
-                    )?;
-                    resolved_insert = cloned;
-                    &resolved_insert
-                }
-                _ => insert,
+            let replay_insert = if !insert.upsert.is_empty() || !insert.returning.is_empty() {
+                // These are caller bindings, before replay assigns ?1..?N to
+                // source values. Omitted bindings mean NULL, whereas an
+                // explicitly supplied short slice must still be rejected.
+                let mut bind_state = BindParamState::default();
+                let mut cloned =
+                    canonicalize_insert_placeholders_with_state(insert, &mut bind_state)?;
+                let unbound_params;
+                let original_params = if let Some(params) = params {
+                    params
+                } else {
+                    let parameter_slots =
+                        usize::try_from(bind_state.next_index.saturating_sub(1)).unwrap_or(0);
+                    unbound_params = vec![SqliteValue::Null; parameter_slots];
+                    &unbound_params
+                };
+                bind_placeholders_in_insert_statement(
+                    &mut cloned,
+                    &mut BindParamState::default(),
+                    original_params,
+                )?;
+                resolved_insert = cloned;
+                &resolved_insert
+            } else {
+                insert
             };
             let outcome = self
                 .execute_insert_select_materialized_rows_outcome(replay_insert, &source_rows)
@@ -887,7 +1465,7 @@ impl Connection {
                 // as -1 when the rowid will be auto-assigned (it is not yet
                 // known). Match that. (GH #205)
                 if Box::pin(self.fire_before_triggers(
-                    table_name,
+                    &insert.table,
                     &insert_event,
                     None,
                     Some(new_values),
@@ -942,7 +1520,7 @@ impl Connection {
                 }
                 for (row, rowid) in live_insert_rows.iter().zip(inserted_rowids.iter()) {
                     if let Err(error) = Box::pin(self.fire_after_triggers(
-                        table_name,
+                        &insert.table,
                         &insert_event,
                         None,
                         Some(&row.values),
@@ -1033,7 +1611,7 @@ impl Connection {
                     Some(fsqlite_ast::ConflictAction::Abort),
                 );
                 Box::pin(self.fire_before_triggers(
-                    table_name,
+                    &insert.table,
                     &update_event,
                     Some(old_row),
                     Some(new_row),
@@ -1052,6 +1630,21 @@ impl Connection {
             return Ok(Vec::new());
         }
 
+        // bd-d8s37: Parent-side FK enforcement for a conflicting DO UPDATE arm.
+        // Run AFTER BEFORE UPDATE triggers (so trigger-side child edits are
+        // observed) and BEFORE writing the parent row (so ON UPDATE RESTRICT
+        // rejects cleanly without mutating the table).
+        let mut pending_upsert_fk_actions = Vec::new();
+        if table_has_upsert_fk_parent_work
+            && let Some((_, old_row, new_row, true)) = &upsert_update_plan
+        {
+            pending_upsert_fk_actions =
+                Box::pin(self.check_fk_on_update(table_name, old_row, new_row)).await?;
+            if !pending_upsert_fk_actions.is_empty() {
+                self.ensure_trigger_program_admission_available()?;
+            }
+        }
+
         // Phase 5B.2 (bd-1yi8): INSERT OR REPLACE / INSERT OR IGNORE
         // routes through VDBE which has UPSERT semantics in the
         // Insert opcode (table_move_to + delete + insert). The
@@ -1064,11 +1657,47 @@ impl Connection {
         // from the pager via StorageCursor instead of MemDatabase.
         // The VDBE path is correct; this is an optimization only.
 
+        // Capture the actual inserted/updated row in the VDBE. Projecting it
+        // later must not re-read a key that an UPSERT changed, nor use the
+        // candidate values when defaults, affinity or generated columns have
+        // changed them. Multi-row inputs were replayed above so this snapshot
+        // is evaluated before the next row and before AFTER triggers.
+        let fk_snapshot = self.upsert_foreign_key_snapshot(insert);
+        let snapshot_statement = if returning_projection.is_some() || fk_snapshot.is_some() {
+            // A snapshot recompiles the statement instead of reusing its
+            // prepared program. Number every original placeholder before
+            // replacing or extending RETURNING, so explicit slots, anonymous
+            // slots and repeated names retain their statement-wide identity.
+            let mut snapshot_insert = canonicalize_insert_placeholders_with_state(
+                insert,
+                &mut BindParamState::default(),
+            )?;
+            if let Some(projection) = &returning_projection {
+                snapshot_insert
+                    .returning
+                    .clone_from(&projection.snapshot_columns);
+            } else if let Some(snapshot) = &fk_snapshot {
+                // Keep the caller's RETURNING prefix and evaluation point.
+                // The trailing FK image must not evaluate SET expressions again.
+                snapshot_insert
+                    .returning
+                    .extend(snapshot.columns.iter().cloned());
+            }
+            Some(Statement::Insert(snapshot_insert))
+        } else {
+            None
+        };
+        let compiled_statement = snapshot_statement.as_ref().unwrap_or(statement);
+        let compiled_insert = match compiled_statement {
+            Statement::Insert(compiled_insert) => compiled_insert,
+            _ => insert,
+        };
         let arc_prog;
         // A BEFORE trigger can invalidate code compiled at batch entry.
         // Check again here, after BEFORE and immediately before the write.
         let program: &VdbeProgram = if let Some(p) = precompiled.filter(|_| {
-            replay_identity.is_none_or(|identity| self.insert_replay_identity() == identity)
+            snapshot_statement.is_none()
+                && replay_identity.is_none_or(|identity| self.insert_replay_identity() == identity)
         }) {
             p
         } else {
@@ -1081,21 +1710,23 @@ impl Connection {
             record_trace_span_created();
             let _plan_guard = plan_span.enter();
             let (sql_text, sql_key) =
-                self.dispatch_statement_text(params, statement, |seen| &mut seen.inserts);
-            // A program built from resolved VALUES subqueries holds
-            // their results for this execution: never reuse it.
-            let _values_subquery_cache_bypass = insert_values_have_subquery(insert)
-                .then(|| BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true));
+                self.dispatch_statement_text(params, compiled_statement, |seen| &mut seen.inserts);
+            // Resolved VALUES subqueries hold this execution's values.
+            // A RETURNING snapshot also changes the compiled shape independently
+            // of any original SQL text retained by the dispatcher.
+            let _insert_cache_bypass = (insert_values_have_subquery(insert)
+                || snapshot_statement.is_some())
+            .then(|| BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true));
             arc_prog = self
                 .compile_with_cache(sql_key, &sql_text, async |conn| {
-                    conn.compile_table_insert(insert, params).await
+                    conn.compile_table_insert(compiled_insert, params).await
                 })
                 .await?;
             &arc_prog
         };
         let runtime_requirements = self.insert_runtime_requirements(insert)?;
         let vtab_instances = self.insert_program_vtab_instances(insert, program)?;
-        let (rows, affected, last_insert_rowid) = self
+        let (mut rows, affected, last_insert_rowid) = self
             .execute_table_program_with_cx(
                 program,
                 params,
@@ -1110,16 +1741,65 @@ impl Connection {
 
         // Implicit REPLACE deletes are parent-row deletions for inbound
         // FK purposes. Enforce their exact OLD rows before child-side
-        // validation and AFTER INSERT processing.
-        Box::pin(self.enforce_fk_on_replace_victims(table_name)).await?;
+        // validation and AFTER INSERT processing. Only a program that
+        // deleted rows left victims; without any the boxed pass is skipped.
+        if !self.last_replace_victims.borrow().is_empty() {
+            Box::pin(self.enforce_fk_on_replace_victims(&insert.table)).await?;
+        }
 
-        // bd-thqgm: FK constraint checking on INSERT.
-        // Skip FK enforcement when no row was written (e.g. an OR IGNORE
-        // PK conflict, affected == 0): SQLite does not FK-check a row it
-        // never inserted (#111).
-        if affected > 0 && self.fk_enforcement_enabled() {
+        // bd-d8s37: an UPSERT checks the row the write program produced.
+        // A real insert checks every child key; DO UPDATE checks only keys
+        // assigned by its single update arm. No-op arms produce no snapshot.
+        if let Some(snapshot) = &fk_snapshot {
+            if rows.len() != affected {
+                return Err(FrankenError::internal(
+                    "UPSERT foreign-key snapshot count does not match changed rows",
+                ));
+            }
+            for row in &mut rows {
+                let width = snapshot.columns.len();
+                let start = if returning_projection.is_some() {
+                    0
+                } else {
+                    row.values.len().checked_sub(width).ok_or_else(|| {
+                        FrankenError::internal("UPSERT foreign-key snapshot is incomplete")
+                    })?
+                };
+                let written = row.values.get(start..start + width).ok_or_else(|| {
+                    FrankenError::internal("UPSERT foreign-key snapshot is incomplete")
+                })?;
+                let keys = last_insert_rowid
+                    .is_none()
+                    .then_some(snapshot.updated_keys.as_slice());
+                Box::pin(self.check_fk_parent_exists_for_keys(table_name, written, keys)).await?;
+                if returning_projection.is_none() {
+                    row.values.truncate(start);
+                }
+            }
+        } else if affected > 0 && self.fk_enforcement_enabled() {
+            // Ordinary INSERT and UPSERT shapes without a precise receipt keep
+            // their established enforcement. Never check a skipped row.
             Box::pin(self.enforce_fk_on_insert(insert, table_name, params)).await?;
         }
+
+        // bd-d8s37: SQLite's parent ON UPDATE FK programs (CASCADE / SET NULL /
+        // SET DEFAULT) observe the updated parent row and run BEFORE the
+        // parent's RETURNING projection and AFTER UPDATE triggers.
+        if affected > 0 && !pending_upsert_fk_actions.is_empty() {
+            let _do_update_clause = DmlConflictClauseGuard::new(
+                &self.dml_conflict_clause,
+                Some(fsqlite_ast::ConflictAction::Abort),
+            );
+            for action in &pending_upsert_fk_actions {
+                Box::pin(self.execute_fk_update_action(action)).await?;
+            }
+        }
+
+        let rows = if let Some(projection) = &returning_projection {
+            Box::pin(self.project_dml_returning(projection, rows, params)).await?
+        } else {
+            rows
+        };
 
         // Patch trigger NEW rows: fill in auto-assigned INTEGER
         // PRIMARY KEY rowids that were NULL at pre-computation time.
@@ -1156,7 +1836,7 @@ impl Connection {
             let after_insert_rowid = self.current_last_insert_rowid();
             for new_values in &trigger_new_rows {
                 if let Err(error) = Box::pin(self.fire_after_triggers(
-                    table_name,
+                    &insert.table,
                     &insert_event,
                     None,
                     Some(new_values),
@@ -1183,7 +1863,7 @@ impl Connection {
                 Some(fsqlite_ast::ConflictAction::Abort),
             );
             if let Err(error) = Box::pin(self.fire_after_triggers(
-                table_name,
+                &insert.table,
                 &update_event,
                 Some(old_row),
                 Some(new_row),
@@ -1199,9 +1879,12 @@ impl Connection {
 
         if table_name.eq_ignore_ascii_case("sqlite_sequence") {
             Box::pin(self.refresh_sqlite_sequence_cache()).await?;
-        } else {
+        } else if self.is_autoincrement_target(table_name, insert.table.schema.as_deref()) {
+            // Only an AUTOINCREMENT table has a high-water to refresh; other
+            // tables do not allocate the refresh future.
             Box::pin(self.refresh_autoincrement_sequence_after_insert(
                 table_name,
+                insert.table.schema.as_deref(),
                 affected,
                 last_insert_rowid,
             ))
@@ -1260,5 +1943,293 @@ use super::*;
         ] {
             assert!(!admits(projection), "{projection}");
         }
+    }
+}
+
+/// bd-fpr5g lever 3b: the trigger body kernel is the path a body statement
+/// takes after its first firing, and it is given up whenever the ordinary
+/// dispatcher would do something it does not. The answers are pinned against
+/// stock SQLite by `kernel_run_trigger_bodies_follow_targets_pragmas_failures_and_rollback`
+/// in crates/fsqlite-core/tests/bd_fpr5g_trigger_body_cache_under_cte.rs;
+/// these tests count kernel runs (a thread-local, so tests do not share it),
+/// which an implementation that never takes the kernel, or takes it when it
+/// must not, gets wrong.
+#[cfg(test)]
+mod trigger_body_kernel_runs {
+    use super::*;
+
+    fn kernel_runs() -> u64 {
+        TRIGGER_BODY_KERNEL_RUNS.with(std::cell::Cell::get)
+    }
+
+    async fn ints(conn: &Connection, sql: &str) -> Vec<i64> {
+        conn.query(sql)
+            .await
+            .unwrap_or_else(|error| panic!("{sql}: {error}"))
+            .iter()
+            .flat_map(|row| row.values().to_vec())
+            .map(|value| match value {
+                SqliteValue::Integer(n) => n,
+                other => panic!("{sql}: {other:?}"),
+            })
+            .collect()
+    }
+
+    const SETUP: &[&str] = &[
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER)",
+        "CREATE TABLE lg(k, m)",
+        "CREATE TABLE u(k TEXT PRIMARY KEY, c INTEGER)",
+        "INSERT INTO u VALUES ('even', 0), ('odd', 0)",
+        "CREATE TRIGGER ti AFTER INSERT ON t WHEN NEW.n % 7 <> 3 BEGIN \
+           INSERT INTO lg VALUES (NEW.id, NEW.n > 10); \
+           UPDATE u SET c = c + 1 WHERE k = CASE WHEN NEW.n % 2 = 0 THEN 'even' ELSE 'odd' END; \
+         END",
+    ];
+
+    /// Insert `first..=last` into t from a recursive CTE; the firing rows.
+    async fn insert_range(conn: &Connection, first: i64, last: i64) -> Vec<i64> {
+        conn.execute(&format!(
+            "WITH RECURSIVE s(i) AS (SELECT {first} UNION ALL SELECT i + 1 FROM s WHERE i < {last}) \
+             INSERT INTO t SELECT i, i FROM s"
+        ))
+        .await
+        .unwrap();
+        (first..=last).filter(|n| n % 7 != 3).collect()
+    }
+
+    async fn assert_answers(conn: &Connection, fired: &[i64]) {
+        let count = |keep: &dyn Fn(i64) -> bool| {
+            i64::try_from(fired.iter().filter(|&&n| keep(n)).count()).unwrap()
+        };
+        assert_eq!(
+            ints(conn, "SELECT count(*), sum(m) FROM lg").await,
+            vec![count(&|_| true), count(&|n| n > 10)]
+        );
+        assert_eq!(
+            ints(conn, "SELECT c FROM u ORDER BY k").await,
+            vec![count(&|n| n % 2 == 0), count(&|n| n % 2 == 1)]
+        );
+    }
+
+    #[test]
+    fn body_statements_run_through_the_kernel_after_their_first_firing() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("kernel.db");
+            for path in [":memory:".to_owned(), file.to_string_lossy().into_owned()] {
+                let conn = Connection::open(&path).await.unwrap();
+                for sql in SETUP {
+                    conn.execute(sql).await.unwrap();
+                }
+                let before = kernel_runs();
+                let fired = insert_range(&conn, 1, 100).await;
+                // Each body statement's first firing takes the ordinary
+                // dispatcher and captures; every later firing takes the kernel.
+                let fired_count = u64::try_from(fired.len()).unwrap();
+                assert_eq!(kernel_runs() - before, 2 * fired_count - 2, "{path}");
+                assert_answers(&conn, &fired).await;
+            }
+        });
+    }
+
+    #[test]
+    fn the_kernel_is_given_up_when_the_dispatcher_would_differ() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            for sql in SETUP {
+                conn.execute(sql).await.unwrap();
+            }
+            let mut fired = insert_range(&conn, 1, 100).await;
+
+            // Foreign keys on: the dispatcher runs its FK validation scope, so
+            // no body statement takes the kernel.
+            conn.execute("PRAGMA foreign_keys = ON").await.unwrap();
+            let before = kernel_runs();
+            fired.extend(insert_range(&conn, 101, 120).await);
+            assert_eq!(kernel_runs() - before, 0, "foreign_keys = ON");
+            conn.execute("PRAGMA foreign_keys = OFF").await.unwrap();
+            assert_answers(&conn, &fired).await;
+
+            // A schema change (an index on the INSERT's target): the next
+            // statement's templates take the ordinary path once, and the
+            // index holds every row afterwards.
+            conn.execute("CREATE INDEX lg_k ON lg(k)").await.unwrap();
+            let before = kernel_runs();
+            let range = insert_range(&conn, 121, 140).await;
+            assert_eq!(
+                kernel_runs() - before,
+                2 * u64::try_from(range.len()).unwrap() - 2,
+                "after CREATE INDEX"
+            );
+            fired.extend(range);
+            assert_answers(&conn, &fired).await;
+            assert_eq!(
+                ints(&conn, "SELECT count(*) FROM lg WHERE k > 120").await,
+                vec![i64::try_from(fired.iter().filter(|&&n| n > 120).count()).unwrap()]
+            );
+            let integrity = conn.query("PRAGMA integrity_check").await.unwrap();
+            assert_eq!(
+                integrity[0].values(),
+                &[SqliteValue::Text("ok".into())],
+                "integrity after kernel-run inserts into an indexed table"
+            );
+
+            // A trigger on the INSERT's target: that statement is refused (it
+            // must fire the new trigger), the UPDATE and the new trigger's own
+            // body statement take the kernel after their first firings.
+            conn.execute(
+                "CREATE TRIGGER tl AFTER INSERT ON lg BEGIN \
+                   UPDATE u SET c = c + 1000 WHERE k = 'even'; END",
+            )
+            .await
+            .unwrap();
+            let before = kernel_runs();
+            let range = insert_range(&conn, 141, 160).await;
+            let range_count = u64::try_from(range.len()).unwrap();
+            assert_eq!(
+                kernel_runs() - before,
+                2 * (range_count - 1),
+                "a trigger on the body's target"
+            );
+            assert_eq!(
+                ints(&conn, "SELECT c FROM u WHERE k = 'even'").await,
+                vec![
+                    i64::try_from(fired.iter().chain(&range).filter(|&&n| n % 2 == 0).count())
+                        .unwrap()
+                        + 1000 * i64::try_from(range.len()).unwrap()
+                ]
+            );
+        });
+    }
+}
+
+/// bd-fpr5g lever 5: which INSERT ... SELECT streams into a table with
+/// triggers replay their rows through the compiled row program.
+#[cfg(test)]
+mod compiled_insert_replay_rows {
+    use super::*;
+
+    fn replayed_rows() -> u64 {
+        COMPILED_INSERT_REPLAY_ROWS.with(std::cell::Cell::get)
+    }
+
+    async fn ints(conn: &Connection, sql: &str) -> Vec<i64> {
+        conn.query(sql)
+            .await
+            .unwrap_or_else(|error| panic!("{sql}: {error}"))
+            .iter()
+            .flat_map(|row| row.values().to_vec())
+            .map(|value| match value {
+                SqliteValue::Integer(n) => n,
+                other => panic!("{sql}: {other:?}"),
+            })
+            .collect()
+    }
+
+    const SETUP: &[&str] = &[
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER)",
+        "CREATE TABLE lg(k, m)",
+        "CREATE TRIGGER ti AFTER INSERT ON t WHEN NEW.n % 7 <> 3 BEGIN \
+           INSERT INTO lg VALUES (NEW.id, NEW.n * 2); END",
+        "CREATE TABLE src(i INTEGER PRIMARY KEY, n INTEGER)",
+        "WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 300) \
+         INSERT INTO src SELECT i, i FROM s",
+    ];
+
+    /// Rows and log entries `t` and `lg` hold, as (count, sum) pairs.
+    async fn totals(conn: &Connection) -> Vec<i64> {
+        let mut out = ints(conn, "SELECT count(*), sum(n) FROM t").await;
+        out.extend(ints(conn, "SELECT count(*), sum(m) FROM lg").await);
+        out
+    }
+
+    /// The totals after `range` went into t (and fired the trigger).
+    fn expected(range: impl Iterator<Item = i64> + Clone) -> Vec<i64> {
+        let fired = range.clone().filter(|n| n % 7 != 3);
+        let count = |it: &mut dyn Iterator<Item = i64>| i64::try_from(it.count()).unwrap();
+        vec![
+            count(&mut range.clone()),
+            range.sum(),
+            count(&mut fired.clone()),
+            fired.map(|n| n * 2).sum(),
+        ]
+    }
+
+    #[test]
+    fn a_materialized_select_source_replays_through_the_compiled_row() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("replay.db");
+            for path in [":memory:".to_owned(), file.to_string_lossy().into_owned()] {
+                let conn = Connection::open(&path).await.unwrap();
+                for sql in SETUP {
+                    conn.execute(sql).await.unwrap();
+                }
+                // A projected expression keeps the streaming producer out: the
+                // SELECT is materialized, then replayed.
+                let before = replayed_rows();
+                conn.execute("INSERT INTO t SELECT i, n + 0 FROM src WHERE i <= 200")
+                    .await
+                    .unwrap();
+                assert_eq!(replayed_rows() - before, 200, "{path}: materialized SELECT");
+                assert_eq!(totals(&conn).await, expected(1..=200), "{path}");
+
+                // Bare columns of one table: the streaming producer emits the
+                // rows while the stream runs, and they keep the prepared replay.
+                conn.execute("CREATE TABLE src2(i INTEGER PRIMARY KEY, n INTEGER)")
+                    .await
+                    .unwrap();
+                conn.execute("INSERT INTO src2 SELECT i + 200, n + 200 FROM src WHERE i <= 50")
+                    .await
+                    .unwrap();
+                let before = replayed_rows();
+                conn.execute("INSERT INTO t SELECT i, n FROM src2").await.unwrap();
+                assert_eq!(replayed_rows() - before, 0, "{path}: streamed SELECT");
+                assert_eq!(totals(&conn).await, expected(1..=250), "{path}");
+            }
+        });
+    }
+
+    #[test]
+    fn temp_roots_keep_the_compiled_row_unless_the_target_is_temp() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            for sql in SETUP {
+                conn.execute(sql).await.unwrap();
+            }
+            // A TEMP table elsewhere and a CTE source (a materialized binding
+            // while the statement runs): both are temp roots, and the
+            // template's program opens neither.
+            conn.execute("CREATE TEMP TABLE scratch(x)").await.unwrap();
+            let before = replayed_rows();
+            conn.execute(
+                "WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 120) \
+                 INSERT INTO t SELECT i, i FROM s",
+            )
+            .await
+            .unwrap();
+            assert_eq!(replayed_rows() - before, 120, "CTE source with a TEMP table present");
+            assert_eq!(totals(&conn).await, expected(1..=120));
+
+            // A TEMP target keeps the prepared replay.
+            conn.execute("CREATE TEMP TABLE tt(id INTEGER PRIMARY KEY, n INTEGER)")
+                .await
+                .unwrap();
+            conn.execute(
+                "CREATE TEMP TRIGGER tti AFTER INSERT ON tt BEGIN \
+                   INSERT INTO lg VALUES (NEW.id, 0); END",
+            )
+            .await
+            .unwrap();
+            let before = replayed_rows();
+            conn.execute("INSERT INTO tt SELECT i, n + 0 FROM src WHERE i <= 30")
+                .await
+                .unwrap();
+            assert_eq!(replayed_rows() - before, 0, "TEMP target");
+            assert_eq!(ints(&conn, "SELECT count(*), sum(n) FROM tt").await, vec![30, 465]);
+            let mut want = expected(1..=120);
+            want[2] += 30;
+            assert_eq!(totals(&conn).await, want);
+        });
     }
 }

@@ -170,6 +170,32 @@ fn value_preserves_reusable_heap_storage(value: &SqliteValue) -> bool {
 /// with common cache line fractions and matches Arc<str>'s pointer size.
 const SMALL_TEXT_INLINE_CAP: usize = 23;
 
+/// Length of the longest `i64` in decimal, `i64::MIN` with its sign.
+const I64_DECIMAL_MAX_LEN: usize = 20;
+
+/// `value` in decimal, with a leading `-` when negative: the bytes
+/// `i64::to_string` produces, written at the end of `digits`.
+fn write_i64_decimal(value: i64, digits: &mut [u8; I64_DECIMAL_MAX_LEN]) -> &[u8] {
+    let mut rest = value.unsigned_abs();
+    let mut start = I64_DECIMAL_MAX_LEN;
+    loop {
+        start -= 1;
+        // `rest % 10` is a single digit.
+        #[allow(clippy::cast_possible_truncation)]
+        let digit = (rest % 10) as u8;
+        digits[start] = b'0' + digit;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    if value < 0 {
+        start -= 1;
+        digits[start] = b'-';
+    }
+    &digits[start..]
+}
+
 #[cfg(feature = "bench-internals")]
 static SMALL_TEXT_DIRECT_TRAITS_FOR_BENCH: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -233,6 +259,15 @@ enum SmallTextRepr {
     /// `lossy` exists only to satisfy Rust-facing string APIs. Storage,
     /// equality, ordering, hashing, and CAST-to-BLOB use `bytes`.
     Raw { bytes: Arc<[u8]>, lossy: Arc<str> },
+    /// UTF-16 whose code units cannot be recovered from its UTF-8 projection.
+    RawUtf16(Arc<RawUtf16>),
+}
+
+struct RawUtf16 {
+    bytes: Box<[u8]>,
+    encoding: TextEncoding,
+    utf8: Box<[u8]>,
+    display: Box<str>,
 }
 
 impl Clone for SmallText {
@@ -259,6 +294,7 @@ impl Clone for SmallTextRepr {
                 bytes: Arc::clone(bytes),
                 lossy: Arc::clone(lossy),
             },
+            Self::RawUtf16(raw) => Self::RawUtf16(Arc::clone(raw)),
         }
     }
 }
@@ -307,6 +343,28 @@ impl SmallText {
         }
     }
 
+    /// `left` followed by `right` in the inline representation, or `None` when
+    /// the two do not fit in [`Self::INLINE_CAPACITY`] bytes.
+    ///
+    /// Each part must be valid UTF-8 on its own (whole code points), which
+    /// makes the result valid UTF-8, the inline representation's invariant.
+    fn inline_concat_utf8(left: &[u8], right: &[u8]) -> Option<Self> {
+        let len = left.len() + right.len();
+        if len > SMALL_TEXT_INLINE_CAP {
+            return None;
+        }
+        let mut buf = [0u8; SMALL_TEXT_INLINE_CAP];
+        buf[..left.len()].copy_from_slice(left);
+        buf[left.len()..len].copy_from_slice(right);
+        debug_assert!(simdutf8::basic::from_utf8(&buf[..len]).is_ok());
+        Some(Self {
+            repr: SmallTextRepr::Inline {
+                len: u8::try_from(len).ok()?,
+                buf,
+            },
+        })
+    }
+
     /// Create from an `Arc<str>`, avoiding re-allocation if already heap.
     #[inline]
     pub fn from_arc(arc: Arc<str>) -> Self {
@@ -348,30 +406,14 @@ impl SmallText {
     /// UTF-16LE/BE payloads are decoded to canonical UTF-8: 16-bit code units are
     /// read in the declared byte order and converted through
     /// [`char::decode_utf16`], so a UTF-16 `sqlite_master` no longer decodes as
-    /// `t\0a\0b\0l\0e\0`. Lone surrogates decode to U+FFFD and any trailing odd
-    /// byte is ignored; byte-exact preservation of malformed UTF-16 sequences is
-    /// tracked separately (GH #180 / bd-bld9w.8). This is the shared decode core
-    /// the record-decode sites (bd-bld9w.2) route TEXT through.
+    /// `t\0a\0b\0l\0e\0`. A trailing odd byte is ignored. Malformed sequences
+    /// retain their native code units for BINARY comparisons and record writes.
     #[must_use]
     pub fn from_record_text_bytes(bytes: &[u8], encoding: TextEncoding) -> Self {
         match encoding {
             TextEncoding::Utf8 => Self::from_bytes(bytes),
             TextEncoding::Utf16le | TextEncoding::Utf16be => {
-                let little_endian = matches!(encoding, TextEncoding::Utf16le);
-                // `as_chunks::<2>` drops any trailing odd byte, matching the
-                // lenient handling of a malformed UTF-16 payload length.
-                let (pairs, _trailing_odd_byte) = bytes.as_chunks::<2>();
-                let units = pairs.iter().map(|pair| {
-                    if little_endian {
-                        u16::from_le_bytes(*pair)
-                    } else {
-                        u16::from_be_bytes(*pair)
-                    }
-                });
-                let decoded: String = char::decode_utf16(units)
-                    .map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER))
-                    .collect();
-                Self::from_string(decoded)
+                Self::from_utf16_record(bytes, encoding, false)
             }
         }
     }
@@ -390,28 +432,84 @@ impl SmallText {
         match encoding {
             TextEncoding::Utf8 => Self::from_bytes_shared(bytes),
             TextEncoding::Utf16le | TextEncoding::Utf16be => {
-                let little_endian = matches!(encoding, TextEncoding::Utf16le);
-                let (pairs, _trailing_odd_byte) = bytes.as_chunks::<2>();
-                let units = pairs.iter().map(|pair| {
-                    if little_endian {
-                        u16::from_le_bytes(*pair)
-                    } else {
-                        u16::from_be_bytes(*pair)
-                    }
-                });
-                let decoded: String = char::decode_utf16(units)
-                    .map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER))
-                    .collect();
-                Self::from_str_shared(&decoded)
+                Self::from_utf16_record(bytes, encoding, true)
             }
+        }
+    }
+
+    fn from_utf16_record(bytes: &[u8], encoding: TextEncoding, shared: bool) -> Self {
+        let (pairs, _) = bytes.as_chunks::<2>();
+        let mut units = pairs.iter().map(|&pair| match encoding {
+            TextEncoding::Utf16le => u16::from_le_bytes(pair),
+            TextEncoding::Utf16be => u16::from_be_bytes(pair),
+            TextEncoding::Utf8 => unreachable!("UTF-16 record decoder"),
+        });
+        if let Ok(text) = char::decode_utf16(units.clone()).collect::<Result<String, _>>() {
+            return if shared {
+                Self::from_str_shared(&text)
+            } else {
+                Self::from_string(text)
+            };
+        }
+
+        // SQLite's UTF-8 projection consumes the next unit after any surrogate,
+        // even a non-pair. A final solitary surrogate yields three non-UTF-8
+        // bytes. Neither projection can reconstruct the original native record.
+        let mut text = String::new();
+        let mut trailing = None;
+        while let Some(unit) = units.next() {
+            let value = if (0xd800..=0xdfff).contains(&unit) {
+                let Some(next) = units.next() else {
+                    trailing = Some(unit);
+                    break;
+                };
+                0x1_0000 + (u32::from(unit & 0x3ff) << 10) + u32::from(next & 0x3ff)
+            } else {
+                u32::from(unit)
+            };
+            text.push(char::from_u32(value).expect("decoded scalar is in the Unicode range"));
+        }
+        let mut utf8 = text.as_bytes().to_vec();
+        if let Some(unit) = trailing {
+            utf8.extend_from_slice(&[
+                0xed,
+                0x80 | u8::try_from((unit >> 6) & 0x3f).expect("six bits"),
+                0x80 | u8::try_from(unit & 0x3f).expect("six bits"),
+            ]);
+            text.push(char::REPLACEMENT_CHARACTER);
+        }
+        Self {
+            repr: SmallTextRepr::RawUtf16(Arc::new(RawUtf16 {
+                bytes: pairs.as_flattened().into(),
+                encoding,
+                utf8: utf8.into_boxed_slice(),
+                display: text.into_boxed_str(),
+            })),
         }
     }
 
     /// UTF-8 byte payload variant of [`Self::from_record_text_bytes_shared`]:
     /// valid UTF-8 becomes inline (short) or `HeapShared` (wide); invalid UTF-8
     /// keeps the byte-preserving raw representation.
+    ///
+    /// ASCII is UTF-8, so a payload that fits inline and has no byte with its
+    /// high bit set is copied in as [`Self::new`] would store it, without the
+    /// general validation: one OR over the zero-padded buffer instead of ~100
+    /// instructions for a ten-byte key (bd-w4pr1.13.28 follow-up, lever O1).
     #[inline]
     fn from_bytes_shared(bytes: &[u8]) -> Self {
+        if bytes.len() <= SMALL_TEXT_INLINE_CAP {
+            let mut buf = [0u8; SMALL_TEXT_INLINE_CAP];
+            buf[..bytes.len()].copy_from_slice(bytes);
+            if buf.iter().fold(0u8, |high, byte| high | byte) < 0x80 {
+                return Self {
+                    repr: SmallTextRepr::Inline {
+                        len: bytes.len() as u8,
+                        buf,
+                    },
+                };
+            }
+        }
         match simdutf8::basic::from_utf8(bytes) {
             Ok(text) => Self::from_str_shared(text),
             Err(_) => Self::from_raw_bytes(Arc::from(bytes)),
@@ -437,13 +535,27 @@ impl SmallText {
     /// UTF-8 returns the value's exact bytes without copying (byte-preserving,
     /// including invalid UTF-8). UTF-16LE/BE encode the value's characters to
     /// 16-bit code units in the requested byte order. Invalid-UTF-8 raw TEXT is
-    /// encoded from its lossy string form under UTF-16; byte-exact preservation
-    /// of such payloads is GH #180 / bd-bld9w.8.
+    /// encoded from its lossy string form under UTF-16. Values read as UTF-16
+    /// retain all complete code units, including unpaired surrogates.
     #[must_use]
     pub fn to_record_text_bytes(&self, encoding: TextEncoding) -> Cow<'_, [u8]> {
         match encoding {
             TextEncoding::Utf8 => Cow::Borrowed(self.as_bytes_direct()),
             TextEncoding::Utf16le | TextEncoding::Utf16be => {
+                if let SmallTextRepr::RawUtf16(raw) = &self.repr {
+                    return if encoding == raw.encoding {
+                        Cow::Borrowed(&raw.bytes)
+                    } else {
+                        Cow::Owned(
+                            raw.bytes
+                                .as_chunks::<2>()
+                                .0
+                                .iter()
+                                .flat_map(|&[a, b]| [b, a])
+                                .collect(),
+                        )
+                    };
+                }
                 let little_endian = matches!(encoding, TextEncoding::Utf16le);
                 let text = self.as_str();
                 let mut bytes = Vec::with_capacity(text.len().saturating_mul(2));
@@ -457,6 +569,33 @@ impl SmallText {
                 }
                 Cow::Owned(bytes)
             }
+        }
+    }
+
+    /// Compare SQLite TEXT in the byte order of the BINARY collation.
+    #[must_use]
+    pub fn cmp_binary_in(&self, other: &Self, encoding: TextEncoding) -> Ordering {
+        if encoding != TextEncoding::Utf8
+            && (matches!(self.repr, SmallTextRepr::RawUtf16(_))
+                || matches!(other.repr, SmallTextRepr::RawUtf16(_)))
+        {
+            return self
+                .to_record_text_bytes(encoding)
+                .cmp(&other.to_record_text_bytes(encoding));
+        }
+        binary_text_cmp(self.as_bytes_direct(), other.as_bytes_direct(), encoding)
+    }
+
+    // Different native UTF-16 sequences can project to the same UTF-8 bytes.
+    // Keep them distinct when a sorter or a set compares canonical values.
+    fn cmp_utf16_identity(&self, other: &Self) -> Ordering {
+        match (&self.repr, &other.repr) {
+            (SmallTextRepr::RawUtf16(_), SmallTextRepr::RawUtf16(_)) => {
+                self.cmp_binary_in(other, TextEncoding::Utf16be)
+            }
+            (SmallTextRepr::RawUtf16(_), _) => Ordering::Greater,
+            (_, SmallTextRepr::RawUtf16(_)) => Ordering::Less,
+            _ => Ordering::Equal,
         }
     }
 
@@ -526,6 +665,7 @@ impl SmallText {
             SmallTextRepr::HeapOwned { text, .. } => text.as_str(),
             SmallTextRepr::HeapShared(text) => text,
             SmallTextRepr::Raw { lossy, .. } => lossy,
+            SmallTextRepr::RawUtf16(raw) => &raw.display,
         }
     }
 
@@ -535,6 +675,7 @@ impl SmallText {
     pub fn as_str_checked(&self) -> Option<&str> {
         match &self.repr {
             SmallTextRepr::Raw { .. } => None,
+            SmallTextRepr::RawUtf16(raw) => std::str::from_utf8(&raw.utf8).ok(),
             _ => Some(self.as_str()),
         }
     }
@@ -543,7 +684,11 @@ impl SmallText {
     #[inline]
     #[must_use]
     pub fn is_valid_utf8(&self) -> bool {
-        !matches!(&self.repr, SmallTextRepr::Raw { .. })
+        match &self.repr {
+            SmallTextRepr::Raw { .. } => false,
+            SmallTextRepr::RawUtf16(raw) => std::str::from_utf8(&raw.utf8).is_ok(),
+            _ => true,
+        }
     }
 
     /// Get the raw bytes of this text value without going through `&str`.
@@ -566,6 +711,7 @@ impl SmallText {
             SmallTextRepr::HeapOwned { text, .. } => text.as_bytes(),
             SmallTextRepr::HeapShared(text) => text.as_bytes(),
             SmallTextRepr::Raw { bytes, .. } => bytes,
+            SmallTextRepr::RawUtf16(raw) => &raw.utf8,
         }
     }
 
@@ -577,6 +723,7 @@ impl SmallText {
             SmallTextRepr::HeapOwned { text, .. } => text.len(),
             SmallTextRepr::HeapShared(text) => text.len(),
             SmallTextRepr::Raw { bytes, .. } => bytes.len(),
+            SmallTextRepr::RawUtf16(raw) => raw.utf8.len(),
         }
     }
 
@@ -607,6 +754,7 @@ impl SmallText {
                 .unwrap_or_else(|| Arc::<str>::from(text)),
             SmallTextRepr::HeapShared(text) => text,
             SmallTextRepr::Raw { lossy, .. } => lossy,
+            SmallTextRepr::RawUtf16(raw) => Arc::from(&*raw.display),
         }
     }
 }
@@ -633,6 +781,11 @@ impl fmt::Display for SmallText {
 impl PartialEq for SmallText {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
+        if matches!(self.repr, SmallTextRepr::RawUtf16(_))
+            || matches!(other.repr, SmallTextRepr::RawUtf16(_))
+        {
+            return self.cmp_utf16_identity(other).is_eq();
+        }
         #[cfg(feature = "bench-internals")]
         if SMALL_TEXT_DIRECT_TRAITS_FOR_BENCH.load(std::sync::atomic::Ordering::Relaxed) {
             SMALL_TEXT_DIRECT_TRAIT_HITS_FOR_BENCH
@@ -658,6 +811,14 @@ impl PartialOrd for SmallText {
 impl Ord for SmallText {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
+        if matches!(self.repr, SmallTextRepr::RawUtf16(_))
+            || matches!(other.repr, SmallTextRepr::RawUtf16(_))
+        {
+            return self
+                .as_bytes_direct()
+                .cmp(other.as_bytes_direct())
+                .then_with(|| self.cmp_utf16_identity(other));
+        }
         #[cfg(feature = "bench-internals")]
         if SMALL_TEXT_DIRECT_TRAITS_FOR_BENCH.load(std::sync::atomic::Ordering::Relaxed) {
             SMALL_TEXT_DIRECT_TRAIT_HITS_FOR_BENCH
@@ -1206,6 +1367,47 @@ impl SqliteValue {
         }
     }
 
+    /// Whether this value satisfies a SQL boolean predicate. NULL is false here.
+    /// TEXT and BLOB use the real numeric prefix, including its exponent.
+    #[must_use]
+    pub fn is_sql_truthy(&self) -> bool {
+        match self {
+            Self::Integer(n) => *n != 0,
+            value => value.to_float() != 0.0,
+        }
+    }
+
+    /// Evaluate a SQL predicate in the database's text encoding. SQLite
+    /// interprets BLOB bytes as text in that encoding for numeric conversion.
+    #[must_use]
+    pub fn is_sql_truthy_in(&self, encoding: TextEncoding) -> bool {
+        let Self::Blob(bytes) = self else {
+            return self.is_sql_truthy();
+        };
+        let (low, high) = match encoding {
+            TextEncoding::Utf8 => return self.is_sql_truthy(),
+            TextEncoding::Utf16le => (0, 1),
+            TextEncoding::Utf16be => (1, 0),
+        };
+        // A numeric prefix contains only ASCII code units. Stop before binary
+        // payload following the number and ignore an incomplete final unit.
+        let mut prefix = smallvec::SmallVec::<[u8; 32]>::new();
+        for pair in bytes.as_chunks::<2>().0 {
+            let ch = pair[low];
+            if pair[high] != 0 {
+                break;
+            }
+            if prefix.is_empty() && matches!(ch, b' ' | b'\t'..=b'\r') {
+                continue;
+            }
+            if !matches!(ch, b'0'..=b'9' | b'.' | b'+' | b'-' | b'e' | b'E') {
+                break;
+            }
+            prefix.push(ch);
+        }
+        parse_float_prefix_bytes(&prefix) != 0.0
+    }
+
     /// Coerce a value for SQLite `sum()` accumulation.
     ///
     /// `sum()` keeps integer accumulation only for INTEGER values and text that
@@ -1286,6 +1488,18 @@ impl SqliteValue {
         }
     }
 
+    /// SQL `CAST(value AS BLOB)` uses the database encoding for text and
+    /// the text representation of numbers. Existing BLOBs retain their bytes.
+    #[must_use]
+    pub fn cast_to_blob_in(self, encoding: TextEncoding) -> Self {
+        let text = match self {
+            Self::Null | Self::Blob(_) => return self,
+            Self::Text(text) => text,
+            number => SmallText::from(number.to_text()),
+        };
+        Self::Blob(Arc::from(text.to_record_text_bytes(encoding)))
+    }
+
     /// SQL `self || rhs`.
     ///
     /// NULL if either operand is NULL; otherwise TEXT holding the text bytes of
@@ -1309,7 +1523,21 @@ impl SqliteValue {
             bytes.extend_from_slice(&right);
             return Self::Text(SmallText::from_bytes(&bytes));
         }
-        // Both operands render as valid UTF-8: concatenate as `str`.
+        // Both operands render as valid UTF-8. A TEXT or INTEGER pair whose
+        // result fits inline is built in place: no String for the integer's
+        // digits or for the result, and no UTF-8 check of a part that is
+        // already known to be valid (`'row-' || id` cost ~600 instructions a
+        // row through the String path below).
+        let mut left_digits = [0_u8; I64_DECIMAL_MAX_LEN];
+        let mut right_digits = [0_u8; I64_DECIMAL_MAX_LEN];
+        if let (Some(left), Some(right)) = (
+            self.concat_operand_utf8(&mut left_digits),
+            rhs.concat_operand_utf8(&mut right_digits),
+        ) && let Some(text) = SmallText::inline_concat_utf8(left, right)
+        {
+            return Self::Text(text);
+        }
+        // Concatenate as `str`.
         match (self, rhs) {
             (Self::Text(l), Self::Text(r)) => {
                 let mut s = String::with_capacity(l.len() + r.len());
@@ -1334,6 +1562,20 @@ impl SqliteValue {
                 s.push_str(&r.to_text());
                 Self::Text(s.into())
             }
+        }
+    }
+
+    /// The UTF-8 bytes `||` takes from a valid-UTF-8 TEXT (its stored bytes)
+    /// or an INTEGER (its decimal digits, written into `digits`). `None` for
+    /// every other value.
+    fn concat_operand_utf8<'a>(
+        &'a self,
+        digits: &'a mut [u8; I64_DECIMAL_MAX_LEN],
+    ) -> Option<&'a [u8]> {
+        match self {
+            Self::Text(text) if text.is_valid_utf8() => Some(text.as_bytes_direct()),
+            Self::Integer(value) => Some(write_i64_decimal(*value, digits)),
+            _ => None,
         }
     }
 
@@ -1407,11 +1649,12 @@ impl SqliteValue {
         }
     }
 
-    /// Mirrors C SQLite's `numericType()` (SQLite VDBE:496): returns true if this
-    /// value should be treated as an integer for arithmetic purposes.
+    /// Whether this value has an integer numeric prefix: an Integer, or
+    /// Text/Blob whose SQLite numeric prefix parses as an `i64`. Float, Null and
+    /// text with no numeric prefix are not.
     ///
-    /// Integer values are obviously integer-typed. Text/Blob values that parse
-    /// as i64 are also integer-typed. Float and Null are not.
+    /// This is not arithmetic's operand type: there non-numeric text counts as
+    /// integer 0 (see [`Self::is_float_numeric_type`]).
     #[inline]
     pub fn is_integer_numeric_type(&self) -> bool {
         fn text_is_integer_numeric_type(s: &str) -> bool {
@@ -1428,12 +1671,14 @@ impl SqliteValue {
         }
     }
 
-    /// Returns true for REAL syntax or a numeric prefix outside the `i64` range.
-    /// Non-numeric text/blob is NOT float: it coerces to integer 0 in
-    /// SQLite's OP_Add/Sub/Mul. Arithmetic must promote overflowing integer
-    /// text to REAL instead of using the saturating INTEGER conversion.
+    /// Arithmetic's operand type, as C SQLite's `numericType()` decides it:
+    /// true (REAL) for a Float, or Text/Blob whose numeric prefix is REAL
+    /// syntax or lies outside the `i64` range; false (INTEGER) otherwise.
+    /// Non-numeric text/blob is NOT float: it coerces to integer 0 in every
+    /// arithmetic opcode (`+ - * / %`). Arithmetic must promote overflowing
+    /// integer text to REAL instead of using the saturating INTEGER conversion.
     #[inline]
-    fn is_float_numeric_type(&self) -> bool {
+    pub fn is_float_numeric_type(&self) -> bool {
         fn text_is_float(s: &str) -> bool {
             let trimmed = trim_sqlite_ascii_whitespace(s);
             let end = scan_numeric_prefix(trimmed.as_bytes());
@@ -1532,6 +1777,59 @@ impl SqliteValue {
                 }
             }
             _ => Self::float_result_or_null(self.to_float() * other.to_float()),
+        }
+    }
+
+    /// Divide following SQLite's `OP_Divide`: NULL if either operand is NULL
+    /// or the divisor is zero. When both operands are integer-typed by
+    /// [`Self::is_float_numeric_type`] (text with no numeric prefix counts as
+    /// integer 0, bd-5lrpw), the division truncates toward zero and
+    /// `i64::MIN / -1` is promoted to REAL; otherwise it is REAL division. A
+    /// NaN result is NULL.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn sql_div(&self, divisor: &Self) -> Self {
+        if self.is_null() || divisor.is_null() {
+            return Self::Null;
+        }
+        if !self.is_float_numeric_type() && !divisor.is_float_numeric_type() {
+            let a = self.to_integer();
+            let b = divisor.to_integer();
+            if b == 0 {
+                return Self::Null;
+            }
+            return match a.checked_div(b) {
+                Some(result) => Self::Integer(result),
+                None => Self::float_result_or_null(a as f64 / b as f64),
+            };
+        }
+        let b = divisor.to_float();
+        if b == 0.0 {
+            return Self::Null;
+        }
+        Self::float_result_or_null(self.to_float() / b)
+    }
+
+    /// Remainder following SQLite's `OP_Remainder`: NULL if either operand is
+    /// NULL or the integer divisor is zero. Both operands are converted to
+    /// integers; the result is INTEGER when both are integer-typed (the rule of
+    /// [`Self::sql_div`]) and REAL otherwise. `i64::MIN % -1` is 0.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn sql_rem(&self, divisor: &Self) -> Self {
+        if self.is_null() || divisor.is_null() {
+            return Self::Null;
+        }
+        let a = self.to_integer();
+        let b = divisor.to_integer();
+        if b == 0 {
+            return Self::Null;
+        }
+        let result = a.checked_rem(b).unwrap_or_default();
+        if !self.is_float_numeric_type() && !divisor.is_float_numeric_type() {
+            Self::Integer(result)
+        } else {
+            Self::Float(result as f64)
         }
     }
 
@@ -2123,7 +2421,7 @@ impl SqliteValue {
     pub fn cmp_binary_in(&self, other: &Self, encoding: TextEncoding) -> Ordering {
         match (self, other) {
             (Self::Text(a), Self::Text(b)) if !matches!(encoding, TextEncoding::Utf8) => {
-                binary_text_cmp(a.as_bytes_direct(), b.as_bytes_direct(), encoding)
+                a.cmp_binary_in(b, encoding)
             }
             _ => self.cmp(other),
         }
@@ -2325,7 +2623,11 @@ pub fn format_sqlite_float_g(f: f64, precision: usize) -> String {
     let precision = precision.max(1);
     let generic_precision = i32::try_from(precision - 1).unwrap_or(i32::MAX);
     render_sqlite_float_decode(
-        &sqlite_float_decode(f, SqliteFloatRounding::Significant(precision)),
+        &sqlite_float_decode(
+            f,
+            SqliteFloatRounding::Significant(precision),
+            SQLITE_FLOAT_MAX_ROUND_DIGITS,
+        ),
         generic_precision,
     )
 }
@@ -2472,15 +2774,46 @@ pub enum SqliteFloatRounding {
 /// must handle non-finite spellings separately.
 #[must_use]
 pub fn sqlite_float_altform2_digits(f: f64, rounding: SqliteFloatRounding) -> (Vec<u8>, i32) {
+    sqlite_float_magnitude_digits(f, rounding, SQLITE_FLOAT_MAX_ROUND_DIGITS)
+}
+
+/// Rounded magnitude digits and scientific exponent for SQLite printf.
+///
+/// The requested rounding determines how many digits are initially converted.
+/// Plain printf caps subsequent rounding at 16 significant digits, while
+/// alternate form 2 uses the full decoder limit.
+#[must_use]
+pub fn sqlite_float_printf_digits(
+    f: f64,
+    rounding: SqliteFloatRounding,
+    alternate_form2: bool,
+) -> (Vec<u8>, i32) {
+    let max_round_digits = if alternate_form2 {
+        SQLITE_FLOAT_MAX_ROUND_DIGITS
+    } else {
+        16
+    };
+    sqlite_float_magnitude_digits(f, rounding, max_round_digits)
+}
+
+fn sqlite_float_magnitude_digits(
+    f: f64,
+    rounding: SqliteFloatRounding,
+    max_round_digits: usize,
+) -> (Vec<u8>, i32) {
     if !f.is_finite() || f == 0.0 {
         return (vec![b'0'], 0);
     }
-    let decoded = sqlite_float_decode(f, rounding);
+    let decoded = sqlite_float_decode(f, rounding, max_round_digits);
     (decoded.digits, decoded.decimal_point - 1)
 }
 
 /// Decode once, then round at the significant or fractional decimal position.
-fn sqlite_float_decode(f: f64, rounding: SqliteFloatRounding) -> SqliteFloatDecode {
+fn sqlite_float_decode(
+    f: f64,
+    rounding: SqliteFloatRounding,
+    max_round_digits: usize,
+) -> SqliteFloatDecode {
     let negative = f < 0.0;
     let r = if negative { -f } else { f };
     if r == 0.0 {
@@ -2539,8 +2872,8 @@ fn sqlite_float_decode(f: f64, rounding: SqliteFloatRounding) -> SqliteFloatDeco
         }
     };
 
-    if round_at > 0 && (round_at < digit_count || digit_count > SQLITE_FLOAT_MAX_ROUND_DIGITS) {
-        round_at = round_at.min(SQLITE_FLOAT_MAX_ROUND_DIGITS);
+    if round_at > 0 && (round_at < digit_count || digit_count > max_round_digits) {
+        round_at = round_at.min(max_round_digits);
         if round_at == SQLITE_FLOAT_SIGNIFICANT_DIGITS {
             round_at = sqlite_adjust_17_digit_rounding(
                 r,
@@ -2876,6 +3209,65 @@ mod tests {
         }
     }
 
+    /// bd-w4pr1.13.28 lever O1: the ASCII shortcut of `from_bytes_shared`
+    /// gives what the validating path gives (`SmallText::new` of valid UTF-8,
+    /// `HeapShared` past the inline capacity, byte-preserving Raw otherwise)
+    /// for every length up to one past the inline capacity, over ASCII, NUL,
+    /// one multi-byte character and one invalid byte at every position. A
+    /// shortcut that checked only some of the bytes would turn the non-ASCII
+    /// cases inline.
+    #[test]
+    fn record_text_ascii_shortcut_matches_validating_decode() {
+        fn reference(bytes: &[u8]) -> (Vec<u8>, bool, bool) {
+            match std::str::from_utf8(bytes) {
+                Ok(text) => {
+                    let inline = text.len() <= SMALL_TEXT_INLINE_CAP;
+                    (text.as_bytes().to_vec(), true, inline)
+                }
+                Err(_) => (bytes.to_vec(), false, false),
+            }
+        }
+        let mut cases: Vec<Vec<u8>> = Vec::new();
+        for len in 0..=SMALL_TEXT_INLINE_CAP + 1 {
+            let ascii: Vec<u8> = (0..len)
+                .map(|i| b'a' + u8::try_from(i % 26).unwrap())
+                .collect();
+            cases.push(ascii.clone());
+            for at in 0..len {
+                let mut with_nul = ascii.clone();
+                with_nul[at] = 0;
+                cases.push(with_nul);
+                let mut invalid = ascii.clone();
+                invalid[at] = 0xFF;
+                cases.push(invalid);
+                let mut lone_continuation = ascii.clone();
+                lone_continuation[at] = 0x80;
+                cases.push(lone_continuation);
+                if at + 1 < len {
+                    let mut two_byte = ascii.clone();
+                    two_byte[at] = 0xC3;
+                    two_byte[at + 1] = 0xA9;
+                    cases.push(two_byte);
+                }
+                if at + 1 == len {
+                    let mut truncated = ascii.clone();
+                    truncated[at] = 0xC3;
+                    cases.push(truncated);
+                }
+            }
+        }
+        for bytes in &cases {
+            let decoded = SmallText::from_record_text_bytes_shared(bytes, TextEncoding::Utf8);
+            let (expected, valid, inline) = reference(bytes);
+            assert_eq!(decoded.as_bytes_direct(), expected.as_slice(), "{bytes:?}");
+            assert_eq!(decoded.is_valid_utf8(), valid, "{bytes:?}");
+            assert_eq!(decoded.is_inline(), inline, "{bytes:?}");
+            if valid {
+                assert_eq!(decoded, SmallText::new(std::str::from_utf8(bytes).unwrap()));
+            }
+        }
+    }
+
     fn log_value_pool_test_stats(test_name: &str) -> ValuePoolStats {
         let stats = value_pool_test_stats_snapshot();
         eprintln!(
@@ -2945,14 +3337,32 @@ mod tests {
     }
 
     #[test]
-    fn from_record_text_bytes_utf16_lone_surrogate_becomes_replacement() {
-        // Lone high surrogate with no following low surrogate decodes to U+FFFD
-        // (byte-exact preservation of malformed UTF-16 is GH #180 / bd-bld9w.8).
-        let bytes = 0xD800_u16.to_le_bytes().to_vec();
-        assert_eq!(
-            SmallText::from_record_text_bytes(&bytes, TextEncoding::Utf16le).as_str(),
-            "\u{FFFD}"
-        );
+    fn malformed_utf16_keeps_native_units_and_separate_utf8_projection() {
+        for decode in [
+            SmallText::from_record_text_bytes,
+            SmallText::from_record_text_bytes_shared,
+        ] {
+            let lone = decode(&[0, 0xd8], TextEncoding::Utf16le);
+            assert_eq!(lone.as_str(), "\u{fffd}");
+            assert_eq!(lone.as_bytes_direct(), &[0xed, 0xa0, 0x80]);
+            assert!(lone.as_str_checked().is_none());
+            assert_eq!(
+                &*lone.to_record_text_bytes(TextEncoding::Utf16be),
+                &[0xd8, 0]
+            );
+            assert_eq!(lone, decode(&[0xd8, 0], TextEncoding::Utf16be));
+            // Both native sequences project to the same valid UTF-8 scalar.
+            let malformed = decode(&[0xd8, 0, 0, 0x41], TextEncoding::Utf16be);
+            let valid = SmallText::new("\u{10041}");
+            assert_eq!(malformed.as_bytes_direct(), valid.as_bytes_direct());
+            assert_ne!(malformed, valid);
+            assert!(
+                malformed
+                    .cmp_binary_in(&valid, TextEncoding::Utf16be)
+                    .is_lt()
+            );
+            assert_eq!(malformed, malformed.clone());
+        }
     }
 
     #[test]
@@ -3417,6 +3827,104 @@ mod tests {
     }
 
     #[test]
+    fn test_write_i64_decimal_matches_to_string() {
+        let mut values = vec![
+            0,
+            1,
+            -1,
+            9,
+            -9,
+            10,
+            -10,
+            99,
+            100,
+            i64::MAX,
+            i64::MIN,
+            i64::MAX - 1,
+            i64::MIN + 1,
+        ];
+        let mut power = 1_i64;
+        while let Some(next) = power.checked_mul(10) {
+            values.extend([power - 1, power, power + 1, -power + 1, -power, -power - 1]);
+            power = next;
+        }
+        values.extend((-2_000..2_000).map(|i| i * 7_919));
+        for value in values {
+            let mut digits = [0_u8; I64_DECIMAL_MAX_LEN];
+            assert_eq!(
+                write_i64_decimal(value, &mut digits),
+                value.to_string().as_bytes(),
+                "decimal digits of {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sql_concat_inline_path_matches_rendered_bytes() {
+        let t = |s: &str| SqliteValue::Text(s.into());
+        let operands = vec![
+            t(""),
+            t("row-"),
+            t("üé€"),
+            t("abcdefghijklmnopqrstu"),
+            t("abcdefghijklmnopqrstuv"),
+            t("abcdefghijklmnopqrstuvw"),
+            t("abcdefghijklmnopqrstuvwx"),
+            SqliteValue::Text(SmallText::from_bytes(&[0x80, b'q'])),
+            SqliteValue::Integer(0),
+            SqliteValue::Integer(7),
+            SqliteValue::Integer(-7),
+            SqliteValue::Integer(12),
+            SqliteValue::Integer(i64::MAX),
+            SqliteValue::Integer(i64::MIN),
+            SqliteValue::Float(1.5),
+            SqliteValue::Float(-0.25),
+            SqliteValue::Blob(vec![0x61, 0x62].into()),
+            SqliteValue::Blob(vec![0x00, 0xFF].into()),
+            SqliteValue::Null,
+        ];
+        // The bytes SQLite's `||` produces, built without sql_concat.
+        let rendered = |v: &SqliteValue| -> Vec<u8> {
+            match v {
+                SqliteValue::Integer(i) => i.to_string().into_bytes(),
+                SqliteValue::Float(f) => format_sqlite_float(*f).into_bytes(),
+                SqliteValue::Text(s) => s.as_bytes_direct().to_vec(),
+                SqliteValue::Blob(b) => b.to_vec(),
+                SqliteValue::Null => Vec::new(),
+            }
+        };
+        for left in &operands {
+            for right in &operands {
+                let joined = left.sql_concat(right);
+                if left.is_null() || right.is_null() {
+                    assert_eq!(joined, SqliteValue::Null, "{left:?} || {right:?}");
+                    continue;
+                }
+                let SqliteValue::Text(text) = &joined else {
+                    panic!("{left:?} || {right:?} must be TEXT, got {joined:?}");
+                };
+                let mut expected = rendered(left);
+                expected.extend(rendered(right));
+                assert_eq!(
+                    text.as_bytes_direct(),
+                    expected.as_slice(),
+                    "{left:?} || {right:?}"
+                );
+                let valid = std::str::from_utf8(&expected).is_ok();
+                assert_eq!(text.is_valid_utf8(), valid, "{left:?} || {right:?}");
+                if valid {
+                    assert_eq!(
+                        text.is_inline(),
+                        expected.len() <= SmallText::INLINE_CAPACITY,
+                        "{left:?} || {right:?} storage"
+                    );
+                    assert_eq!(text.as_str().as_bytes(), expected.as_slice());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_text_bytes_never_substitutes_replacement_characters() {
         assert_eq!(
             SqliteValue::Blob(vec![0xFF].into()).text_bytes().as_ref(),
@@ -3696,6 +4204,56 @@ mod tests {
         assert!(SqliteValue::Blob(Arc::from(b"123a".as_slice())).is_integer_numeric_type());
         assert!(!SqliteValue::Text(SmallText::new("1.5e2abc")).is_integer_numeric_type());
         assert!(!SqliteValue::Text(SmallText::new("abc")).is_integer_numeric_type());
+    }
+
+    #[test]
+    fn sql_div_and_sql_rem_take_arithmetic_operand_types() {
+        // `SqliteValue` equality is numeric (INTEGER 0 == REAL 0.0), so the
+        // storage class is checked through the derived `Debug` text.
+        fn class(v: &SqliteValue) -> String {
+            format!("{v:?}")
+        }
+        let text = |s: &str| SqliteValue::Text(SmallText::new(s));
+        let int = SqliteValue::Integer;
+        let cases = [
+            // bd-5lrpw: text with no numeric prefix is INTEGER 0, not REAL 0.0.
+            (text("x").sql_div(&int(3)), "Integer(0)"),
+            (text("x").sql_rem(&int(3)), "Integer(0)"),
+            (
+                SqliteValue::Blob(Arc::from(b"A".as_slice())).sql_rem(&int(3)),
+                "Integer(0)",
+            ),
+            (text("").sql_div(&text("2")), "Integer(0)"),
+            // Numeric text divides as an integer.
+            (text("17").sql_div(&int(5)), "Integer(3)"),
+            (text("12abc").sql_rem(&int(5)), "Integer(2)"),
+            // A REAL-looking or out-of-range prefix stays REAL, even for `%`.
+            (text("2.5").sql_rem(&int(2)), "Float(0.0)"),
+            (
+                text("9223372036854775808").sql_div(&int(2)),
+                "Float(4.611686018427388e18)",
+            ),
+            // Overflow promotes; zero divisors, NULL and NaN give NULL.
+            (
+                int(i64::MIN).sql_div(&int(-1)),
+                "Float(9.223372036854776e18)",
+            ),
+            (int(i64::MIN).sql_rem(&int(-1)), "Integer(0)"),
+            (int(5).sql_div(&int(0)), "Null"),
+            (int(5).sql_rem(&text("x")), "Null"),
+            (
+                SqliteValue::Float(1.0).sql_div(&SqliteValue::Float(0.0)),
+                "Null",
+            ),
+            (SqliteValue::Null.sql_div(&int(1)), "Null"),
+            (
+                SqliteValue::Float(f64::INFINITY).sql_div(&SqliteValue::Float(f64::INFINITY)),
+                "Null",
+            ),
+        ];
+        for (index, (value, expected)) in cases.iter().enumerate() {
+            assert_eq!(class(value), *expected, "case {index}");
+        }
     }
 
     #[test]

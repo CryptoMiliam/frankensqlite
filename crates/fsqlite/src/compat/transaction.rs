@@ -50,6 +50,16 @@ pub struct Transaction<'a> {
 }
 
 impl<'a> Transaction<'a> {
+    /// Open a scoped `BEGIN DEFERRED` transaction. Reads share one snapshot
+    /// without reserving a writer. A caller that already owns a transaction
+    /// receives [`FrankenError::NestedTransaction`].
+    pub async fn begin_deferred(conn: &'a Connection) -> Result<Self, FrankenError> {
+        Self::new_with_begin(conn, async {
+            conn.execute("BEGIN DEFERRED").await.map(|_| ())
+        })
+        .await
+    }
+
     async fn new(conn: &'a Connection) -> Result<Self, FrankenError> {
         Self::new_with_begin(conn, conn.begin_transaction()).await
     }
@@ -146,7 +156,9 @@ impl<'a> Transaction<'a> {
     /// Commit the transaction.
     ///
     /// If `COMMIT` fails, the transaction remains active so the caller can
-    /// inspect the error and choose whether to retry or roll back.
+    /// inspect the error and choose whether to retry or roll back. The
+    /// exception is a `BusySnapshot` refusal: that transaction can never
+    /// commit, so the engine rolls it back and this handle is finalized.
     pub async fn commit(&mut self) -> Result<(), FrankenError> {
         self.ensure_active()?;
         let result = self.conn.commit_transaction().await;

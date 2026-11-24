@@ -101,6 +101,7 @@ pub use metrics::{
 pub use parallel_wal::{
     FsyncPolicy, PARALLEL_WAL_COMMIT_CERTIFICATE_VERSION, PARALLEL_WAL_COMPATIBILITY_SELECTOR,
     PARALLEL_WAL_DURABLE_CERTIFICATE_FIRST_RECORD_VERSION, PARALLEL_WAL_DURABLE_CERTIFICATE_MAGIC,
+    PARALLEL_WAL_DURABLE_CERTIFICATE_OLDEST_HONORED_RECORD_VERSION,
     PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION, PARALLEL_WAL_FLUSH_SCENARIO_ID,
     PARALLEL_WAL_LANE_POLICY_VERSION, PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE,
     PARALLEL_WAL_PUBLICATION_SCENARIO_ID, PARALLEL_WAL_STAGE_SCENARIO_ID, ParallelWalBatch,
@@ -109,17 +110,18 @@ pub use parallel_wal::{
     ParallelWalCoordinator, ParallelWalDecisionAction, ParallelWalDecisionRecord,
     ParallelWalDurabilityCombiner, ParallelWalDurabilityReceipt, ParallelWalDurabilityRequest,
     ParallelWalDurableCertificateRecord, ParallelWalFallbackReason, ParallelWalFrame,
-    ParallelWalFramePayloadDigestBuilder, ParallelWalLaneBatch, ParallelWalLaneStager,
-    ParallelWalLookupMode, ParallelWalOperatingMode, ParallelWalOrderedResidue,
-    ParallelWalPendingPublication, ParallelWalShadowVerdict, ParallelWalTraceRecord,
-    ParallelWalVisibilitySnapshot, SegmentHeader, SegmentRecoveryOptions, SegmentRecoveryResult,
-    cleanup_segments, decode_parallel_wal_durable_certificate_records,
-    default_parallel_wal_lane_count, delete_segment, durable_certificate_record_version_is_legacy,
-    list_segments, max_durable_epoch, parallel_wal_coordinator_for_path,
-    parallel_wal_fallback_reason_name, parallel_wal_lookup_mode_name, parallel_wal_mode_name,
-    parallel_wal_shadow_verdict_name, parallel_wal_should_shadow_compare, read_segment,
-    recover_and_apply_segments, recover_segments, remove_parallel_wal_coordinator,
-    resolve_parallel_wal_control_surface_from_env, segment_path, write_segment,
+    ParallelWalFramePayloadDigestAlgorithm, ParallelWalFramePayloadDigestBuilder,
+    ParallelWalLaneBatch, ParallelWalLaneStager, ParallelWalLookupMode, ParallelWalOperatingMode,
+    ParallelWalOrderedResidue, ParallelWalPendingPublication, ParallelWalShadowVerdict,
+    ParallelWalTraceRecord, ParallelWalVisibilitySnapshot, SegmentHeader, SegmentRecoveryOptions,
+    SegmentRecoveryResult, cleanup_segments, decode_parallel_wal_durable_certificate_records,
+    default_parallel_wal_lane_count, delete_segment, durable_certificate_record_version_is_honored,
+    durable_certificate_record_version_is_legacy, list_segments, max_durable_epoch,
+    parallel_wal_coordinator_for_path, parallel_wal_fallback_reason_name,
+    parallel_wal_lookup_mode_name, parallel_wal_mode_name, parallel_wal_shadow_verdict_name,
+    parallel_wal_should_shadow_compare, read_segment, recover_and_apply_segments, recover_segments,
+    remove_parallel_wal_coordinator, resolve_parallel_wal_control_surface_from_env, segment_path,
+    write_segment,
 };
 pub use per_core_buffer::{
     AppendOutcome, BufferConfig, BufferState, DEFAULT_BUFFER_SLOT_COUNT, EpochConfig,
@@ -136,11 +138,17 @@ pub use telemetry::{
     NoOpWalObserver, WalTelemetryEvent, WalTelemetryObserver, WalTelemetryRingBuffer,
     WalTelemetrySnapshot, wal_telemetry_snapshot,
 };
-pub use wal::{WalFile, WalGenerationIdentity};
+pub use wal::{WalFile, WalGenerationIdentity, WalScanStopKind};
+/// WAL-FEC generation is opt-in (bd-71vt5); see the native definition.
 #[cfg(target_arch = "wasm32")]
-pub const DEFAULT_RAPTORQ_REPAIR_SYMBOLS: u8 = 2;
+pub const DEFAULT_RAPTORQ_REPAIR_SYMBOLS: u8 = 0;
 #[cfg(target_arch = "wasm32")]
 pub const MAX_RAPTORQ_REPAIR_SYMBOLS: u8 = u8::MAX;
+#[cfg(not(target_arch = "wasm32"))]
+pub use wal_fec::replay::{
+    WalFecLiveRepairReport, WalFecReplayLimits, WalFecReplayStop, WalFecReplayStopReason,
+    repair_wal_file_in_place_with_fec, wal_fec_sidecar_covers_frame,
+};
 #[cfg(not(target_arch = "wasm32"))]
 pub use wal_fec::{
     DEFAULT_RAPTORQ_REPAIR_SYMBOLS, MAX_RAPTORQ_REPAIR_SYMBOLS, WAL_FEC_GROUP_META_MAGIC,

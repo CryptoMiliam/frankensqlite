@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-core"
-version = "0.5.0"
+version = "0.5.1"
 description = "Core engine: connection, prepare, schema, DDL/DML codegen"
 edition.workspace = true
 license-file.workspace = true
@@ -102,7 +102,7 @@ asupersync = { workspace = true }
 [dev-dependencies]
 asupersync = { workspace = true, features = ["test-internals"] }
 criterion = { workspace = true }
-rusqlite = { workspace = true }
+rusqlite = { workspace = true, features = ["collation"] }
 sha2 = { workspace = true }
 tracing = { workspace = true }
 tempfile = { workspace = true }

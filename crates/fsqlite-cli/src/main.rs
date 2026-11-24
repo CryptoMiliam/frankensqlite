@@ -1010,25 +1010,30 @@ where
                 continue;
             }
 
-            match try_execute_dot_command(
-                trimmed,
-                connection,
-                current_db_path,
-                output_options,
-                out,
-                err,
-                shell_options,
-                &mut had_error,
-            )
-            .await
-            {
-                DotCommandResult::NotHandled => {}
-                DotCommandResult::Continue => continue,
-                DotCommandResult::Exit => {
-                    return Some(ShellOutcome {
-                        flow: ShellFlow::Exit,
-                        had_error,
-                    });
+            // Every dot command starts with '.'; for any other line
+            // `try_execute_dot_command` answers NotHandled, so a statement
+            // line does not build and poll its future (bd-w4pr1.13.35).
+            if trimmed.starts_with('.') {
+                match try_execute_dot_command(
+                    trimmed,
+                    connection,
+                    current_db_path,
+                    output_options,
+                    out,
+                    err,
+                    shell_options,
+                    &mut had_error,
+                )
+                .await
+                {
+                    DotCommandResult::NotHandled => {}
+                    DotCommandResult::Continue => continue,
+                    DotCommandResult::Exit => {
+                        return Some(ShellOutcome {
+                            flow: ShellFlow::Exit,
+                            had_error,
+                        });
+                    }
                 }
             }
 
@@ -1614,33 +1619,42 @@ where
         .map(|row| row.values().len())
         .unwrap_or(column_names.len());
     let mut widths = vec![0usize; column_count];
+    let rendered_names: Vec<_> = column_names
+        .iter()
+        .take(column_count)
+        .map(|name| translate_column_line(name.as_bytes()).0)
+        .collect();
 
-    for (index, name) in column_names.iter().take(column_count).enumerate() {
-        widths[index] = widths[index].max(name.chars().count());
+    for (width, name) in widths.iter_mut().zip(&rendered_names) {
+        *width = display_character_count(name);
     }
 
+    let mut has_multiline_row = false;
     let rendered_rows = rows
         .iter()
         .map(|row| {
-            row.values()
+            let mut height = 1;
+            let cells = row
+                .values()
                 .iter()
-                .map(render_display_value)
-                .collect::<Vec<_>>()
+                .zip(&mut widths)
+                .map(|(value, width)| {
+                    let cell = ColumnCell::new(render_display_value(value));
+                    *width = (*width).max(display_character_count(&cell.first));
+                    for line in &cell.continuations {
+                        *width = (*width).max(display_character_count(line));
+                    }
+                    height = height.max(1 + cell.continuations.len());
+                    cell
+                })
+                .collect::<Vec<_>>();
+            has_multiline_row |= height > 1;
+            (cells, height)
         })
         .collect::<Vec<_>>();
 
-    for row in &rendered_rows {
-        for (index, value) in row.iter().enumerate() {
-            widths[index] = widths[index].max(display_character_count(value));
-        }
-    }
-
-    if show_headers && !column_names.is_empty() {
-        let names: Vec<_> = column_names
-            .iter()
-            .map(|name| Cow::Borrowed(name.as_bytes()))
-            .collect();
-        write_column_line(&names, &widths, out)?;
+    if show_headers && !rendered_names.is_empty() {
+        write_column_line(rendered_names.iter().map(Cow::as_ref), &widths, out)?;
         let underline = widths
             .iter()
             .map(|width| "-".repeat(*width))
@@ -1649,8 +1663,13 @@ where
         writeln!(out, "{underline}")?;
     }
 
-    for row in rendered_rows {
-        write_column_line(&row, &widths, out)?;
+    for (index, (cells, height)) in rendered_rows.iter().enumerate() {
+        for line in 0..*height {
+            write_column_line(cells.iter().map(|cell| cell.line(line)), &widths, out)?;
+        }
+        if has_multiline_row && index + 1 < rendered_rows.len() {
+            writeln!(out)?;
+        }
     }
 
     Ok(())
@@ -1690,22 +1709,103 @@ where
 }
 
 fn display_character_count(value: &[u8]) -> usize {
-    // Lossy decoding is used only for alignment; output retains the original
-    // bytes, including invalid UTF-8.
-    String::from_utf8_lossy(value).chars().count()
+    // The stock column renderer counts UTF-8 leading bytes for field widths.
+    value.iter().filter(|&&byte| byte & 0xc0 != 0x80).count()
 }
 
-fn write_column_line<W: Write>(
-    values: &[Cow<'_, [u8]>],
+struct ColumnCell<'a> {
+    first: Cow<'a, [u8]>,
+    continuations: Vec<Cow<'a, [u8]>>,
+}
+
+impl<'a> ColumnCell<'a> {
+    fn new(value: Cow<'a, [u8]>) -> Self {
+        // Only text and BLOB values can contain line breaks. The display
+        // renderer borrows those bytes and owns the generated numeric text.
+        let Cow::Borrowed(bytes) = value else {
+            return Self {
+                first: value,
+                continuations: Vec::new(),
+            };
+        };
+        let (first, mut tail) = translate_column_line(bytes);
+        let mut continuations = Vec::new();
+        while let Some(bytes) = tail {
+            let (line, rest) = translate_column_line(bytes);
+            continuations.push(line);
+            tail = rest;
+        }
+        Self {
+            first,
+            continuations,
+        }
+    }
+
+    fn line(&self, index: usize) -> &[u8] {
+        if index == 0 {
+            &self.first
+        } else {
+            self.continuations.get(index - 1).map_or(b"", Cow::as_ref)
+        }
+    }
+}
+
+fn translate_column_line(value: &[u8]) -> (Cow<'_, [u8]>, Option<&[u8]>) {
+    // The default sqlite3 column mode wraps at sixty display characters.
+    const WRAP_WIDTH: usize = 60;
+    const TAB_STOP: usize = 8;
+    let mut expanded = None;
+    let mut remaining = value;
+    let mut column = 0;
+    while column < WRAP_WIDTH {
+        let Some((&byte, tail)) = remaining.split_first() else {
+            break;
+        };
+        match byte {
+            b'\t' => {
+                let spaces = (TAB_STOP - column % TAB_STOP).min(WRAP_WIDTH - column);
+                let output = expanded.get_or_insert_with(|| {
+                    let consumed = value.len() - remaining.len();
+                    value[..consumed].to_vec()
+                });
+                output.extend(std::iter::repeat_n(b' ', spaces));
+                remaining = tail;
+                column += spaces;
+            }
+            b' '..=u8::MAX => {
+                // Stock consumes continuation bytes with the preceding byte,
+                // including runs that do not form a valid UTF-8 sequence.
+                let len = 1 + tail.iter().take_while(|&&byte| byte & 0xc0 == 0x80).count();
+                if let Some(output) = &mut expanded {
+                    output.extend_from_slice(&remaining[..len]);
+                }
+                remaining = &remaining[len..];
+                column += 1;
+            }
+            _ => break,
+        }
+    }
+    let consumed = value.len() - remaining.len();
+    let line = expanded.map_or(Cow::Borrowed(&value[..consumed]), Cow::Owned);
+    let tail = match remaining {
+        [b' '..=u8::MAX, ..] => remaining,
+        [] | [0, ..] => &[],
+        [b'\r', b'\n', tail @ ..] | [_, tail @ ..] => tail,
+    };
+    (line, (!tail.is_empty()).then_some(tail))
+}
+
+fn write_column_line<'a, W: Write>(
+    values: impl IntoIterator<Item = &'a [u8]>,
     widths: &[usize],
     out: &mut W,
 ) -> io::Result<()> {
-    for (index, value) in values.iter().enumerate() {
+    for (index, (value, width)) in values.into_iter().zip(widths).enumerate() {
         if index > 0 {
             out.write_all(OutputMode::Column.separator().as_bytes())?;
         }
         out.write_all(value)?;
-        let padding = widths[index].saturating_sub(display_character_count(value));
+        let padding = width.saturating_sub(display_character_count(value));
         write!(out, "{:padding$}", "")?;
     }
     writeln!(out)
@@ -2623,13 +2723,13 @@ where
         SELECT name \
         FROM sqlite_schema \
         WHERE type IN ('table', 'view') \
-          AND name NOT LIKE 'sqlite_%' \
+          AND lower(name) NOT GLOB 'sqlite_*' \
         ORDER BY name";
     let filtered_sql = "\
         SELECT name \
         FROM sqlite_schema \
         WHERE type IN ('table', 'view') \
-          AND name NOT LIKE 'sqlite_%' \
+          AND lower(name) NOT GLOB 'sqlite_*' \
           AND name LIKE ?1 \
         ORDER BY name";
 
@@ -2668,7 +2768,7 @@ where
         FROM sqlite_schema \
         WHERE sql IS NOT NULL \
           AND type IN ('table', 'index', 'trigger', 'view') \
-          AND name NOT LIKE 'sqlite_%' \
+          AND lower(name) NOT GLOB 'sqlite_*' \
         ORDER BY CASE type \
             WHEN 'table' THEN 0 \
             WHEN 'index' THEN 1 \
@@ -2681,7 +2781,7 @@ where
         FROM sqlite_schema \
         WHERE sql IS NOT NULL \
           AND type IN ('table', 'index', 'trigger', 'view') \
-          AND name NOT LIKE 'sqlite_%' \
+          AND lower(name) NOT GLOB 'sqlite_*' \
           AND (name LIKE ?1 OR tbl_name LIKE ?1) \
         ORDER BY CASE type \
             WHEN 'table' THEN 0 \
@@ -2720,27 +2820,103 @@ async fn write_dump<W>(
 where
     W: Write,
 {
+    // Pin catalog, rows, sequence counters and schema objects to one snapshot.
+    // If the shell is already in a transaction, its uncommitted view is the
+    // one to dump and the caller retains ownership of it.
+    let snapshot = match fsqlite::compat::Transaction::begin_deferred(connection).await {
+        Ok(transaction) => Some(transaction),
+        Err(FrankenError::NestedTransaction) => None,
+        Err(error) => return Err(error.to_string()),
+    };
+    let contents = write_dump_contents(connection, filter, colorize_sql, out).await;
+    let release = if let Some(mut snapshot) = snapshot {
+        snapshot.rollback().await.map_err(|error| error.to_string())
+    } else {
+        Ok(())
+    };
+    let has_virtual_tables = contents?;
+    release?;
+    write_sql_statement(out, "COMMIT;", colorize_sql).map_err(|error| error.to_string())?;
+    // The committed catalog can now bind the virtual modules to their
+    // restored storage, including on an already-open in-memory connection.
+    if has_virtual_tables {
+        write_sql_statement(out, "PRAGMA writable_schema=RESET;", colorize_sql)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+struct DumpTable<'a> {
+    name: &'a str,
+    ddl: &'a str,
+    virtual_table: bool,
+}
+
+fn dump_tables(catalog: &[Row]) -> Vec<DumpTable<'_>> {
+    use fsqlite_ast::Statement;
+    use std::collections::HashSet;
+
+    let mut shadows = HashSet::new();
+    for row in catalog {
+        let [
+            SqliteValue::Text(name),
+            SqliteValue::Text(ddl),
+            SqliteValue::Integer(0),
+            SqliteValue::Integer(1),
+        ] = row.values()
+        else {
+            continue;
+        };
+        let Ok(Some((Statement::CreateVirtualTable(table), _))) =
+            Parser::from_sql(ddl).parse_next_statement_with_tail()
+        else {
+            continue;
+        };
+        for shadow in fsqlite_core::connection::virtual_table_shadow_names(name, &table) {
+            shadows.insert(shadow.to_ascii_lowercase());
+        }
+    }
+
+    catalog
+        .iter()
+        .filter_map(|row| {
+            let [
+                SqliteValue::Text(name),
+                SqliteValue::Text(ddl),
+                SqliteValue::Integer(rootpage),
+                SqliteValue::Integer(selected),
+            ] = row.values()
+            else {
+                return None;
+            };
+            (*selected != 0 || shadows.contains(&name.to_ascii_lowercase())).then_some(DumpTable {
+                name,
+                ddl,
+                virtual_table: *rootpage == 0,
+            })
+        })
+        .collect()
+}
+
+async fn write_dump_contents<W: Write>(
+    connection: &Connection,
+    filter: Option<&str>,
+    colorize_sql: bool,
+    out: &mut W,
+) -> Result<bool, String> {
     let table_sql = "\
-        SELECT name, sql \
-        FROM sqlite_schema \
+        SELECT name, sql, rootpage, (?1 IS NULL OR name LIKE ?1) \
+        FROM main.sqlite_schema \
         WHERE type = 'table' \
           AND sql IS NOT NULL \
-          AND name NOT LIKE 'sqlite_%' \
-        ORDER BY name";
-    let filtered_table_sql = "\
-        SELECT name, sql \
-        FROM sqlite_schema \
-        WHERE type = 'table' \
-          AND sql IS NOT NULL \
-          AND name NOT LIKE 'sqlite_%' \
-          AND name LIKE ?1 \
+          AND lower(name) NOT GLOB 'sqlite_*' \
         ORDER BY name";
     let object_sql = "\
         SELECT sql \
-        FROM sqlite_schema \
+        FROM main.sqlite_schema \
         WHERE sql IS NOT NULL \
           AND type IN ('index', 'trigger', 'view') \
-          AND name NOT LIKE 'sqlite_%' \
+          AND lower(name) NOT GLOB 'sqlite_*' \
         ORDER BY CASE type \
             WHEN 'index' THEN 0 \
             WHEN 'trigger' THEN 1 \
@@ -2749,10 +2925,10 @@ where
         END, name";
     let filtered_object_sql = "\
         SELECT sql \
-        FROM sqlite_schema \
+        FROM main.sqlite_schema \
         WHERE sql IS NOT NULL \
           AND type IN ('index', 'trigger', 'view') \
-          AND name NOT LIKE 'sqlite_%' \
+          AND lower(name) NOT GLOB 'sqlite_*' \
           AND (name LIKE ?1 OR tbl_name LIKE ?1) \
         ORDER BY CASE type \
             WHEN 'index' THEN 0 \
@@ -2761,15 +2937,12 @@ where
             ELSE 3 \
         END, name";
 
-    let table_rows = match filter {
-        Some(filter) => {
-            connection
-                .query_with_params(filtered_table_sql, &[SqliteValue::from(filter.to_owned())])
-                .await
-        }
-        None => connection.query(table_sql).await,
-    }
-    .map_err(|error| error.to_string())?;
+    let pattern = filter.map_or(SqliteValue::Null, |name| SqliteValue::from(name.to_owned()));
+    let catalog = connection
+        .query_with_params(table_sql, &[pattern])
+        .await
+        .map_err(|error| error.to_string())?;
+    let tables = dump_tables(&catalog);
 
     // Match sqlite3's .dump preamble: tables are emitted in name order, not
     // FK-dependency order, so the reload must run with FK enforcement off.
@@ -2778,26 +2951,25 @@ where
     write_sql_statement(out, "BEGIN TRANSACTION;", colorize_sql)
         .map_err(|error| error.to_string())?;
 
-    for row in &table_rows {
-        let Some(SqliteValue::Text(statement)) = row.get(1) else {
-            continue;
-        };
-        write_sql_statement(out, statement, colorize_sql).map_err(|error| error.to_string())?;
+    for table in tables.iter().filter(|table| !table.virtual_table) {
+        write_sql_statement(out, table.ddl, colorize_sql).map_err(|error| error.to_string())?;
     }
 
-    for row in &table_rows {
-        let Some(SqliteValue::Text(table_name)) = row.get(0) else {
-            continue;
-        };
-        let quoted_table = quote_identifier(table_name);
+    for table in tables.iter().filter(|table| !table.virtual_table) {
+        let quoted_table = quote_identifier(table.name);
+        let writable_columns = dump_generated_table_columns(table.ddl);
+        let projection = writable_columns.as_deref().unwrap_or("*");
+        let insert_columns = writable_columns
+            .as_ref()
+            .map_or_else(String::new, |columns| format!(" ({columns})"));
         let rows = connection
-            .query(&format!("SELECT * FROM {quoted_table};"))
+            .query(&format!("SELECT {projection} FROM main.{quoted_table};"))
             .await
             .map_err(|error| error.to_string())?;
         for row in rows {
             writeln!(
                 out,
-                "INSERT INTO {quoted_table} VALUES({});",
+                "INSERT INTO {quoted_table}{insert_columns} VALUES({});",
                 row.values()
                     .iter()
                     .map(sql_literal)
@@ -2809,6 +2981,26 @@ where
     }
 
     write_sqlite_sequence_dump(connection, filter, colorize_sql, out).await?;
+
+    // Like sqlite3's shell, register each rootpage-zero table against the
+    // restored backing tables. Running CREATE VIRTUAL TABLE would initialize
+    // a second index and lose information such as contentless FTS5 postings.
+    let has_virtual_tables = tables.iter().any(|table| table.virtual_table);
+    if has_virtual_tables {
+        write_sql_statement(out, "PRAGMA writable_schema=ON;", colorize_sql)
+            .map_err(|error| error.to_string())?;
+        for table in tables.iter().filter(|table| table.virtual_table) {
+            let name = sql_literal(&SqliteValue::from(table.name));
+            let ddl = sql_literal(&SqliteValue::from(table.ddl));
+            let statement = format!(
+                "INSERT INTO sqlite_schema(type,name,tbl_name,rootpage,sql) VALUES('table',{name},{name},0,{ddl});"
+            );
+            write_sql_statement(out, &statement, colorize_sql)
+                .map_err(|error| error.to_string())?;
+        }
+        write_sql_statement(out, "PRAGMA writable_schema=OFF;", colorize_sql)
+            .map_err(|error| error.to_string())?;
+    }
 
     let object_rows = match filter {
         Some(filter) => {
@@ -2827,8 +3019,37 @@ where
         write_sql_statement(out, statement, colorize_sql).map_err(|error| error.to_string())?;
     }
 
-    write_sql_statement(out, "COMMIT;", colorize_sql).map_err(|error| error.to_string())?;
-    Ok(())
+    Ok(has_virtual_tables)
+}
+
+/// VIRTUAL and STORED generated values are both recomputed by INSERT.
+/// Return an explicit projection only for tables with generated columns.
+fn dump_generated_table_columns(create_sql: &str) -> Option<String> {
+    use fsqlite_ast::{ColumnConstraintKind, CreateTableBody, Statement};
+
+    let (Statement::CreateTable(table), _) = Parser::from_sql(create_sql)
+        .parse_next_statement_with_tail()
+        .ok()??
+    else {
+        return None;
+    };
+    let CreateTableBody::Columns { mut columns, .. } = table.body else {
+        return None;
+    };
+    let total = columns.len();
+    columns.retain(|column| {
+        !column
+            .constraints
+            .iter()
+            .any(|constraint| matches!(constraint.kind, ColumnConstraintKind::Generated { .. }))
+    });
+    (columns.len() != total).then(|| {
+        columns
+            .iter()
+            .map(|column| quote_identifier(&column.name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    })
 }
 
 async fn write_sqlite_sequence_dump<W>(
@@ -2842,7 +3063,7 @@ where
 {
     let exists = connection
         .query(
-            "SELECT name FROM sqlite_schema \
+            "SELECT name FROM main.sqlite_schema \
              WHERE type = 'table' AND name = 'sqlite_sequence'",
         )
         .await
@@ -2851,10 +3072,10 @@ where
         return Ok(());
     }
 
-    let sql = "SELECT name, seq FROM sqlite_sequence ORDER BY name";
+    let sql = "SELECT name, seq FROM main.sqlite_sequence ORDER BY name";
     let filtered_sql = "\
         SELECT name, seq \
-        FROM sqlite_sequence \
+        FROM main.sqlite_sequence \
         WHERE name LIKE ?1 \
         ORDER BY name";
     let rows = match filter {
@@ -2928,15 +3149,13 @@ fn quote_identifier(name: &str) -> String {
 
 fn sql_literal(value: &SqliteValue) -> String {
     match value {
-        SqliteValue::Text(text) => format!("'{}'", text.replace('\'', "''")),
-        SqliteValue::Blob(bytes) => {
-            let mut rendered = String::from("X'");
-            for byte in bytes.iter() {
-                let _ = write!(rendered, "{byte:02X}");
-            }
-            rendered.push('\'');
-            rendered
+        SqliteValue::Text(text) if !text.is_valid_utf8() => {
+            format!("CAST({} AS TEXT)", blob_sql_literal(text.as_bytes_direct()))
         }
+        // A NUL terminates SQL input, and line-oriented shells can normalize CRLF.
+        SqliteValue::Text(text) if text.contains(['\0', '\r']) => dump_control_text(text),
+        SqliteValue::Text(text) => format!("'{}'", text.replace('\'', "''")),
+        SqliteValue::Blob(bytes) => blob_sql_literal(bytes),
         // Non-finite REALs have no SQL literal form; sqlite3's .dump emits
         // 9.0e+999 / -9.0e+999 (which parse back as infinities) and NULL
         // for NaN. `Display` would render `Inf`, a syntax error on reload.
@@ -2946,6 +3165,33 @@ fn sql_literal(value: &SqliteValue) -> String {
         }
         _ => value.to_string(),
     }
+}
+
+fn dump_control_text(text: &str) -> String {
+    // char() constructs characters in the destination encoding. Use a fixed
+    // expression depth even for long runs of controls. Decode escaped tildes
+    // last so literal "~0" and "~r" survive.
+    let mut sql = String::from("replace(replace(replace('");
+    for ch in text.chars() {
+        match ch {
+            '\'' => sql.push_str("''"),
+            '~' => sql.push_str("~e"),
+            '\0' => sql.push_str("~0"),
+            '\r' => sql.push_str("~r"),
+            _ => sql.push(ch),
+        }
+    }
+    sql.push_str("','~0',char(0)),'~r',char(13)),'~e','~')");
+    sql
+}
+
+fn blob_sql_literal(bytes: &[u8]) -> String {
+    let mut rendered = String::from("X'");
+    for byte in bytes {
+        let _ = write!(rendered, "{byte:02X}");
+    }
+    rendered.push('\'');
+    rendered
 }
 
 fn is_block_comment_start(bytes: &[u8], i: usize) -> bool {
@@ -2976,7 +3222,81 @@ fn statement_complete(buffer: &str) -> bool {
     scan_pending_input(buffer).complete
 }
 
+/// What the shell's pending input is: the one-pass answer for the line it
+/// reads most, else the full state scan.
 fn scan_pending_input(buffer: &str) -> PendingInput {
+    lone_plain_statement_scan(buffer.as_bytes())
+        .unwrap_or_else(|| scan_pending_input_by_states(buffer))
+}
+
+/// The four verbs a lone plain statement starts with.
+const LONE_STATEMENT_VERBS: [&[u8]; 4] = [b"select", b"insert", b"update", b"delete"];
+
+/// [`scan_pending_input`]'s answer for the line the shell reads most: one
+/// INSERT, UPDATE, DELETE or SELECT whose only semicolon outside a string is
+/// its last significant byte, made of plain text and single-quoted strings,
+/// with no `"`, backtick or `[` anywhere and no `--` or `/*` even inside a
+/// string. That input is complete and lone, as
+/// [`scan_pending_input_by_states`] finds; `None` leaves every other input,
+/// complete or not, to that scan (bd-w4pr1.13.35).
+///
+/// With a verb first and nothing significant after the one semicolon, no
+/// trigger head can arise, and without the refused bytes there is no comment
+/// or quoted name to follow. Toggling on every `'` keeps the state scan's
+/// inside/outside answer, since the two halves of a doubled quote have
+/// nothing between them.
+fn lone_plain_statement_scan(bytes: &[u8]) -> Option<PendingInput> {
+    let start = bytes.iter().position(|byte| !byte.is_ascii_whitespace())?;
+    let word_end = bytes[start..]
+        .iter()
+        .position(|byte| !(byte.is_ascii_alphanumeric() || *byte == b'_'))
+        .map_or(bytes.len(), |length| start + length);
+    let verb = &bytes[start..word_end];
+    if !LONE_STATEMENT_VERBS
+        .iter()
+        .any(|candidate| verb.eq_ignore_ascii_case(candidate))
+    {
+        return None;
+    }
+    let rest = &bytes[word_end..];
+    // The lexer's word runs on through a non-ASCII byte.
+    if rest.first().is_some_and(|byte| !byte.is_ascii()) {
+        return None;
+    }
+    let mut in_string = false;
+    let mut semicolons = 0_u32;
+    let mut ends_with_semicolon = false;
+    let mut previous = 0_u8;
+    for &byte in rest {
+        match byte {
+            b'\'' => {
+                if !in_string {
+                    ends_with_semicolon = false;
+                }
+                in_string = !in_string;
+            }
+            b'"' | b'`' | b'[' => return None,
+            b'-' if previous == b'-' => return None,
+            b'*' if previous == b'/' => return None,
+            b';' if !in_string => {
+                semicolons += 1;
+                ends_with_semicolon = true;
+            }
+            _ if in_string || byte.is_ascii_whitespace() => {}
+            _ => ends_with_semicolon = false,
+        }
+        previous = byte;
+    }
+    (!in_string && semicolons == 1 && ends_with_semicolon).then_some(PendingInput {
+        complete: true,
+        lone_plain_statement: true,
+    })
+}
+
+/// The state machine behind [`scan_pending_input`]: completeness as
+/// `sqlite3_complete()` judges it, and whether the input is a lone plain
+/// statement.
+fn scan_pending_input_by_states(buffer: &str) -> PendingInput {
     let bytes = buffer.as_bytes();
     let mut state = StatementScanState::Normal;
     let mut last_significant: Option<u8> = None;
@@ -3246,9 +3566,10 @@ mod tests {
         ShellOptions, StatementScanState, ansi_colors_enabled, bytes_alone_delimit_statements,
         format_row, highlight_sql, is_block_comment_end, is_block_comment_start,
         is_line_comment_start, lone_plain_statement, lone_plain_statement_by_bytes,
-        lone_plain_statement_by_tokens, output_uses_column_names, parse_args, render_display_value,
-        render_prompt, run, run_with_shell_options, scan_pending_input, statement_complete,
-        write_delimited_rows, write_query_plan_tree, write_rows,
+        lone_plain_statement_by_tokens, lone_plain_statement_scan, output_uses_column_names,
+        parse_args, render_display_value, render_prompt, run, run_with_shell_options,
+        scan_pending_input, scan_pending_input_by_states, statement_complete, write_delimited_rows,
+        write_query_plan_tree, write_rows,
     };
 
     fn parse_from(args: &[&str]) -> Result<super::CliOptions, String> {
@@ -4003,6 +4324,87 @@ INSERT INTO r VALUES(9e999), (-9e999), (1.5);\n\
     }
 
     #[test]
+    fn test_lone_plain_statement_scan_agrees_with_the_state_scan_wherever_it_answers() {
+        // Every sequence of up to five of these pieces joined by a space, and
+        // of up to four joined by nothing: verbs and a word, the bytes the
+        // quick scan refuses or must see in pairs (`-`, `/`, `*`, quotes,
+        // brackets), strings holding them, semicolons, a comment and a byte
+        // that is not ASCII.
+        const PIECES: [&str; 16] = [
+            "INSERT", "select", "x1", ";", "'a;b'", "'p-1-2'", "'a--b'", "'a''b'", "-", "/", "*",
+            "'", "\"q\"", "[a]", "-- c\n", "\u{e9}",
+        ];
+        let mut answered = 0_u32;
+        let mut indices = Vec::new();
+        for (joiner, longest) in [(" ", 5), ("", 4)] {
+            for length in 1..=longest {
+                indices.clear();
+                indices.resize(length, 0_usize);
+                loop {
+                    let text = indices
+                        .iter()
+                        .map(|&index| PIECES[index])
+                        .collect::<Vec<_>>()
+                        .join(joiner);
+                    let full = scan_pending_input_by_states(&text);
+                    if let Some(quick) = lone_plain_statement_scan(text.as_bytes()) {
+                        assert_eq!(quick, full, "{text:?}");
+                        answered += 1;
+                    }
+                    assert_eq!(scan_pending_input(&text), full, "{text:?}");
+                    let Some(position) =
+                        indices.iter().rposition(|&index| index + 1 < PIECES.len())
+                    else {
+                        break;
+                    };
+                    indices[position] += 1;
+                    for index in &mut indices[position + 1..] {
+                        *index = 0;
+                    }
+                }
+            }
+        }
+        assert!(answered > 1_000, "{answered}");
+
+        // The lines the scorecard's statement rows feed the shell are read by
+        // the quick scan.
+        for line in [
+            "INSERT INTO e(w,s) VALUES(7,'p-7-3');",
+            "INSERT INTO e(w,s) VALUES(42,'payload-42');",
+            " select * from t where id = -5 / 2 ; \r\n",
+            "UPDATE t SET a = 'x''y;' WHERE id = 1;",
+        ] {
+            assert_eq!(
+                lone_plain_statement_scan(line.as_bytes()),
+                Some(scan_pending_input_by_states(line)),
+                "{line:?}"
+            );
+        }
+        // What a quick scan that read past strings, comments or a second
+        // statement would call lone: each is left to the state scan.
+        for other in [
+            "SELECT 'a--b';",
+            "SELECT '/*';",
+            "SELECT 1 -- c\n;",
+            "SELECT 1; SELECT 2;",
+            "SELECT 1; CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1;",
+            "SELECT 'unterminated;",
+            "SELECT 1;'",
+            "SELECT 1; \u{e9}",
+            "SELECT [a];",
+            "selectx 1;",
+            "select\u{e9} 1;",
+            "SELECT 1",
+        ] {
+            assert_eq!(
+                lone_plain_statement_scan(other.as_bytes()),
+                None,
+                "{other:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_format_row_joins_with_pipes() {
         asupersync::test_utils::run_test(|| async {
             let mut input = Cursor::new(Vec::<u8>::new());
@@ -4061,9 +4463,10 @@ INSERT INTO r VALUES(9e999), (-9e999), (1.5);\n\
             OsString::from("fsqlite"),
             db.clone().into_os_string(),
             OsString::from("-c"),
+            // bd-71vt5 (owner decision 2026-11-17): generation is opt-in.
             OsString::from(
                 "PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; \
-                 PRAGMA wal_autocheckpoint = 0; \
+                 PRAGMA wal_autocheckpoint = 0; PRAGMA raptorq_repair_symbols = 2; \
                  CREATE TABLE t(value INTEGER); INSERT INTO t VALUES (42); \
                  SELECT value FROM t;",
             ),
@@ -4083,11 +4486,11 @@ INSERT INTO r VALUES(9e999), (-9e999), (1.5);\n\
                 .any(|line| line == "42")
         );
 
-        // No repair PRAGMA was written, so a group marker proves this is
-        // generated repair data rather than only a persisted config header.
-        // The shell's awaited close drains the worker before returning here.
+        // The opt-in writes only a configuration header (FSQLWFCP), so a
+        // group marker proves this is generated repair data. The shell's
+        // awaited close drains the worker before returning here.
         let sidecar = fs::read(dir.path().join("shell-fec.db-wal-fec"))
-            .expect("the shipped shell runtime must generate WAL repair symbols");
+            .expect("the shipped shell runtime must generate WAL repair symbols once opted in");
         assert!(sidecar.windows(8).any(|bytes| bytes == b"FSQLWFEC"));
         let stock = rusqlite::Connection::open(&db).expect("stock SQLite open");
         assert_eq!(
@@ -4096,6 +4499,50 @@ INSERT INTO r VALUES(9e999), (-9e999), (1.5);\n\
                 .expect("stock SQLite query"),
             42,
         );
+    }
+
+    /// bd-71vt5 (owner decision 2026-11-17): a default database written by
+    /// the shell at `synchronous = FULL` generates no repair symbols: no
+    /// `-wal-fec`, no `-wal-fec.lock`, though the shell's runtime could run
+    /// the worker.
+    #[test]
+    fn test_shell_default_database_writes_no_wal_fec() {
+        let runtime = super::shell_runtime_builder()
+            .build()
+            .expect("shell runtime");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("shell-default.db");
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = vec![
+            OsString::from("fsqlite"),
+            db.clone().into_os_string(),
+            OsString::from("-c"),
+            OsString::from(
+                "PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; \
+                 PRAGMA wal_autocheckpoint = 0; \
+                 CREATE TABLE t(value INTEGER); INSERT INTO t VALUES (42); \
+                 SELECT value FROM t;",
+            ),
+        ];
+        let exit_code = runtime.block_on(run_with_shell_options(
+            args,
+            &mut input,
+            &mut out,
+            &mut err,
+            ShellOptions::batch(),
+        ));
+        assert_eq!(exit_code, 0, "{}", String::from_utf8_lossy(&err));
+        assert!(
+            String::from_utf8_lossy(&out)
+                .lines()
+                .any(|line| line == "42")
+        );
+        // test_shell_runtime_generates_wal_fec_before_exit is the positive
+        // control: the same script on the same runtime, opted in, writes one.
+        assert!(!dir.path().join("shell-default.db-wal-fec").exists());
+        assert!(!dir.path().join("shell-default.db-wal-fec.lock").exists());
     }
 
     #[test]
@@ -4702,6 +5149,105 @@ SELECT 1 AS one, 'two,three' AS two;\n\
             assert_eq!(system_sqlite3_stdout(script.as_bytes()), expected);
             eprintln!("event=display_bytes_stock_verified sqlite={version}");
         }
+    }
+
+    #[test]
+    fn test_returning_headers_and_column_tab_stops() {
+        asupersync::test_utils::run_test(|| async {
+            let script = concat!(
+                ".headers on\n",
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT, v REAL);\n",
+                "INSERT INTO t VALUES(4,'r',3.0) RETURNING id, name;\n",
+                ".mode line\n",
+                "UPDATE t SET v=4.0 WHERE id=4 RETURNING v;\n",
+                ".mode column\n",
+                "DELETE FROM t WHERE id=4 RETURNING *;\n",
+                "SELECT 'x' AS a, 'tab\there' AS b, 'z' AS c ",
+                "UNION ALL SELECT 'aaaa', 'à\tβ\t!', 'q';\n",
+                "SELECT 'a' AS 'a\tname', 'b' AS 'b\tname';\n",
+                ".headers off\n",
+                ".mode tabs\n",
+                "SELECT 'tab\there' AS a, 'z' AS b;\n",
+            );
+            let expected = concat!(
+                "id|name\n",
+                "4|r\n",
+                "    v = 4.0\n",
+                "id  name  v  \n",
+                "--  ----  ---\n",
+                "4   r     4.0\n",
+                "a     b                  c\n",
+                "----  -----------------  -\n",
+                "x     tab     here       z\n",
+                "aaaa  à       β       !  q\n",
+                "a       name  b       name\n",
+                "------------  ------------\n",
+                "a             b           \n",
+                "tab\there\tz\n",
+            );
+            assert_display_script_matches_stock(script, expected.as_bytes()).await;
+            assert_display_script_matches_stock(
+                ".mode column\n\
+                 SELECT 'x' AS a, x'61800962' AS b, 'z' AS c;\n\
+                 SELECT x'80810962' AS b;\n",
+                b"a  b          c\n-  ---------  -\nx  a\x80       b  z\n\
+                  b       \n--------\n\x80\x81       b\n",
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    fn test_column_mode_aligns_multiline_cells_and_keeps_logical_rows() {
+        asupersync::test_utils::run_test(|| async {
+            let script = concat!(
+                ".mode column\n",
+                "SELECT 'x' AS a, 'z'||char(13,10)||'q'||char(9)||'k' AS b, 'z' AS c\n",
+                "UNION ALL SELECT 'u', 'v', 'w';\n",
+                "SELECT 'a'||char(10)||'b' AS x, 'c'||char(13)||'d'||char(11)||'e' AS y;\n",
+                "SELECT 'a'||char(10) AS x, 'b' AS y;\n",
+                "SELECT 'a' AS 'x\nlonger', 'b' AS c;\n",
+                "SELECT x'61800a620963' AS a, 'end' AS b;\n",
+                ".headers off\n",
+                "SELECT 'foo'||char(10)||'bar' AS a, 'baz' AS b;\n",
+                ".mode list\n",
+                "SELECT 'x'||char(10)||'y' AS a, 'z' AS b;\n",
+            );
+            let expected =
+                b"a  b          c\n-  ---------  -\nx  z          z\n   q       k   \n\n\
+                             u  v          w\nx  y\n-  -\na  c\nb  d\n   e\nx  y\n-  -\na  b\n\
+                             x  c\n-  -\na  b\na          b  \n---------  ---\na\x80          end\n\
+                             b       c     \nfoo  baz\nbar     \nx\ny|z\n";
+            assert_display_script_matches_stock(script, expected).await;
+        });
+    }
+
+    #[test]
+    fn test_column_mode_wraps_at_sixty_display_characters() {
+        asupersync::test_utils::run_test(|| async {
+            let script = concat!(
+                ".headers off\n.mode column\n",
+                "SELECT replace(hex(zeroblob(31)), '0','é') AS x, 'end' AS y;\n",
+                "SELECT hex(zeroblob(29))||char(9)||'z' AS x, 'end' AS y;\n",
+                "SELECT hex(zeroblob(30))||char(9)||'z' AS x, 'end' AS y;\n",
+                "SELECT hex(zeroblob(31))||char(13,10)||'tail' AS x, 'end' AS y\n",
+                "UNION ALL SELECT 'last', 'row';\n",
+            );
+            let sixty_zeros = "0".repeat(60);
+            let expected = format!(
+                "{unicode}  end\néé{pad_two}\n\
+                 {short}    end\nz{pad_one}\n\
+                 {sixty_zeros}  end\nz{pad_one}\n\
+                 {sixty_zeros}  end\n00{pad_two}\ntail{pad_tail}\n\nlast{pad_last}row\n",
+                unicode = "é".repeat(60),
+                short = "0".repeat(58),
+                pad_one = " ".repeat(64),
+                pad_two = " ".repeat(63),
+                pad_tail = " ".repeat(61),
+                pad_last = " ".repeat(58),
+            );
+            assert_display_script_matches_stock(script, expected.as_bytes()).await;
+        });
     }
 
     #[test]
@@ -5466,6 +6012,760 @@ INSERT INTO notes VALUES(1, 'O''Malley', x'0102', NULL);\n\
             assert!(
                 stdout.contains("COMMIT;"),
                 "expected transaction trailer in dump, got: {stdout}",
+            );
+        });
+    }
+
+    #[test]
+    #[cfg(feature = "fts5")]
+    fn test_dump_restores_fts5_postings_rowids_and_actual_shadow_tables() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("fts.db");
+            let source = rusqlite::Connection::open(&path).unwrap();
+            source
+                .execute_batch(
+                    "CREATE TABLE My_docs_content(v);
+                 INSERT INTO My_docs_content VALUES(73);
+                 CREATE VIRTUAL TABLE Books USING fts5(body);
+                 INSERT INTO Books(rowid,body) VALUES(4,'first needle'),(91,'other');
+                 CREATE VIRTUAL TABLE My_docs USING fts5(body,content='');
+                 INSERT INTO My_docs(rowid,body) VALUES(27,'hidden needle'),(61,'other');",
+                )
+                .unwrap();
+            let reader = Connection::open(path.to_str().unwrap()).await.unwrap();
+            reader.execute_batch("CREATE TEMP TABLE Books_config(k,v); INSERT INTO temp.Books_config VALUES('wrong',0);").await.unwrap();
+            for filter in [None, Some("My_docs"), Some("My_docs%")] {
+                let mut bytes = Vec::new();
+                super::write_dump(&reader, filter, false, &mut bytes)
+                    .await
+                    .unwrap();
+                let sql = std::str::from_utf8(&bytes).unwrap();
+                let stock = rusqlite::Connection::open_in_memory().unwrap();
+                stock.execute_batch(sql).unwrap();
+                let native = Connection::open(":memory:").await.unwrap();
+                native.execute_batch(sql).await.unwrap();
+                let mut checks = vec![
+                    ("SELECT rowid FROM My_docs WHERE My_docs MATCH 'needle'", 27),
+                    ("SELECT rowid FROM My_docs WHERE My_docs MATCH 'other'", 61),
+                    (
+                        "SELECT count(*) FROM sqlite_schema WHERE name='My_docs_content'",
+                        i64::from(filter != Some("My_docs")),
+                    ),
+                ];
+                if filter != Some("My_docs") {
+                    checks.push(("SELECT v FROM My_docs_content", 73));
+                }
+                if filter.is_none() {
+                    checks.push(("SELECT rowid FROM Books WHERE Books MATCH 'needle' AND body='first needle'", 4));
+                }
+                for (query, expected) in checks {
+                    assert_eq!(
+                        stock.query_row(query, [], |r| r.get::<_, i64>(0)).unwrap(),
+                        expected,
+                        "{query}"
+                    );
+                    assert_eq!(
+                        native.query_row(query).await.unwrap().get(0),
+                        Some(&fsqlite::SqliteValue::Integer(expected)),
+                        "{query}"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    #[cfg(feature = "rtree")]
+    fn test_dump_restores_split_rtree_across_page_sizes() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("spatial.db");
+            let source = rusqlite::Connection::open(&path).unwrap();
+            source
+                .execute_batch(
+                    "PRAGMA page_size=512;
+                 CREATE VIRTUAL TABLE bounds USING rtree_i32(id,lo,hi,+label);
+                 WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<180)
+                 INSERT INTO bounds SELECT 3*i,i,i,'point-'||i FROM n;
+                 CREATE TABLE bounds_notes(v);",
+                )
+                .unwrap();
+            assert!(
+                source
+                    .query_row("SELECT count(*) FROM bounds_node", [], |r| r
+                        .get::<_, i64>(0))
+                    .unwrap()
+                    > 1
+            );
+            let reader = Connection::open(path.to_str().unwrap()).await.unwrap();
+            let mut bytes = Vec::new();
+            super::write_dump(&reader, Some("bounds"), false, &mut bytes)
+                .await
+                .unwrap();
+            let sql = std::str::from_utf8(&bytes).unwrap();
+            let stock = rusqlite::Connection::open_in_memory().unwrap();
+            let native = Connection::open(":memory:").await.unwrap();
+            stock.execute_batch(sql).unwrap();
+            native.execute_batch(sql).await.unwrap();
+            let add_point = "INSERT INTO bounds VALUES(9000,40,45,'new')";
+            stock.execute_batch(add_point).unwrap();
+            native.execute(add_point).await.unwrap();
+            for (query, expected) in [
+                ("SELECT count(*) FROM bounds", 181),
+                (
+                    "SELECT id FROM bounds WHERE lo<=42 AND hi>=42 AND label='point-42'",
+                    126,
+                ),
+                ("SELECT count(*) FROM bounds WHERE lo<=42 AND hi>=42", 2),
+                (
+                    "SELECT count(*) FROM sqlite_schema WHERE name='bounds_notes'",
+                    0,
+                ),
+            ] {
+                assert_eq!(
+                    stock.query_row(query, [], |r| r.get::<_, i64>(0)).unwrap(),
+                    expected,
+                    "{query}"
+                );
+                assert_eq!(
+                    native.query_row(query).await.unwrap().get(0),
+                    Some(&fsqlite::SqliteValue::Integer(expected)),
+                    "{query}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    #[cfg(feature = "fts5")]
+    fn test_dump_preserves_typed_contentless_unindexed_storage() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("sparse.db");
+            let source = rusqlite::Connection::open(&path).unwrap();
+            source.execute_batch(
+                "CREATE VIRTUAL TABLE docs USING fts5(title, tag UNINDEXED, body, cost UNINDEXED,
+                      content='', contentless_unindexed=1);
+                 INSERT INTO docs(rowid,title,tag,body,cost) VALUES(10,'needle',17,'more',X'00FF');"
+            ).unwrap();
+            let reader = Connection::open(path.to_str().unwrap()).await.unwrap();
+            let mut bytes = Vec::new();
+            super::write_dump(&reader, Some("docs"), false, &mut bytes)
+                .await
+                .unwrap();
+            let sql = std::str::from_utf8(&bytes).unwrap();
+            let stock = rusqlite::Connection::open_in_memory().unwrap();
+            stock.execute_batch(sql).unwrap();
+            let native = Connection::open(":memory:").await.unwrap();
+            native.execute_batch(sql).await.unwrap();
+            let physical = "SELECT id FROM docs_content WHERE typeof(c1)='integer' AND c1=17
+                                 AND typeof(c3)='blob' AND c3=X'00FF'";
+            let hit = "SELECT rowid FROM docs WHERE docs MATCH 'needle'";
+            for query in [physical, hit] {
+                assert_eq!(
+                    stock.query_row(query, [], |r| r.get::<_, i64>(0)).unwrap(),
+                    10
+                );
+                assert_eq!(
+                    native.query_row(query).await.unwrap().get(0),
+                    Some(&fsqlite::SqliteValue::Integer(10))
+                );
+            }
+            let logical =
+                "SELECT rowid FROM docs WHERE typeof(tag)='integer' AND tag=17 AND cost=X'00FF'";
+            assert_eq!(
+                native.query_row(logical).await.unwrap().get(0),
+                Some(&fsqlite::SqliteValue::Integer(10))
+            );
+            assert_eq!(
+                stock
+                    .query_row(logical, [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                10
+            );
+        });
+    }
+
+    #[test]
+    #[cfg(feature = "fts5")]
+    fn test_fts5_contentless_unindexed_cross_engine_writes() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("typed.db");
+            let db = Connection::open(path.to_str().unwrap()).await.unwrap();
+            db.execute_batch(
+                "CREATE VIRTUAL TABLE d USING fts5(title, tag UNINDEXED, content='', body,
+                    cost UNINDEXED, contentless_unindexed=1, contentless_delete=1);
+                 INSERT INTO d(rowid,title,tag,body,cost) VALUES
+                    (10,'needle',17,'hay',X'00FF'),(20,'needle',NULL,'other',NULL);
+                 INSERT INTO d(title,tag,body,cost) VALUES('extra',1.25,'another','original');",
+            )
+            .await
+            .unwrap();
+            let hit = "SELECT rowid FROM d WHERE d MATCH 'needle' AND title IS NULL AND body IS NULL
+                       AND typeof(tag)='integer' AND tag=17 AND typeof(cost)='blob' AND cost=X'00FF'";
+            let missing =
+                "SELECT rowid FROM d WHERE d MATCH 'needle' AND tag IS NULL AND cost IS NULL";
+            for (sql, id) in [(hit, 10), (missing, 20)] {
+                assert_eq!(
+                    db.query_row(sql).await.unwrap().get(0),
+                    Some(&fsqlite::SqliteValue::Integer(id))
+                );
+            }
+            drop(db);
+            let stock = rusqlite::Connection::open(&path).unwrap();
+            for (sql, id) in [(hit, 10), (missing, 20)] {
+                assert_eq!(
+                    stock.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap(),
+                    id
+                );
+            }
+            stock
+                .execute_batch("UPDATE d SET cost=X'FF00' WHERE rowid=21")
+                .unwrap();
+            drop(stock);
+            let db = Connection::open(path.to_str().unwrap()).await.unwrap();
+            db.execute_batch(
+                "CREATE TEMP TABLE d_content(id INTEGER PRIMARY KEY,c1,c3);
+                 INSERT INTO temp.d_content VALUES(21,'temporary','decoy');",
+            )
+            .await
+            .unwrap();
+            let edited = "SELECT rowid FROM d WHERE d MATCH 'extra' AND typeof(tag)='real' AND tag=1.25 AND cost=X'FF00'";
+            assert_eq!(
+                db.query_row(edited).await.unwrap().get(0),
+                Some(&fsqlite::SqliteValue::Integer(21))
+            );
+            db.execute_batch(
+                "BEGIN;
+                 UPDATE d SET cost='transient' WHERE rowid=21;
+                 ROLLBACK;",
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                db.query_row(edited).await.unwrap().get(0),
+                Some(&fsqlite::SqliteValue::Integer(21))
+            );
+            db.execute_batch(
+                "UPDATE d SET cost='committed' WHERE rowid=21;
+                 UPDATE d SET rowid=rowid+100,title='fresh',body='word' WHERE rowid=10;
+                 DELETE FROM d WHERE rowid=20;
+                 INSERT INTO d(d) VALUES('optimize');",
+            )
+            .await
+            .unwrap();
+            assert!(
+                db.execute("UPDATE d SET rowid=21,title='bad',body='bad' WHERE rowid=110")
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                db.query_row("SELECT id FROM temp.d_content WHERE c1='temporary' AND c3='decoy'")
+                    .await
+                    .unwrap()
+                    .get(0),
+                Some(&fsqlite::SqliteValue::Integer(21))
+            );
+            drop(db);
+            let stock = rusqlite::Connection::open(&path).unwrap();
+            for (query, id) in [
+                (
+                    "SELECT rowid FROM d WHERE d MATCH 'extra' AND tag=1.25 AND cost='committed'",
+                    21,
+                ),
+                (
+                    "SELECT rowid FROM d WHERE d MATCH 'fresh' AND tag=17 AND cost=X'00FF'",
+                    110,
+                ),
+                ("SELECT count(*) FROM d WHERE d MATCH 'needle'", 0),
+                ("SELECT count(*) FROM d_content WHERE id=20", 0),
+                ("SELECT count(*) FROM d_content WHERE id=10", 0),
+            ] {
+                assert_eq!(
+                    stock.query_row(query, [], |r| r.get::<_, i64>(0)).unwrap(),
+                    id,
+                    "{query}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    #[cfg(feature = "fts5")]
+    fn test_fts5_sparse_insert_with_no_terms_or_docsize() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("no-terms.db");
+            let db = Connection::open(path.to_str().unwrap()).await.unwrap();
+            db.execute_batch(
+                "CREATE VIRTUAL TABLE s USING fts5(label UNINDEXED, w, content='',
+                    columnsize=0, contentless_unindexed=1);
+                 INSERT INTO s(label) VALUES(X'00FF');
+                 INSERT INTO s(w,label) VALUES('needle',NULL);",
+            )
+            .await
+            .unwrap();
+            assert!(
+                db.execute("INSERT OR REPLACE INTO s(rowid,w,label) VALUES(1,'wrong',7)")
+                    .await
+                    .is_err()
+            );
+            db.execute("UPDATE s SET label=17 WHERE rowid=2")
+                .await
+                .unwrap();
+            db.execute_batch(
+                "INSERT INTO s(rowid,w,label) VALUES(3,'removed',99);
+                              INSERT INTO s(s,rowid,w) VALUES('delete',3,'removed');
+                              CREATE VIRTUAL TABLE a USING fts5(k UNINDEXED,content='',
+                                  contentless_unindexed=1,contentless_delete=1);
+                              INSERT INTO a(k) VALUES(3),(4);
+                              DELETE FROM a WHERE rowid=1;",
+            )
+            .await
+            .unwrap();
+            drop(db);
+            let stock = rusqlite::Connection::open(&path).unwrap();
+            for (sql, expected) in [
+                ("SELECT rowid FROM s WHERE label=X'00FF'", 1),
+                ("SELECT rowid FROM s WHERE s MATCH 'needle' AND label=17", 2),
+                ("SELECT count(*) FROM s WHERE s MATCH 'wrong'", 0),
+                ("SELECT count(*) FROM s WHERE s MATCH 'removed'", 0),
+                ("SELECT count(*) FROM s_content WHERE id=3", 0),
+                ("SELECT rowid FROM a WHERE k=4", 2),
+                ("SELECT count(*) FROM a", 1),
+            ] {
+                assert_eq!(
+                    stock.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap(),
+                    expected
+                );
+            }
+        });
+    }
+
+    #[test]
+    #[cfg(feature = "fts5")]
+    fn test_fts5_writes_preserve_ordinary_tables_with_shadow_suffixes() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("ordinary.db");
+            let db = Connection::open(path.to_str().unwrap()).await.unwrap();
+            db.execute_batch(
+                "CREATE TABLE s_content(v); INSERT INTO s_content VALUES('keep content');
+                 CREATE TABLE s_docsize(v); INSERT INTO s_docsize VALUES('keep sizes');
+                 CREATE VIRTUAL TABLE s USING fts5(body, content='', columnsize=0);",
+            )
+            .await
+            .unwrap();
+            for sql in [
+                "INSERT INTO s(rowid,body) VALUES(1,'first')",
+                "INSERT INTO s(rowid,body) VALUES(2,'second')",
+                "INSERT INTO s(s) VALUES('delete-all')",
+                "INSERT INTO s(rowid,body) VALUES(3,'third')",
+            ] {
+                db.execute(sql).await.unwrap();
+                for (table, value) in [("s_content", "keep content"), ("s_docsize", "keep sizes")] {
+                    let rows = db.query(&format!("SELECT v FROM {table}")).await.unwrap();
+                    assert_eq!(rows.len(), 1, "{table} after {sql}");
+                    assert_eq!(
+                        rows[0].get(0),
+                        Some(&fsqlite::SqliteValue::from(value)),
+                        "{table} after {sql}"
+                    );
+                }
+            }
+            drop(db);
+            let stock = rusqlite::Connection::open(&path).unwrap();
+            assert_eq!(
+                stock
+                    .query_row("SELECT rowid FROM s WHERE s MATCH 'third'", [], |r| r
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                3
+            );
+            assert_eq!(
+                stock
+                    .query_row("SELECT count(*) FROM s WHERE s MATCH 'first'", [], |r| r
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            let db = Connection::open(path.to_str().unwrap()).await.unwrap();
+            assert_eq!(
+                db.query_row("SELECT rowid FROM s WHERE s MATCH 'third'")
+                    .await
+                    .unwrap()
+                    .get(0),
+                Some(&fsqlite::SqliteValue::Integer(3))
+            );
+        });
+    }
+
+    #[test]
+    fn test_writable_schema_reset_reads_transaction_view_and_survives_rollback() {
+        asupersync::test_utils::run_test(|| async {
+            let db = Connection::open(":memory:").await.unwrap();
+            db.execute_batch(
+                "CREATE VIEW current_v AS SELECT 1 AS v;
+                 BEGIN; SAVEPOINT original;
+                 PRAGMA writable_schema=ON;
+                 UPDATE sqlite_schema SET sql='CREATE VIEW current_v AS SELECT 2 AS v'
+                   WHERE type='view' AND name='current_v';
+                 PRAGMA writable_schema=RESET;",
+            )
+            .await
+            .unwrap();
+            for (sql, expected) in [
+                ("", 2),
+                ("ROLLBACK TO original; RELEASE original; COMMIT;", 1),
+                (
+                    "PRAGMA writable_schema=ON;
+                  UPDATE sqlite_schema SET sql='CREATE VIEW current_v AS SELECT 3 AS v'
+                    WHERE type='view' AND name='current_v';
+                  PRAGMA writable_schema='RESET';",
+                    3,
+                ),
+            ] {
+                db.execute_batch(sql).await.unwrap();
+                assert_eq!(
+                    db.query_row("SELECT v FROM current_v")
+                        .await
+                        .unwrap()
+                        .get(0),
+                    Some(&fsqlite::SqliteValue::Integer(expected))
+                );
+                assert_eq!(
+                    db.query_row("PRAGMA writable_schema").await.unwrap().get(0),
+                    Some(&fsqlite::SqliteValue::Integer(0))
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn test_catalog_commands_preserve_user_names_starting_with_sqlite() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = fsqlite::Connection::open(":memory:").await.unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sqlite3_notes(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+                 INSERT INTO sqlite3_notes VALUES(7,'saved');
+                 CREATE INDEX sqliteX_tag ON sqlite3_notes(v);
+                 CREATE VIEW SQLiteView AS SELECT v FROM sqlite3_notes;
+                 CREATE TABLE ordinary(v);",
+            )
+            .await
+            .unwrap();
+
+            for filter in [None, Some("sqlite%")] {
+                let mut output = Vec::new();
+                super::write_tables(&conn, filter, &mut output)
+                    .await
+                    .unwrap();
+                let tables: Vec<_> = std::str::from_utf8(&output)
+                    .unwrap()
+                    .split_whitespace()
+                    .collect();
+                assert!(tables.contains(&"sqlite3_notes"));
+                assert!(tables.contains(&"SQLiteView"));
+                assert!(!tables.contains(&"sqlite_sequence"));
+                assert_eq!(tables.contains(&"ordinary"), filter.is_none());
+
+                output.clear();
+                super::write_schema(&conn, filter, false, &mut output)
+                    .await
+                    .unwrap();
+                let schema = std::str::from_utf8(&output).unwrap();
+                for name in ["sqlite3_notes", "sqliteX_tag", "SQLiteView"] {
+                    assert!(schema.contains(name), "{schema}");
+                }
+                assert!(!schema.contains("sqlite_sequence"));
+
+                output.clear();
+                super::write_dump(&conn, filter, false, &mut output)
+                    .await
+                    .unwrap();
+                let restored = rusqlite::Connection::open_in_memory().unwrap();
+                restored
+                    .execute_batch(std::str::from_utf8(&output).unwrap())
+                    .unwrap();
+                let result: (String, i64, i64) = restored
+                    .query_row(
+                        "SELECT v, (SELECT count(*) FROM SQLiteView),
+                           (SELECT seq FROM sqlite_sequence WHERE name='sqlite3_notes')
+                         FROM sqlite3_notes INDEXED BY sqliteX_tag WHERE id=7",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .unwrap();
+                assert_eq!(result, (String::from("saved"), 1, 7));
+            }
+        });
+    }
+
+    #[test]
+    fn test_dump_keeps_one_snapshot_while_a_wal_writer_commits() {
+        struct DumpOutput {
+            sql: Vec<u8>,
+            writer: Option<rusqlite::Connection>,
+        }
+
+        impl io::Write for DumpOutput {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.sql.extend_from_slice(buf);
+                if self.sql.ends_with(b"INSERT INTO \"a_head\" VALUES(0);\n")
+                    && let Some(writer) = self.writer.take()
+                {
+                    writer
+                        .execute_batch(
+                            "BEGIN; UPDATE a_head SET v=1; UPDATE z_tail SET v=1;
+                             CREATE INDEX after_dump_started ON z_tail(v); COMMIT;",
+                        )
+                        .map_err(io::Error::other)?;
+                }
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        asupersync::test_utils::run_test(|| async {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let path = directory.path().join("concurrent.db");
+            let writer = rusqlite::Connection::open(&path).expect("stock writer");
+            writer
+                .execute_batch(
+                    "PRAGMA journal_mode=WAL;
+                     CREATE TABLE a_head(v); CREATE TABLE z_tail(v);
+                     INSERT INTO a_head VALUES(0); INSERT INTO z_tail VALUES(0);",
+                )
+                .expect("create source");
+            let reader = fsqlite::Connection::open(path.to_str().unwrap())
+                .await
+                .expect("dump reader");
+            let mut output = DumpOutput {
+                sql: Vec::new(),
+                writer: Some(writer),
+            };
+            super::write_dump(&reader, None, false, &mut output)
+                .await
+                .expect("dump beside stock writer");
+            assert!(output.writer.is_none(), "the writer must run during output");
+            let read = |db: &rusqlite::Connection| -> (i64, i64, i64) {
+                db.query_row(
+                    "SELECT (SELECT v FROM a_head), (SELECT v FROM z_tail),
+                     (SELECT count(*) FROM sqlite_schema WHERE name='after_dump_started')",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("inspect generations and index")
+            };
+            assert_eq!(read(&rusqlite::Connection::open(&path).unwrap()), (1, 1, 1));
+            let restored = rusqlite::Connection::open_in_memory().unwrap();
+            restored
+                .execute_batch(std::str::from_utf8(&output.sql).unwrap())
+                .expect("restore dump");
+            assert_eq!(read(&restored), (0, 0, 0));
+            assert!(!reader.in_transaction());
+        });
+    }
+
+    #[test]
+    fn test_dump_releases_only_its_own_transaction_on_success_and_error() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = fsqlite::Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE t(v)").await.unwrap();
+            let mut full_output: &mut [u8] = &mut [];
+            assert!(
+                super::write_dump(&conn, None, false, &mut full_output)
+                    .await
+                    .is_err()
+            );
+            assert!(!conn.in_transaction());
+            conn.execute_batch("BEGIN; INSERT INTO t VALUES(41); SAVEPOINT caller;")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES(42)").await.unwrap();
+            let mut dump = Vec::new();
+            super::write_dump(&conn, Some("t"), false, &mut dump)
+                .await
+                .unwrap();
+            let restored = rusqlite::Connection::open_in_memory().unwrap();
+            restored
+                .execute_batch(std::str::from_utf8(&dump).unwrap())
+                .unwrap();
+            assert_eq!(
+                restored
+                    .query_row("SELECT sum(v) FROM t", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                83
+            );
+            assert!(
+                super::write_dump(&conn, None, false, &mut full_output)
+                    .await
+                    .is_err()
+            );
+            conn.execute_batch("ROLLBACK TO caller; RELEASE caller; ROLLBACK;")
+                .await
+                .expect("caller still owns its savepoint and transaction");
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM t")
+                    .await
+                    .unwrap()
+                    .get(0),
+                Some(&fsqlite::SqliteValue::Integer(0))
+            );
+        });
+    }
+
+    #[test]
+    fn test_dump_restores_exact_text_bytes_in_stock_and_fsqlite() {
+        asupersync::test_utils::run_test(|| async {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let path = directory.path().join("text.db");
+            {
+                let stock = rusqlite::Connection::open(&path).expect("create source file");
+                stock
+                    .execute_batch(
+                        "CREATE TABLE t(v);
+                         INSERT INTO t VALUES (CAST(X'410042' AS TEXT)), (CAST(X'00' AS TEXT)),
+                           (CAST(X'804127FF' AS TEXT)), (CAST(X'FF0080' AS TEXT)),
+                           (CAST(X'410D0A42' AS TEXT)), ('é''s'), (''),
+                           (X'FF0080'), (X''), (NULL),
+                           ('~0' || char(0) || '~r' || char(13) || '~e''~é');",
+                    )
+                    .expect("populate source");
+            }
+            let mut dump = Vec::new();
+            let mut err = Vec::new();
+            let status = run(
+                vec!["fsqlite".into(), path.into_os_string(), ".dump".into()],
+                &mut Cursor::new(Vec::new()),
+                &mut dump,
+                &mut err,
+            )
+            .await;
+            assert_eq!(status, 0, "{}", String::from_utf8_lossy(&err));
+            let dump = String::from_utf8(dump).expect("UTF-8 SQL dump");
+            let query = "SELECT typeof(v) || ':' || hex(v) FROM t ORDER BY rowid;";
+            let expected = [
+                "text:410042",
+                "text:00",
+                "text:804127FF",
+                "text:FF0080",
+                "text:410D0A42",
+                "text:C3A92773",
+                "text:",
+                "blob:FF0080",
+                "blob:",
+                "null:",
+                "text:7E30007E720D7E65277EC3A9",
+            ];
+
+            let stock = rusqlite::Connection::open_in_memory().expect("restore destination");
+            stock.execute_batch(&dump).expect("stock restores dump");
+            let restored = stock
+                .prepare(query)
+                .expect("read restored data")
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("query stock")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("read stock rows");
+            assert_eq!(restored, expected);
+
+            for encoding in ["UTF-16le", "UTF-16be"] {
+                let db = rusqlite::Connection::open_in_memory().expect("UTF-16 destination");
+                db.pragma_update(None, "encoding", encoding)
+                    .expect("set encoding");
+                db.execute_batch(&dump).expect("restore into UTF-16");
+                let actual_encoding: String = db
+                    .pragma_query_value(None, "encoding", |row| row.get(0))
+                    .expect("read destination encoding");
+                assert_eq!(actual_encoding, encoding);
+                let text: String = db
+                    .query_row("SELECT v FROM t WHERE rowid=11", [], |row| row.get(0))
+                    .expect("read restored Unicode text");
+                assert_eq!(text, "~0\0~r\r~e'~é", "{encoding}");
+            }
+
+            let mut out = Vec::new();
+            let status = run_with_shell_options(
+                vec!["fsqlite".into()],
+                &mut Cursor::new(format!("{dump}{query}\n")),
+                &mut out,
+                &mut err,
+                ShellOptions::batch(),
+            )
+            .await;
+            assert_eq!(status, 0, "{}", String::from_utf8_lossy(&err));
+            let restored = String::from_utf8(out).expect("shell output");
+            assert_eq!(restored.lines().collect::<Vec<_>>(), expected);
+        });
+    }
+
+    #[test]
+    fn test_dump_generated_columns_restore_in_stock_sqlite() {
+        asupersync::test_utils::run_test(|| async {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let path = directory.path().join("generated.db");
+            {
+                let stock = rusqlite::Connection::open(&path).expect("create stock file");
+                stock
+                    .execute_batch(
+                        r#"CREATE TABLE "g data"(
+                            id INTEGER PRIMARY KEY, raw INTEGER,
+                            twice INTEGER AS (raw * 2) VIRTUAL, "select" TEXT,
+                            plus INTEGER AS (raw + 1) STORED, "a""b" INTEGER
+                        );
+                        INSERT INTO "g data"(id, raw, "select", "a""b")
+                        VALUES (1, 7, 'keep''quoted', 29);"#,
+                    )
+                    .expect("populate generated columns");
+            }
+            let args = vec![
+                OsString::from("fsqlite"),
+                path.into_os_string(),
+                ".dump".into(),
+            ];
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let status = run(args, &mut Cursor::new(Vec::new()), &mut out, &mut err).await;
+            assert_eq!(status, 0, "{}", String::from_utf8_lossy(&err));
+            let dump = String::from_utf8(out).expect("dump SQL");
+            assert!(
+                dump.contains(r#"INSERT INTO "g data" ("id", "raw", "select", "a""b") VALUES"#),
+                "{dump}"
+            );
+            let restored = rusqlite::Connection::open_in_memory().expect("restore destination");
+            restored.execute_batch(&dump).expect("stock restores dump");
+            let row: (i64, i64, i64, String, i64, i64) = restored
+                .query_row(
+                    r#"SELECT id, raw, twice, "select", plus, "a""b" FROM "g data""#,
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
+                )
+                .expect("restored row");
+            assert_eq!(
+                row,
+                (
+                    1_i64,
+                    7_i64,
+                    14_i64,
+                    "keep'quoted".to_owned(),
+                    8_i64,
+                    29_i64
+                )
             );
         });
     }

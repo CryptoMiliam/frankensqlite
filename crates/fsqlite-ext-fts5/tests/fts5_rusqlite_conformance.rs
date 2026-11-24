@@ -2565,6 +2565,102 @@ fn unicode61_keep_diacritic_queries_match_rusqlite_reference() {
 }
 
 #[test]
+fn unicode61_combining_marks_match_rusqlite_reference() {
+    let docs = [
+        Doc {
+            rowid: 1,
+            title: "",
+            body: "re\u{301}sume\u{301} file",
+        },
+        Doc {
+            rowid: 2,
+            title: "",
+            body: "résumé file",
+        },
+        Doc {
+            rowid: 3,
+            title: "",
+            body: "\u{301}resume file",
+        },
+        Doc {
+            rowid: 4,
+            title: "",
+            body: "re sume file",
+        },
+    ];
+    for mode in [0, 1, 2] {
+        let spec = format!("tokenize='unicode61 remove_diacritics {mode}'");
+        let harness = Fts5ConformanceHarness::with_docs(&[&spec], &docs);
+        for query in [
+            "resume",
+            "résumé",
+            "re\u{301}sume\u{301}",
+            r#""resume file""#,
+            "sume",
+        ] {
+            assert_eq!(
+                harness.franken_match_rowids(query),
+                harness.sqlite_match_rowids(query),
+                "{spec} MATCH {query}"
+            );
+        }
+    }
+}
+
+#[test]
+fn unicode61_category_selection_and_folding_match_stock() {
+    let docs = [
+        Doc {
+            rowid: 1,
+            title: "A.99",
+            body: "alpha_beta Καφές Việt Łódź ",
+        },
+        Doc {
+            rowid: 2,
+            title: "B_42",
+            body: "alpha beta καφέσ Viet Lodz",
+        },
+        Doc {
+            rowid: 3,
+            title: "C99",
+            body: "東京 पुस्तक A🧑B",
+        },
+    ];
+    for spec in [
+        "unicode61",
+        "unicode61 remove_diacritics 0",
+        "unicode61 remove_diacritics 2",
+        "unicode61 categories 'L* N* Co Pc'",
+        "unicode61 categories 'Nd'",
+        "unicode61 categories 'L* M*'",
+        "porter unicode61 categories 'L* N* Pc'",
+    ] {
+        let option = format!(r#"tokenize="{spec}""#);
+        let harness = Fts5ConformanceHarness::with_docs(&[&option], &docs);
+        for query in [
+            "alpha_beta",
+            "alpha",
+            "99",
+            "Καφές",
+            "καφέσ",
+            "Việt",
+            "viet",
+            "Łódź",
+            "Lodz",
+            "पुस्तक",
+            "東京",
+            "A🧑B",
+        ] {
+            assert_eq!(
+                harness.franken_match_rowids(query),
+                harness.sqlite_match_rowids(query),
+                "{spec} MATCH {query}"
+            );
+        }
+    }
+}
+
+#[test]
 fn default_unicode61_separator_queries_match_rusqlite_reference() {
     let harness = Fts5ConformanceHarness::with_docs(&[], UNICODE61_DEFAULT_SEPARATOR_DOCS);
 
@@ -2623,6 +2719,35 @@ fn ascii_tokenizer_queries_match_rusqlite_reference() {
             case.name,
             case.query
         );
+    }
+}
+
+#[test]
+fn ascii_tokenizer_overrides_match_rusqlite_reference() {
+    let docs = [
+        Doc {
+            rowid: 1,
+            title: "",
+            body: "Co-op_XxÉé",
+        },
+        Doc {
+            rowid: 2,
+            title: "",
+            body: "co op x é",
+        },
+    ];
+    for tokenizer in ["ascii", "porter ascii"] {
+        let spec = format!(
+            r#"tokenize="{tokenizer} tokenchars '-_' separators 'xé' separators '_' tokenchars ''""#
+        );
+        let harness = Fts5ConformanceHarness::with_docs(&[&spec], &docs);
+        for query in [r#""co-op""#, "co", "op", "Éé", r#""co op""#] {
+            assert_eq!(
+                harness.franken_match_rowids(query),
+                harness.sqlite_match_rowids(query),
+                "{tokenizer} MATCH {query}"
+            );
+        }
     }
 }
 
@@ -3490,6 +3615,183 @@ fn invalid_match_syntax_errors_like_rusqlite_reference() {
             case.name,
             case.query
         );
+    }
+}
+
+#[test]
+fn multi_token_query_literals_match_rusqlite_reference() {
+    let texts = [
+        ("alpha beta gamma", ""),
+        ("beta alpha gamma", ""),
+        ("alpha gap beta gamma", ""),
+        ("alpha betamax gamma", ""),
+        ("alphabet beta gamma", ""),
+        ("alpha", "beta gamma"),
+        ("head alpha betamax gamma", ""),
+        ("head alpha gap betamax gamma", ""),
+    ];
+    let docs: Vec<_> = texts
+        .into_iter()
+        .enumerate()
+        .map(|(i, (title, body))| Doc {
+            rowid: i64::try_from(i + 1).unwrap(),
+            title,
+            body,
+        })
+        .collect();
+    for options in [
+        &[][..],
+        &["tokenize='ascii'"][..],
+        &["tokenize='porter'"][..],
+        &["tokenize='unicode61 tokenchars _'"][..],
+    ] {
+        let harness = Fts5ConformanceHarness::with_docs(options, &docs);
+        let rows = harness
+            .franken
+            .encode_shadow_rows()
+            .expect("encode FTS5 segments");
+        let mut args = vec!["fts5", "main", "docs", "title", "body"];
+        args.extend_from_slice(options);
+        let reopened = Fts5Table::open_shadow_rows(&Cx::new(), &args, &rows)
+            .expect("reopen persisted FTS5 segments");
+        for query in [
+            "alpha_beta",
+            "alpha_beta*",
+            "alpha*beta",
+            "alpha * beta",
+            r#""alpha"*beta"#,
+            r#""alpha_beta"*"#,
+            r#""alpha beta" *"#,
+            "head + alpha_beta*",
+            "^alpha_beta*",
+            "NEAR(alpha_beta* gamma, 0)",
+            r#"NEAR("alpha beta"* gamma, 0)"#,
+            "title:alpha_beta*",
+            "alpha beta",
+            "alpha_beta OR alphabet",
+        ] {
+            let expected = harness.sqlite_match_rowids(query);
+            assert_eq!(
+                harness.franken_match_rowids(query),
+                expected,
+                "{options:?} {query}"
+            );
+            let mut persisted: Vec<_> = reopened
+                .table
+                .search(query)
+                .expect("search persisted FTS5 index")
+                .into_iter()
+                .map(|(rowid, _)| rowid)
+                .collect();
+            persisted.sort_unstable();
+            assert_eq!(persisted, expected, "{options:?} persisted {query}");
+        }
+    }
+}
+
+#[test]
+fn zero_token_query_literals_match_rusqlite_reference() {
+    let docs = [
+        Doc {
+            rowid: 1,
+            title: "ABC DEF",
+            body: "",
+        },
+        Doc {
+            rowid: 2,
+            title: "ABC GHI DEF",
+            body: "",
+        },
+        Doc {
+            rowid: 3,
+            title: "abc",
+            body: "",
+        },
+        Doc {
+            rowid: 4,
+            title: "___",
+            body: "",
+        },
+        Doc {
+            rowid: 5,
+            title: "ABC def",
+            body: "",
+        },
+        Doc {
+            rowid: 6,
+            title: "\u{0300}",
+            body: "",
+        },
+        Doc {
+            rowid: 7,
+            title: "\u{0301}",
+            body: "",
+        },
+        Doc {
+            rowid: 8,
+            title: "\u{0305}",
+            body: "",
+        },
+    ];
+    for options in [
+        &["tokenize='unicode61 categories Lu'"][..],
+        &["tokenize='unicode61 categories Lu'", "detail=none"][..],
+        &["tokenize='unicode61 categories Mn remove_diacritics 1'"][..],
+        &["tokenize='unicode61 categories Mn remove_diacritics 2'"][..],
+        &[
+            "tokenize='unicode61 categories Mn remove_diacritics 2'",
+            "detail=none",
+        ][..],
+    ] {
+        let harness = Fts5ConformanceHarness::with_docs(options, &docs);
+        let rows = harness
+            .franken
+            .encode_shadow_rows()
+            .expect("encode FTS5 segments");
+        let mut args = vec!["fts5", "main", "docs", "title", "body"];
+        args.extend_from_slice(options);
+        let reopened = Fts5Table::open_shadow_rows(&Cx::new(), &args, &rows)
+            .expect("reopen persisted FTS5 segments");
+        for query in [
+            "abc",
+            "abc*",
+            "ABC",
+            r#""abc""#,
+            r#""ABC""#,
+            r#""ABC abc""#,
+            r#""abc DEF""#,
+            "ABC + abc",
+            "ABC + abc*",
+            "abc + DEF*",
+            "NEAR(ABC abc, 0)",
+            "NEAR(abc DEF, 0)",
+            "NEAR(abc def, 0)",
+            "___",
+            "___*",
+            "ABC + ___*",
+            r#""""#,
+            r#"""*"#,
+            "NEAR(ABC ___, 0)",
+            "\u{0300}",
+            "\u{0300}*",
+            "NEAR(abc \u{0300}, 0)",
+        ] {
+            let expected = harness.sqlite_match_rowids(query);
+            assert_eq!(
+                harness.franken_match_rowids(query),
+                expected,
+                "{options:?} {query}"
+            );
+            let mut persisted: Vec<_> = reopened
+                .table
+                .search(query)
+                .expect("search persisted FTS5 index")
+                .into_iter()
+                .map(|(rowid, _)| rowid)
+                .collect();
+            persisted.sort_unstable();
+            assert_eq!(persisted, expected, "{options:?} persisted {query}");
+        }
     }
 }
 

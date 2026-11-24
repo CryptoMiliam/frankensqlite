@@ -27,6 +27,7 @@ pub mod frame;
 pub mod jit;
 #[cfg(test)]
 mod make_record_simd;
+mod parallel_aggregate;
 #[cfg(test)]
 mod repro_delete_skip;
 pub mod vectorized;
@@ -357,13 +358,14 @@ pub(crate) fn opcode_register_spans(op: &VdbeOp) -> OpcodeRegisterSpans {
             (read_start, read_len, -1, 0)
         }
         Opcode::SorterCompare => {
-            let (read_start, read_len) = register_range(op.p3, 1);
-            let (write_start, write_len) = if (op.p5 & SORTER_COMPARE_TOP_N_PREFLIGHT) != 0 {
-                (read_start, read_len)
-            } else {
-                (-1, 0)
+            // A top-N preflight reads its P4 key registers from P3; the
+            // ordinary form reads the record in P3. Neither writes.
+            let key_registers = match op.p4 {
+                P4::Int(count) if (op.p5 & SORTER_COMPARE_TOP_N_PREFLIGHT) != 0 => count,
+                _ => 1,
             };
-            (read_start, read_len, write_start, write_len)
+            let (read_start, read_len) = register_range(op.p3, key_registers);
+            (read_start, read_len, -1, 0)
         }
         Opcode::SorterOpen if (op.p5 & SORTER_OPEN_TOP_N_REGISTER) != 0 => {
             let (read_start, read_len) = register_range(op.p3, 1);
@@ -586,12 +588,18 @@ pub struct ProgramBuilder {
     /// bd-5bq6u: true when this statement is `OR FAIL`, whose semantics keep the
     /// rows already written when a later row violates a constraint.
     preserves_rows_on_constraint: bool,
+    /// bd-hja9y: true when `PRAGMA ignore_check_constraints = ON` is active for
+    /// this compilation, suppressing CHECK constraint bytecode emission.
+    ignore_check_constraints: bool,
     /// bd-01uq7: MemDatabase-backed (TEMP) table roots whose written rows carry
     /// computed VIRTUAL generated values instead of leaving those columns out.
     materialized_virtual_generated_roots: Vec<i32>,
     /// bd-w4pr1.13.31: literals loaded once, in the prologue `Init` jumps to,
     /// with the register each one lives in (see [`Self::hoisted_literal`]).
     hoisted_literals: Vec<(HoistedLiteral, i32)>,
+    /// bd-w4pr1.13.11: the aggregate loop the engine may run on several
+    /// threads instead (see [`Self::set_parallel_aggregate`]).
+    parallel_aggregate: Option<parallel_aggregate::ParallelAggregatePlan>,
 }
 
 /// A literal a program loads once, before its first instruction after
@@ -617,9 +625,21 @@ impl ProgramBuilder {
             schema_evaluation_context: None,
             generated_column_emission: None,
             preserves_rows_on_constraint: false,
+            ignore_check_constraints: false,
             materialized_virtual_generated_roots: Vec::new(),
             hoisted_literals: Vec::new(),
+            parallel_aggregate: None,
         }
+    }
+
+    /// bd-w4pr1.13.11: record that the aggregate loop starting at `plan`'s
+    /// `OpenRead` may instead run on several threads and continue at its
+    /// `ResultRow`. The program's instructions do not change.
+    pub(crate) fn set_parallel_aggregate(
+        &mut self,
+        plan: parallel_aggregate::ParallelAggregatePlan,
+    ) {
+        self.parallel_aggregate = Some(plan);
     }
 
     /// A register holding `literal` for the whole run of the program, loaded
@@ -672,6 +692,18 @@ impl ProgramBuilder {
             .checked_add(count)
             .expect("auxiliary cursor identifier overflow");
         base
+    }
+
+    /// Configure whether CHECK constraint bytecode emission is suppressed
+    /// (`PRAGMA ignore_check_constraints = ON`, bd-hja9y).
+    pub fn set_ignore_check_constraints(&mut self, ignore: bool) {
+        self.ignore_check_constraints = ignore;
+    }
+
+    /// Whether CHECK constraint bytecode emission is suppressed for this program.
+    #[must_use]
+    pub const fn ignore_check_constraints(&self) -> bool {
+        self.ignore_check_constraints
     }
 
     /// Emit a complete schema-owned expression under `context`.
@@ -1017,6 +1049,7 @@ impl ProgramBuilder {
             } else {
                 ConstraintFailureRows::Discard
             },
+            parallel_aggregate: self.parallel_aggregate.map(Arc::new),
         };
         program.verify_control_flow_targets()?;
         Ok(program)
@@ -1248,6 +1281,7 @@ fn compute_attached_memdb_requirement_reason(ops: &[VdbeOp]) -> Option<&'static 
             | Opcode::IdxGE
             | Opcode::SetSnapshot
             | Opcode::CountIndexEqRun
+            | Opcode::IdxCountBefore
             | Opcode::FusedAppendInsert
             | Opcode::IdxBulkLoad
                 if !storage_cursor_ids.contains(&op.p1) && !sorter_cursor_ids.contains(&op.p1) =>
@@ -1343,6 +1377,9 @@ pub struct VdbeProgram {
     /// bd-5bq6u: `OR FAIL` keeps rows already written when a later row
     /// violates a constraint; ABORT discards them.
     constraint_failure_rows: ConstraintFailureRows,
+    /// bd-w4pr1.13.11: an aggregate loop the engine may run on several
+    /// threads instead, continuing at its `ResultRow`.
+    parallel_aggregate: Option<Arc<parallel_aggregate::ParallelAggregatePlan>>,
 }
 
 impl VdbeProgram {
@@ -1584,6 +1621,12 @@ impl VdbeProgram {
         self.requires_version_store
     }
 
+    /// bd-w4pr1.13.11: the aggregate loop the engine may run on several
+    /// threads instead, if codegen proved one.
+    pub(crate) fn parallel_aggregate(&self) -> Option<&parallel_aggregate::ParallelAggregatePlan> {
+        self.parallel_aggregate.as_deref()
+    }
+
     /// Disassemble the program to a human-readable string.
     ///
     /// Output format matches SQLite's `EXPLAIN` output:
@@ -1796,16 +1839,34 @@ pub mod pragma {
         /// its full-table scan in reverse. Consumed by codegen via
         /// `CodegenContext::reverse_unordered_selects` (GH #236 / bd-3gk2x).
         pub reverse_unordered_selects: bool,
+        /// `PRAGMA ignore_check_constraints` toggle (default OFF). When ON,
+        /// CHECK constraints are not evaluated during DML (`INSERT`, `UPDATE`,
+        /// `UPSERT DO UPDATE`, `REPLACE`) or `PRAGMA integrity_check` /
+        /// `quick_check`, matching stock SQLite's `SQLITE_IgnoreChecks`
+        /// (bd-hja9y).
+        pub ignore_check_constraints: bool,
         /// `PRAGMA locking_mode` (`normal` or `exclusive`; default `normal`).
         /// Set/readback surface only.
         pub locking_mode: String,
         /// `PRAGMA secure_delete` tri-state: 0 = OFF, 1 = ON, 2 = FAST (default 0).
-        /// Set/readback surface only.
+        /// The connection applies this erasure policy to pager transactions.
         pub secure_delete: i64,
-        /// `PRAGMA threads` auxiliary worker-thread limit (default 0). Advisory:
-        /// FrankenSQLite does not spawn SQLite-style sort helper threads, so this
-        /// is a stored limit clamped to the stock maximum (8).
+        /// TEMP has its own erasure policy once its database is opened. An
+        /// unqualified assignment affects it only after that initialization.
+        pub temp_secure_delete: Option<i64>,
+        /// `PRAGMA threads` auxiliary worker-thread limit (default 0, clamped
+        /// to stock `SQLITE_MAX_WORKER_THREADS = 8`). An explicit non-negative
+        /// assignment binds the connection's live auxiliary execution limit
+        /// (`threads = 0` forces serial execution with 0 auxiliary helpers;
+        /// `threads = N` admits up to `N` auxiliary helpers alongside the
+        /// caller thread, subject to tree size and process helper budget).
+        /// (GH #279, bd-dwjnq.7)
         pub threads: i64,
+        /// Monotonic count of explicit non-negative `PRAGMA threads = N`
+        /// assignments applied to this state, allowing `Connection` to
+        /// distinguish an explicit `PRAGMA threads = 0` from an unchanged
+        /// negative query like `PRAGMA threads = -1`.
+        pub threads_set_count: u64,
         /// `PRAGMA cache_spill` page threshold (C SQLite's `szSpill`). Default
         /// `1`. A bare query reports `0` when spilling is disabled, otherwise
         /// `max(cache_pages, cache_spill_pages)` where `cache_pages` is derived
@@ -1850,9 +1911,12 @@ pub mod pragma {
                 checkpoint_fullfsync: false,
                 automatic_index: true,
                 reverse_unordered_selects: false,
+                ignore_check_constraints: false,
                 locking_mode: "normal".to_owned(),
                 secure_delete: 0,
+                temp_secure_delete: None,
                 threads: 0,
+                threads_set_count: 0,
                 cache_spill_pages: 1,
                 cache_spill_enabled: true,
             }
@@ -1981,6 +2045,12 @@ pub mod pragma {
         if name.eq_ignore_ascii_case("reverse_unordered_selects") {
             return apply_bool_toggle(&mut state.reverse_unordered_selects, stmt);
         }
+        if name.eq_ignore_ascii_case("ignore_check_constraints") {
+            return Ok(apply_sqlite_flag_bool(
+                &mut state.ignore_check_constraints,
+                stmt,
+            ));
+        }
         if name.eq_ignore_ascii_case("soft_heap_limit") {
             return Ok(apply_soft_heap_limit(stmt));
         }
@@ -1991,7 +2061,7 @@ pub mod pragma {
             return apply_locking_mode(state, stmt);
         }
         if name.eq_ignore_ascii_case("secure_delete") {
-            return apply_secure_delete(state, stmt);
+            return Ok(apply_secure_delete(state, stmt));
         }
         if name.eq_ignore_ascii_case("threads") {
             return apply_threads(state, stmt);
@@ -2032,6 +2102,51 @@ pub mod pragma {
                 *flag = enabled;
                 Ok(PragmaOutput::Bool(enabled))
             }
+        }
+    }
+
+    /// Stock SQLite `PragTyp_FLAG` boolean toggle (`sqlite3GetBoolean(z, 0)`):
+    /// bare queries return the current 0/1 flag; assignments evaluate `expr`
+    /// with SQLite's permissive flag-pragma rules (leading ASCII digits ->
+    /// `atoi != 0`; `"on"`/`"yes"`/`"true"` -> `true`; anything else -> `false`)
+    /// without raising an error on non-boolean tokens.
+    fn apply_sqlite_flag_bool(flag: &mut bool, stmt: &PragmaStatement) -> PragmaOutput {
+        match &stmt.value {
+            None => PragmaOutput::Bool(*flag),
+            Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                let enabled = parse_sqlite_flag_bool(expr);
+                *flag = enabled;
+                PragmaOutput::Bool(enabled)
+            }
+        }
+    }
+
+    fn parse_sqlite_flag_bool(expr: &Expr) -> bool {
+        fn from_text(s: &str) -> bool {
+            let bytes = s.as_bytes();
+            if let Some(&first) = bytes.first()
+                && first.is_ascii_digit()
+            {
+                let digits_end = bytes
+                    .iter()
+                    .position(|b| !b.is_ascii_digit())
+                    .unwrap_or(bytes.len());
+                return s[..digits_end].parse::<i64>().map_or_else(
+                    |_| bytes[..digits_end].iter().any(|&b| b != b'0'),
+                    |n| n != 0,
+                );
+            }
+            s.eq_ignore_ascii_case("on")
+                || s.eq_ignore_ascii_case("yes")
+                || s.eq_ignore_ascii_case("true")
+        }
+
+        match expr {
+            Expr::Literal(Literal::Integer(n), _) => *n > 0,
+            Expr::Literal(Literal::True, _) => true,
+            Expr::Literal(Literal::String(s), _) => from_text(s),
+            Expr::Column(col, _) => from_text(&col.column),
+            _ => false,
         }
     }
 
@@ -2081,6 +2196,57 @@ pub mod pragma {
         PragmaOutput::Int(HARD_HEAP_LIMIT.load(Ordering::Relaxed))
     }
 
+    /// Current process-global soft heap limit in bytes (`0` = unlimited).
+    #[must_use]
+    pub fn soft_heap_limit() -> i64 {
+        SOFT_HEAP_LIMIT.load(Ordering::Relaxed)
+    }
+
+    /// Current process-global hard heap limit in bytes (`0` = unlimited).
+    #[must_use]
+    pub fn hard_heap_limit() -> i64 {
+        HARD_HEAP_LIMIT.load(Ordering::Relaxed)
+    }
+
+    /// Compute the active temporary-storage spill budget in bytes from
+    /// connection pragmas (`temp.cache_size`, `cache_size`, `page_size`) and
+    /// process-global heap limits (`soft_heap_limit`, `hard_heap_limit`).
+    ///
+    /// Rules (mirroring SQLite's cache-size byte algebra):
+    /// 1. When `temp_cache_size != 0`, it governs the base temporary budget
+    ///    (`N > 0` => `N * page_size` bytes; `N < 0` => `|N| * 1024` bytes).
+    /// 2. Otherwise `cache_size` governs the base budget using the same rule
+    ///    (with `0` clamped to 1 page).
+    /// 3. Positive `soft_heap_limit` and `hard_heap_limit` clamp the budget down
+    ///    so spills begin before heap ceilings are crossed.
+    #[must_use]
+    pub fn effective_temp_budget_bytes(
+        temp_cache_size: i64,
+        cache_size: i64,
+        page_size: u32,
+    ) -> usize {
+        let page_bytes = u64::from(page_size.max(512));
+        let active_setting = if temp_cache_size != 0 {
+            temp_cache_size
+        } else {
+            cache_size
+        };
+        let mut budget_u64 = match active_setting.cmp(&0) {
+            std::cmp::Ordering::Less => active_setting.unsigned_abs().saturating_mul(1024),
+            std::cmp::Ordering::Greater => active_setting.unsigned_abs().saturating_mul(page_bytes),
+            std::cmp::Ordering::Equal => page_bytes,
+        };
+        let soft = soft_heap_limit();
+        if soft > 0 {
+            budget_u64 = budget_u64.min(soft.unsigned_abs());
+        }
+        let hard = hard_heap_limit();
+        if hard > 0 {
+            budget_u64 = budget_u64.min(hard.unsigned_abs());
+        }
+        usize::try_from(budget_u64.max(1)).unwrap_or(usize::MAX)
+    }
+
     /// Test-only: reset the process-global heap limits to `0/0` so unit tests that
     /// exercise the lower-only hard-limit semantics can replay C SQLite's
     /// fresh-process oracle scenarios from a known state (the hard limit cannot be
@@ -2111,47 +2277,68 @@ pub mod pragma {
         }
     }
 
-    /// `PRAGMA secure_delete [= OFF|ON|FAST|0|1|2]`. Tri-state: 0 = OFF, 1 = ON,
+    /// `PRAGMA secure_delete [= OFF|ON|FAST|0|1]`. Tri-state: 0 = OFF, 1 = ON,
     /// 2 = FAST. C SQLite reports the integer on readback and echoes the new value
-    /// on assignment. This is the set/readback surface only; the actual
-    /// zero-on-delete storage semantics are tracked separately. (GH #277)
+    /// on assignment. Only the FAST keyword selects mode 2; other arguments use
+    /// SQLite's boolean PRAGMA conversion. The connection applies the policy to
+    /// the pager and propagates unqualified assignments to attached databases.
     fn apply_secure_delete(
         state: &mut ConnectionPragmaState,
         stmt: &PragmaStatement,
-    ) -> Result<PragmaOutput> {
+    ) -> PragmaOutput {
+        let is_temp = stmt
+            .name
+            .schema
+            .as_deref()
+            .is_some_and(|schema| schema.eq_ignore_ascii_case("temp"));
+        if is_temp {
+            state.temp_secure_delete.get_or_insert(0);
+        }
         match &stmt.value {
-            None => Ok(PragmaOutput::Int(state.secure_delete)),
+            None => PragmaOutput::Int(if is_temp {
+                state.temp_secure_delete.unwrap_or(0)
+            } else {
+                state.secure_delete
+            }),
             Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
-                let value = parse_secure_delete_value(expr)?;
-                state.secure_delete = value;
-                Ok(PragmaOutput::Int(value))
+                let value = parse_secure_delete_value(expr);
+                if is_temp {
+                    state.temp_secure_delete = Some(value);
+                } else {
+                    state.secure_delete = value;
+                    if stmt.name.schema.is_none() && state.temp_secure_delete.is_some() {
+                        state.temp_secure_delete = Some(value);
+                    }
+                }
+                PragmaOutput::Int(value)
             }
         }
     }
 
-    fn parse_secure_delete_value(expr: &Expr) -> Result<i64> {
-        if let Expr::Literal(Literal::Integer(n), _) = expr {
-            return match *n {
-                0..=2 => Ok(*n),
-                _ => Err(FrankenError::OutOfRange {
-                    what: "secure_delete".to_owned(),
-                    value: n.to_string(),
-                }),
-            };
+    fn parse_secure_delete_value(expr: &Expr) -> i64 {
+        let text = match expr {
+            Expr::Literal(Literal::True, _) => return 1,
+            Expr::Literal(Literal::False, _) => return 0,
+            _ => cache_pragma_argument_text(expr),
+        };
+        if text.eq_ignore_ascii_case("fast") {
+            return 2;
         }
-        if let Ok(text) = parse_text_expr(expr)
-            && text.eq_ignore_ascii_case("fast")
-        {
-            return Ok(2);
-        }
-        // OFF/ON/TRUE/FALSE map to 0/1.
-        Ok(i64::from(parse_bool(expr)?))
+        i64::from(
+            text.eq_ignore_ascii_case("on")
+                || text.eq_ignore_ascii_case("yes")
+                || text.eq_ignore_ascii_case("true")
+                || (text.as_bytes().first().is_some_and(u8::is_ascii_digit)
+                    && parse_cache_pragma_int32(expr) != 0),
+        )
     }
 
     /// `PRAGMA threads [= N]`. A bare query reports the current limit; an
     /// assignment with a non-negative N clamps to the stock maximum (8), stores
-    /// it, and echoes the effective value. A negative argument leaves the limit
-    /// unchanged and just reports it, matching C SQLite. (GH #279)
+    /// it, increments `threads_set_count` so `Connection` binds live auxiliary
+    /// execution, and echoes the effective value. A negative argument leaves
+    /// the limit unchanged and just reports it, matching C SQLite.
+    /// (GH #279, bd-dwjnq.7)
     fn apply_threads(
         state: &mut ConnectionPragmaState,
         stmt: &PragmaStatement,
@@ -2164,6 +2351,7 @@ pub mod pragma {
                 let n = parse_integer_expr(expr)?;
                 if n >= 0 {
                     state.threads = n.min(MAX_WORKER_THREADS);
+                    state.threads_set_count = state.threads_set_count.saturating_add(1);
                 }
                 Ok(PragmaOutput::Int(state.threads))
             }
@@ -2472,11 +2660,12 @@ pub mod pragma {
         state: &mut ConnectionPragmaState,
         stmt: &PragmaStatement,
     ) -> Result<PragmaOutput> {
+        const MAX_MMAP_SIZE_I64: i64 = 0x7fff_0000;
         match &stmt.value {
             None => Ok(PragmaOutput::Int(state.mmap_size)),
             Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
                 let val = parse_integer_expr(expr)?;
-                state.mmap_size = val.max(0);
+                state.mmap_size = val.clamp(0, MAX_MMAP_SIZE_I64);
                 Ok(PragmaOutput::Int(state.mmap_size))
             }
         }
@@ -2652,14 +2841,9 @@ pub mod pragma {
         match &stmt.value {
             None => Ok(PragmaOutput::Int(i64::from(state.writable_schema))),
             Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
-                // SQLite accepts `PRAGMA writable_schema = RESET`: it clears the
-                // toggle and reparses the in-memory schema from sqlite_schema.
-                // We honor the toggle-off; there is no separately cached parsed
-                // schema to discard at this layer, so RESET is observably
-                // equivalent to OFF. Without this, RESET errored
-                // "expected ON|OFF|TRUE|FALSE|1|0, got RESET" and aborted the
-                // rest of the script (GH #284).
-                if expr_is_reset(expr) {
+                // The connection reloads its parsed catalog after the toggle
+                // is cleared, using the current transaction's view.
+                if is_writable_schema_reset(stmt) {
                     state.writable_schema = false;
                     return Ok(PragmaOutput::Int(0));
                 }
@@ -2670,10 +2854,13 @@ pub mod pragma {
         }
     }
 
-    /// Whether a `PRAGMA writable_schema = <expr>` value is the `RESET` keyword
-    /// (a bareword identifier or a quoted string), case-insensitive.
-    fn expr_is_reset(expr: &Expr) -> bool {
-        match expr {
+    /// Whether this pragma requests a reparse of the live schema catalog.
+    #[must_use]
+    pub fn is_writable_schema_reset(stmt: &PragmaStatement) -> bool {
+        let Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) = &stmt.value else {
+            return false;
+        };
+        stmt.name.name.eq_ignore_ascii_case("writable_schema") && match expr {
             Expr::Column(col, _) => col.column.eq_ignore_ascii_case("reset"),
             Expr::Literal(Literal::String(s), _) => s.eq_ignore_ascii_case("reset"),
             _ => false,
@@ -2988,6 +3175,617 @@ pub mod pragma {
             Some(false)
         } else {
             None
+        }
+    }
+}
+
+/// Live `PRAGMA temp_store` policy, VFS-backed temporary file abstraction, and
+/// observable resource telemetry (bd-dwjnq.5 / bd-dwjnq.6).
+pub mod temp_store {
+    use std::fmt;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+
+    use fsqlite_error::{FrankenError, Result};
+    use fsqlite_types::cx::Cx;
+
+    /// Canonical `PRAGMA temp_store` integer values.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    #[repr(i64)]
+    pub enum TempStoreMode {
+        /// `0` / `DEFAULT`: resolves to compile-time default (`FILE` on native,
+        /// `MEMORY` on wasm32).
+        #[default]
+        Default = 0,
+        /// `1` / `FILE`: prefer temporary VFS files when exceeding the byte budget.
+        File = 1,
+        /// `2` / `MEMORY`: keep all temporary structures strictly in memory.
+        Memory = 2,
+    }
+
+    impl TempStoreMode {
+        #[must_use]
+        pub const fn from_pragma_i64(value: i64) -> Self {
+            match value {
+                1 => Self::File,
+                2 => Self::Memory,
+                _ => Self::Default,
+            }
+        }
+
+        #[must_use]
+        pub const fn as_pragma_i64(self) -> i64 {
+            self as i64
+        }
+    }
+
+    /// Resolved runtime temporary storage behavior after considering mode and
+    /// platform/backend capability.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum EffectiveTempStore {
+        /// Spill temporary runs, ephemeral B-trees, and TEMP tables to VFS temp files.
+        File,
+        /// Keep all temporary data in memory (never create temp files).
+        Memory,
+    }
+
+    impl EffectiveTempStore {
+        /// Resolve effective mode from `PRAGMA temp_store` and whether the
+        /// active backend/platform permits real temporary files.
+        #[must_use]
+        pub const fn resolve(mode: TempStoreMode, backend_supports_file: bool) -> Self {
+            match mode {
+                TempStoreMode::Memory => Self::Memory,
+                TempStoreMode::File => {
+                    if backend_supports_file {
+                        Self::File
+                    } else {
+                        Self::Memory
+                    }
+                }
+                TempStoreMode::Default => {
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        let _ = backend_supports_file;
+                        Self::Memory
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        if backend_supports_file {
+                            Self::File
+                        } else {
+                            Self::Memory
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Map an OS/VFS I/O error from a temporary spill file into a canonical
+    /// `FrankenError`, preserving `SQLITE_FULL` for disk-full / quota conditions.
+    #[must_use]
+    pub fn map_io_error_for_temp_store(err: std::io::Error) -> FrankenError {
+        if err.kind() == std::io::ErrorKind::StorageFull {
+            return FrankenError::DatabaseFull;
+        }
+        #[cfg(unix)]
+        if matches!(err.raw_os_error(), Some(28 | 122)) {
+            // ENOSPC (28) / EDQUOT (122) on Linux/POSIX.
+            return FrankenError::DatabaseFull;
+        }
+        #[cfg(windows)]
+        if matches!(err.raw_os_error(), Some(39 | 112)) {
+            // ERROR_HANDLE_DISK_FULL (39) / ERROR_DISK_FULL (112).
+            return FrankenError::DatabaseFull;
+        }
+        FrankenError::Io(err)
+    }
+
+    /// An open, connection-private temporary file handle backed by the VFS.
+    ///
+    /// Implementations must enforce delete-on-close semantics so dropping or
+    /// closing the handle leaves zero residual files on disk.
+    pub trait TempFileHandle: Send + Sync {
+        /// Write `data` starting at byte `offset`.
+        fn write_at(&self, cx: &Cx, offset: u64, data: &[u8]) -> Result<()>;
+
+        /// Read up to `buf.len()` bytes starting at byte `offset`, returning
+        /// the number of bytes read (`0` at EOF).
+        fn read_at(&self, cx: &Cx, offset: u64, buf: &mut [u8]) -> Result<usize>;
+
+        /// Current file size in bytes.
+        fn file_size(&self, cx: &Cx) -> Result<u64>;
+
+        /// Truncate the file to `size` bytes.
+        fn truncate(&self, cx: &Cx, size: u64) -> Result<()>;
+
+        /// Close and unlink the temporary file. Idempotent.
+        fn close(&self, cx: &Cx) -> Result<()>;
+    }
+
+    /// Factory for opening VFS-backed temporary files for sorters, ephemeral
+    /// B-trees, and spilled TEMP tables.
+    pub trait TempFileBackend: Send + Sync {
+        /// Create a new private, delete-on-close temporary file.
+        fn create_temp_file(&self, cx: &Cx, purpose: &str) -> Result<Box<dyn TempFileHandle>>;
+
+        /// Whether this backend can create file-backed temporary storage.
+        fn supports_file_storage(&self) -> bool {
+            true
+        }
+    }
+
+    /// Snapshot of live temporary-storage execution metrics for a connection.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct TempStoreStatsSnapshot {
+        pub configured_mode: i64,
+        pub effective_mode_is_file: bool,
+        pub budget_bytes: usize,
+        pub sorter_memory_bytes_peak: u64,
+        pub sorter_spill_runs: u64,
+        pub sorter_spill_bytes: u64,
+        pub temp_table_spill_events: u64,
+        pub temp_table_spill_bytes: u64,
+        pub temp_index_spill_events: u64,
+        pub temp_index_spill_bytes: u64,
+        pub temp_files_opened: u64,
+        pub temp_files_closed: u64,
+        pub active_temp_files: u64,
+        pub memory_only_allocations: u64,
+    }
+
+    /// Atomic live counters shared across a connection's temporary structures.
+    #[derive(Debug)]
+    pub struct TempStoreStats {
+        configured_mode: AtomicI64,
+        effective_mode_is_file: AtomicBool,
+        budget_bytes: AtomicUsize,
+        sorter_memory_bytes_peak: AtomicU64,
+        sorter_spill_runs: AtomicU64,
+        sorter_spill_bytes: AtomicU64,
+        temp_table_spill_events: AtomicU64,
+        temp_table_spill_bytes: AtomicU64,
+        temp_index_spill_events: AtomicU64,
+        temp_index_spill_bytes: AtomicU64,
+        temp_files_opened: AtomicU64,
+        temp_files_closed: AtomicU64,
+        active_temp_files: AtomicU64,
+        memory_only_allocations: AtomicU64,
+    }
+
+    impl Default for TempStoreStats {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl TempStoreStats {
+        #[must_use]
+        pub fn new() -> Self {
+            Self {
+                configured_mode: AtomicI64::new(TempStoreMode::Default.as_pragma_i64()),
+                effective_mode_is_file: AtomicBool::new(!cfg!(target_arch = "wasm32")),
+                budget_bytes: AtomicUsize::new(0),
+                sorter_memory_bytes_peak: AtomicU64::new(0),
+                sorter_spill_runs: AtomicU64::new(0),
+                sorter_spill_bytes: AtomicU64::new(0),
+                temp_table_spill_events: AtomicU64::new(0),
+                temp_table_spill_bytes: AtomicU64::new(0),
+                temp_index_spill_events: AtomicU64::new(0),
+                temp_index_spill_bytes: AtomicU64::new(0),
+                temp_files_opened: AtomicU64::new(0),
+                temp_files_closed: AtomicU64::new(0),
+                active_temp_files: AtomicU64::new(0),
+                memory_only_allocations: AtomicU64::new(0),
+            }
+        }
+
+        pub fn update_policy(
+            &self,
+            mode: TempStoreMode,
+            effective: EffectiveTempStore,
+            budget_bytes: usize,
+        ) {
+            self.configured_mode
+                .store(mode.as_pragma_i64(), Ordering::Relaxed);
+            self.effective_mode_is_file.store(
+                matches!(effective, EffectiveTempStore::File),
+                Ordering::Relaxed,
+            );
+            self.budget_bytes.store(budget_bytes, Ordering::Relaxed);
+        }
+
+        pub fn record_sorter_memory(&self, bytes: u64) {
+            self.sorter_memory_bytes_peak
+                .fetch_max(bytes, Ordering::Relaxed);
+        }
+
+        pub fn record_sorter_spill(&self, bytes: u64) {
+            self.sorter_spill_runs.fetch_add(1, Ordering::Relaxed);
+            self.sorter_spill_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+
+        pub fn record_temp_table_spill(&self, bytes: u64) {
+            self.temp_table_spill_events.fetch_add(1, Ordering::Relaxed);
+            self.temp_table_spill_bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
+
+        pub fn record_temp_index_spill(&self, bytes: u64) {
+            self.temp_index_spill_events.fetch_add(1, Ordering::Relaxed);
+            self.temp_index_spill_bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
+
+        pub fn record_memory_only_allocation(&self) {
+            self.memory_only_allocations.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn record_file_opened(&self) {
+            self.temp_files_opened.fetch_add(1, Ordering::Relaxed);
+            self.active_temp_files.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn record_file_closed(&self) {
+            self.temp_files_closed.fetch_add(1, Ordering::Relaxed);
+            let _ = self
+                .active_temp_files
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                    Some(cur.saturating_sub(1))
+                });
+        }
+
+        #[must_use]
+        pub fn snapshot(&self) -> TempStoreStatsSnapshot {
+            TempStoreStatsSnapshot {
+                configured_mode: self.configured_mode.load(Ordering::Relaxed),
+                effective_mode_is_file: self.effective_mode_is_file.load(Ordering::Relaxed),
+                budget_bytes: self.budget_bytes.load(Ordering::Relaxed),
+                sorter_memory_bytes_peak: self.sorter_memory_bytes_peak.load(Ordering::Relaxed),
+                sorter_spill_runs: self.sorter_spill_runs.load(Ordering::Relaxed),
+                sorter_spill_bytes: self.sorter_spill_bytes.load(Ordering::Relaxed),
+                temp_table_spill_events: self.temp_table_spill_events.load(Ordering::Relaxed),
+                temp_table_spill_bytes: self.temp_table_spill_bytes.load(Ordering::Relaxed),
+                temp_index_spill_events: self.temp_index_spill_events.load(Ordering::Relaxed),
+                temp_index_spill_bytes: self.temp_index_spill_bytes.load(Ordering::Relaxed),
+                temp_files_opened: self.temp_files_opened.load(Ordering::Relaxed),
+                temp_files_closed: self.temp_files_closed.load(Ordering::Relaxed),
+                active_temp_files: self.active_temp_files.load(Ordering::Relaxed),
+                memory_only_allocations: self.memory_only_allocations.load(Ordering::Relaxed),
+            }
+        }
+    }
+
+    /// RAII wrapper around a [`TempFileHandle`] that enforces cancellation
+    /// checks and guarantees exactly-once close/unlink accounting.
+    pub struct TrackedTempFile {
+        inner: Box<dyn TempFileHandle>,
+        stats: Arc<TempStoreStats>,
+        closed: AtomicBool,
+    }
+
+    impl fmt::Debug for TrackedTempFile {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("TrackedTempFile")
+                .field("closed", &self.closed.load(Ordering::Relaxed))
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl TrackedTempFile {
+        fn new(inner: Box<dyn TempFileHandle>, stats: Arc<TempStoreStats>) -> Self {
+            stats.record_file_opened();
+            Self {
+                inner,
+                stats,
+                closed: AtomicBool::new(false),
+            }
+        }
+
+        pub fn write_at(&self, cx: &Cx, offset: u64, data: &[u8]) -> Result<()> {
+            if cx.is_cancel_requested() {
+                return Err(FrankenError::Abort);
+            }
+            self.inner.write_at(cx, offset, data)
+        }
+
+        pub fn read_at(&self, cx: &Cx, offset: u64, buf: &mut [u8]) -> Result<usize> {
+            if cx.is_cancel_requested() {
+                return Err(FrankenError::Abort);
+            }
+            self.inner.read_at(cx, offset, buf)
+        }
+
+        pub fn read_exact_at(&self, cx: &Cx, mut offset: u64, mut buf: &mut [u8]) -> Result<()> {
+            while !buf.is_empty() {
+                let n = self.read_at(cx, offset, buf)?;
+                if n == 0 {
+                    return Err(FrankenError::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "unexpected EOF reading temporary spill file",
+                    )));
+                }
+                offset = offset.saturating_add(n as u64);
+                buf = &mut buf[n..];
+            }
+            Ok(())
+        }
+
+        pub fn file_size(&self, cx: &Cx) -> Result<u64> {
+            if cx.is_cancel_requested() {
+                return Err(FrankenError::Abort);
+            }
+            self.inner.file_size(cx)
+        }
+
+        pub fn truncate(&self, cx: &Cx, size: u64) -> Result<()> {
+            if cx.is_cancel_requested() {
+                return Err(FrankenError::Abort);
+            }
+            self.inner.truncate(cx, size)
+        }
+
+        pub fn close_with_cx(&self, cx: &Cx) -> Result<()> {
+            if !self.closed.swap(true, Ordering::AcqRel) {
+                let res = self.inner.close(cx);
+                self.stats.record_file_closed();
+                return res;
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for TrackedTempFile {
+        fn drop(&mut self) {
+            if !self.closed.swap(true, Ordering::AcqRel) {
+                // Drop may follow statement cancellation. The spill file still needs
+                // its one close/unlink attempt before we retire its accounting.
+                let cx = Cx::detached_rebind();
+                #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+                if let Some(native_task_cx) = asupersync::Cx::current() {
+                    cx.set_native_cx(native_task_cx);
+                }
+                let _mask = cx.masked();
+                let _ = self.inner.close(&cx);
+                self.stats.record_file_closed();
+            }
+        }
+    }
+
+    /// Live runtime policy passed from `Connection` into `VdbeEngine`,
+    /// `SorterCursor`, `TempSpillPageStore`, and `TEMP`/ephemeral `MemTable`s.
+    #[derive(Clone)]
+    pub struct TempStoreRuntime {
+        mode: TempStoreMode,
+        effective_mode: EffectiveTempStore,
+        budget_bytes: usize,
+        hard_heap_limit_bytes: Option<usize>,
+        backend: Option<Arc<dyn TempFileBackend>>,
+        stats: Arc<TempStoreStats>,
+    }
+
+    impl fmt::Debug for TempStoreRuntime {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("TempStoreRuntime")
+                .field("mode", &self.mode)
+                .field("effective_mode", &self.effective_mode)
+                .field("budget_bytes", &self.budget_bytes)
+                .field("hard_heap_limit_bytes", &self.hard_heap_limit_bytes)
+                .field("has_backend", &self.backend.is_some())
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl Default for TempStoreRuntime {
+        fn default() -> Self {
+            #[cfg(not(target_arch = "wasm32"))]
+            let backend: Option<Arc<dyn TempFileBackend>> = Some(Arc::new(OsTempFileBackend));
+            #[cfg(target_arch = "wasm32")]
+            let backend: Option<Arc<dyn TempFileBackend>> = None;
+            Self::new(
+                TempStoreMode::Default,
+                100 * 1024 * 1024,
+                None,
+                backend,
+                Arc::new(TempStoreStats::new()),
+            )
+        }
+    }
+
+    impl TempStoreRuntime {
+        #[must_use]
+        pub fn new(
+            mode: TempStoreMode,
+            budget_bytes: usize,
+            hard_heap_limit_bytes: Option<usize>,
+            backend: Option<Arc<dyn TempFileBackend>>,
+            stats: Arc<TempStoreStats>,
+        ) -> Self {
+            let backend_supports_file = backend
+                .as_ref()
+                .is_some_and(|b| b.supports_file_storage());
+            let effective_mode = EffectiveTempStore::resolve(mode, backend_supports_file);
+            let effective_budget = budget_bytes.max(1);
+            stats.update_policy(mode, effective_mode, effective_budget);
+            Self {
+                mode,
+                effective_mode,
+                budget_bytes: effective_budget,
+                hard_heap_limit_bytes,
+                backend,
+                stats,
+            }
+        }
+
+        #[must_use]
+        pub const fn mode(&self) -> TempStoreMode {
+            self.mode
+        }
+
+        #[must_use]
+        pub const fn effective_mode(&self) -> EffectiveTempStore {
+            self.effective_mode
+        }
+
+        #[must_use]
+        pub const fn is_file_backed(&self) -> bool {
+            matches!(self.effective_mode, EffectiveTempStore::File)
+        }
+
+        #[must_use]
+        pub const fn budget_bytes(&self) -> usize {
+            self.budget_bytes
+        }
+
+        #[must_use]
+        pub const fn hard_heap_limit_bytes(&self) -> Option<usize> {
+            self.hard_heap_limit_bytes
+        }
+
+        #[must_use]
+        pub fn stats(&self) -> &Arc<TempStoreStats> {
+            &self.stats
+        }
+
+        /// Enforce `hard_heap_limit` when operating in memory-only mode.
+        pub fn check_memory_limit(&self, current_bytes: usize) -> Result<()> {
+            if let Some(limit) = self.hard_heap_limit_bytes
+                && limit > 0
+                && current_bytes > limit
+            {
+                return Err(FrankenError::OutOfMemory);
+            }
+            Ok(())
+        }
+
+        /// Open a tracked VFS-backed temporary file under this runtime.
+        pub fn create_temp_file(&self, cx: &Cx, purpose: &str) -> Result<Arc<TrackedTempFile>> {
+            if cx.is_cancel_requested() {
+                return Err(FrankenError::Abort);
+            }
+            let Some(backend) = self.backend.as_ref() else {
+                return Err(FrankenError::internal(
+                    "temporary file spill requested without an active TempFileBackend",
+                ));
+            };
+            let handle = backend.create_temp_file(cx, purpose)?;
+            Ok(Arc::new(TrackedTempFile::new(
+                handle,
+                Arc::clone(&self.stats),
+            )))
+        }
+    }
+
+    /// Fallback OS temporary-file backend used by standalone `fsqlite-vdbe`
+    /// unit tests that do not construct a `Connection`-owned `VfsTempFileBackend`.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[derive(Debug, Default)]
+    pub struct OsTempFileBackend;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    struct OsTempFileHandle {
+        file: std::sync::Mutex<Option<tempfile::NamedTempFile>>,
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    impl TempFileHandle for OsTempFileHandle {
+        fn write_at(&self, cx: &Cx, offset: u64, data: &[u8]) -> Result<()> {
+            use std::io::{Seek, SeekFrom, Write};
+            if cx.is_cancel_requested() {
+                return Err(FrankenError::Abort);
+            }
+            let mut guard = self
+                .file
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(tmp) = guard.as_mut() else {
+                return Err(FrankenError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "temporary spill file already closed",
+                )));
+            };
+            let file = tmp.as_file_mut();
+            file.seek(SeekFrom::Start(offset))
+                .map_err(map_io_error_for_temp_store)?;
+            file.write_all(data).map_err(map_io_error_for_temp_store)?;
+            Ok(())
+        }
+
+        fn read_at(&self, cx: &Cx, offset: u64, buf: &mut [u8]) -> Result<usize> {
+            use std::io::{Read, Seek, SeekFrom};
+            if cx.is_cancel_requested() {
+                return Err(FrankenError::Abort);
+            }
+            let mut guard = self
+                .file
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(tmp) = guard.as_mut() else {
+                return Err(FrankenError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "temporary spill file already closed",
+                )));
+            };
+            let file = tmp.as_file_mut();
+            file.seek(SeekFrom::Start(offset))
+                .map_err(map_io_error_for_temp_store)?;
+            file.read(buf).map_err(map_io_error_for_temp_store)
+        }
+
+        fn file_size(&self, cx: &Cx) -> Result<u64> {
+            if cx.is_cancel_requested() {
+                return Err(FrankenError::Abort);
+            }
+            let guard = self
+                .file
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(tmp) = guard.as_ref() else {
+                return Ok(0);
+            };
+            tmp.as_file()
+                .metadata()
+                .map(|m| m.len())
+                .map_err(map_io_error_for_temp_store)
+        }
+
+        fn truncate(&self, cx: &Cx, size: u64) -> Result<()> {
+            if cx.is_cancel_requested() {
+                return Err(FrankenError::Abort);
+            }
+            let mut guard = self
+                .file
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(tmp) = guard.as_mut() else {
+                return Ok(());
+            };
+            tmp.as_file_mut()
+                .set_len(size)
+                .map_err(map_io_error_for_temp_store)
+        }
+
+        fn close(&self, _cx: &Cx) -> Result<()> {
+            let mut guard = self
+                .file
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = guard.take();
+            Ok(())
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    impl TempFileBackend for OsTempFileBackend {
+        fn create_temp_file(&self, cx: &Cx, _purpose: &str) -> Result<Box<dyn TempFileHandle>> {
+            if cx.is_cancel_requested() {
+                return Err(FrankenError::Abort);
+            }
+            let tmp = tempfile::NamedTempFile::new().map_err(map_io_error_for_temp_store)?;
+            Ok(Box::new(OsTempFileHandle {
+                file: std::sync::Mutex::new(Some(tmp)),
+            }))
         }
     }
 }
@@ -3450,7 +4248,7 @@ mod tests {
             0,
             2,
             7,
-            P4::None,
+            P4::Int(3),
             fsqlite_types::opcode::SORTER_COMPARE_TOP_N_PREFLIGHT,
         );
         builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
@@ -3458,13 +4256,13 @@ mod tests {
         let program = builder.finish().expect("program should build");
         assert_eq!(
             program.register_count(),
-            8,
-            "runtime SorterOpen.p3 and SorterCompare.p3 must contribute to register sizing"
+            9,
+            "runtime SorterOpen.p3 and every SorterCompare preflight key register must contribute to register sizing"
         );
     }
 
     #[test]
-    fn test_sorter_compare_register_spans_distinguish_preflight_consumption() {
+    fn test_sorter_compare_register_spans_read_the_preflight_key_registers() {
         let ordinary = VdbeOp {
             opcode: Opcode::SorterCompare,
             p1: 0,
@@ -3475,6 +4273,7 @@ mod tests {
         };
         let ordinary_spans = opcode_register_spans(&ordinary);
         let preflight = VdbeOp {
+            p4: P4::Int(3),
             p5: SORTER_COMPARE_TOP_N_PREFLIGHT,
             ..ordinary
         };
@@ -3494,11 +4293,11 @@ mod tests {
             preflight_spans,
             OpcodeRegisterSpans {
                 read_start: 7,
-                read_len: 1,
-                write_start: 7,
-                write_len: 1,
+                read_len: 3,
+                write_start: -1,
+                write_len: 0,
             },
-            "top-N preflight must model P3 as consumed"
+            "a top-N preflight reads its P4 key registers from P3 and writes none"
         );
     }
 
@@ -4245,7 +5044,46 @@ mod tests {
         assert_eq!(apply_sql(&mut state, "PRAGMA secure_delete = ON"), Int(1));
         assert_eq!(apply_sql(&mut state, "PRAGMA secure_delete = FAST"), Int(2));
         assert_eq!(apply_sql(&mut state, "PRAGMA secure_delete = OFF"), Int(0));
-        assert_eq!(apply_sql(&mut state, "PRAGMA secure_delete = 2"), Int(2));
+        assert_eq!(apply_sql(&mut state, "PRAGMA secure_delete = 2"), Int(1));
+        assert_eq!(apply_sql(&mut state, "PRAGMA secure_delete = -1"), Int(0));
+        assert_eq!(apply_sql(&mut state, "PRAGMA secure_delete = yes"), Int(1));
+        assert_eq!(apply_sql(&mut state, "PRAGMA secure_delete = bogus"), Int(0));
+    }
+
+    #[test]
+    fn test_connection_pragma_secure_delete_numeric_spelling() {
+        use pragma::PragmaOutput::Int;
+        let mut state = pragma::ConnectionPragmaState::default();
+        // Stock SQLite uses the integer prefix of the original token. Parsing
+        // and formatting a float first would silently turn requested ON into OFF.
+        for (sql, expected) in [
+            ("PRAGMA secure_delete=1e-300", 1),
+            ("PRAGMA secure_delete=1e309", 1),
+            ("PRAGMA secure_delete=+1e-300", 1),
+            ("PRAGMA secure_delete=-1e-300", 0),
+            ("PRAGMA secure_delete=0x80000000", 0),
+            ("PRAGMA secure_delete(1e-300)", 1),
+        ] {
+            assert_eq!(apply_sql(&mut state, sql), Int(expected), "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_connection_pragma_secure_delete_temp_scope() {
+        use pragma::PragmaOutput::Int;
+        let mut state = pragma::ConnectionPragmaState::default();
+        assert_eq!(apply_sql(&mut state, "PRAGMA secure_delete=FAST"), Int(2));
+        // An unopened TEMP database does not inherit an earlier assignment.
+        assert_eq!(apply_sql(&mut state, "PRAGMA temp.secure_delete"), Int(0));
+        assert_eq!(apply_sql(&mut state, "PRAGMA main.secure_delete"), Int(2));
+        assert_eq!(apply_sql(&mut state, "PRAGMA secure_delete=ON"), Int(1));
+        assert_eq!(apply_sql(&mut state, "PRAGMA temp.secure_delete"), Int(1));
+        assert_eq!(apply_sql(&mut state, "PRAGMA main.secure_delete=OFF"), Int(0));
+        assert_eq!(apply_sql(&mut state, "PRAGMA temp.secure_delete"), Int(1));
+        assert_eq!(apply_sql(&mut state, "PRAGMA temp.secure_delete=FAST"), Int(2));
+        assert_eq!(apply_sql(&mut state, "PRAGMA main.secure_delete"), Int(0));
+        assert_eq!(apply_sql(&mut state, "PRAGMA secure_delete=ON"), Int(1));
+        assert_eq!(apply_sql(&mut state, "PRAGMA temp.secure_delete"), Int(1));
     }
 
     #[test]
@@ -4437,18 +5275,64 @@ mod tests {
     }
 
     #[test]
+    fn test_connection_pragma_ignore_check_constraints_bd_hja9y() {
+        use pragma::PragmaOutput::Bool;
+        let mut state = pragma::ConnectionPragmaState::default();
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA ignore_check_constraints"),
+            Bool(false)
+        );
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA ignore_check_constraints = ON"),
+            Bool(true)
+        );
+        assert!(state.ignore_check_constraints);
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA ignore_check_constraints = 'bogus'"),
+            Bool(false)
+        );
+        assert!(!state.ignore_check_constraints);
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA ignore_check_constraints = YES"),
+            Bool(true)
+        );
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA ignore_check_constraints = NO"),
+            Bool(false)
+        );
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA ignore_check_constraints = 2"),
+            Bool(true)
+        );
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA ignore_check_constraints(0)"),
+            Bool(false)
+        );
+    }
+
+    #[test]
     fn test_connection_pragma_threads_readback() {
-        // GH #279: threads reports the stored limit; a set clamps to 8; a
-        // negative argument leaves the limit unchanged.
+        // GH #279 & bd-dwjnq.7: threads reports the stored limit; non-negative
+        // sets clamp to 8 and bump `threads_set_count` so Connection binds live
+        // auxiliary workers; negative arguments and bare queries leave both
+        // `threads` and `threads_set_count` unchanged.
         use pragma::PragmaOutput::Int;
         let mut state = pragma::ConnectionPragmaState::default();
+        assert_eq!(state.threads_set_count, 0);
         assert_eq!(apply_sql(&mut state, "PRAGMA threads"), Int(0));
+        assert_eq!(state.threads_set_count, 0);
+        assert_eq!(apply_sql(&mut state, "PRAGMA threads = 0"), Int(0));
+        assert_eq!(state.threads_set_count, 1);
         assert_eq!(apply_sql(&mut state, "PRAGMA threads = 4"), Int(4));
+        assert_eq!(state.threads_set_count, 2);
         assert_eq!(apply_sql(&mut state, "PRAGMA threads"), Int(4));
+        assert_eq!(state.threads_set_count, 2);
         // Clamps to the stock maximum of 8.
         assert_eq!(apply_sql(&mut state, "PRAGMA threads = 100"), Int(8));
-        // A negative argument leaves the current limit unchanged.
+        assert_eq!(state.threads_set_count, 3);
+        // A negative argument leaves the current limit and set count unchanged.
         assert_eq!(apply_sql(&mut state, "PRAGMA threads = -1"), Int(8));
+        assert_eq!(state.threads_set_count, 3);
     }
 
     #[test]

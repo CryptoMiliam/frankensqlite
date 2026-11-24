@@ -455,6 +455,11 @@ impl<F: VfsFile> VfsFile for TracingFile<F> {
         )
     }
 
+    fn external_wal_append_blocked_by_local_transaction(&self) -> bool {
+        self.inner
+            .external_wal_append_blocked_by_local_transaction()
+    }
+
     fn restore_external_wal_append_attempt(&mut self, cx: &Cx) -> Result<()> {
         GLOBAL_VFS_METRICS
             .unlock_ops
@@ -557,6 +562,14 @@ impl<F: VfsFile> VfsFile for TracingFile<F> {
         self.inner.wal_reader_slot_release(cx, slot)
     }
 
+    fn wal_private_reader_claim_acquire(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.wal_private_reader_claim_acquire(cx)
+    }
+
+    fn wal_private_reader_claim_release(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.wal_private_reader_claim_release(cx)
+    }
+
     fn wal_checkpoint_backfill_gate_acquire(&mut self, cx: &Cx) -> Result<bool> {
         self.inner.wal_checkpoint_backfill_gate_acquire(cx)
     }
@@ -579,6 +592,22 @@ impl<F: VfsFile> VfsFile for TracingFile<F> {
 
     fn set_busy_timeout_ms(&mut self, ms: u64) {
         self.inner.set_busy_timeout_ms(ms);
+    }
+
+    fn set_mmap_size(&self, cx: &Cx, limit_bytes: u64) -> Result<crate::traits::VfsMmapStatus> {
+        self.inner.set_mmap_size(cx, limit_bytes)
+    }
+
+    fn mmap_status(&self) -> crate::traits::VfsMmapStatus {
+        self.inner.mmap_status()
+    }
+
+    fn read_only_mmap_view(&self) -> Option<crate::traits::ReadOnlyMmapView> {
+        self.inner.read_only_mmap_view()
+    }
+
+    fn inject_mmap_failure(&self, remaining_failures: u64) -> Result<()> {
+        self.inner.inject_mmap_failure(remaining_failures)
     }
 }
 

@@ -39,7 +39,10 @@ use fsqlite_types::serial_type::{
 };
 use fsqlite_types::sync_primitives::Instant;
 use fsqlite_types::value::binary_text_cmp;
-use fsqlite_types::{PageData, PageNumber, SqliteValue, TextEncoding, WitnessKey};
+use fsqlite_types::{
+    PageData, PageNumber, PtrMapEntry, PtrMapType, SecureDeleteMode, SqliteValue, TextEncoding,
+    WitnessKey, is_ptrmap_page, ptrmap_entry_offset, ptrmap_lock_byte_page, ptrmap_page_for,
+};
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -322,6 +325,35 @@ pub trait PageReader {
         async move { self.read_page_data(cx, page_no).await }
     }
 
+    /// [`Self::read_btree_page_data`]'s answer when the reader has it
+    /// without a storage read: a transaction-backed reader answers from the
+    /// transaction's own staged writes and the images it already read
+    /// (bd-w4pr1.13.18). `None` leaves the page to `read_btree_page_data`.
+    /// An implementation returns only what `read_btree_page_data` would return
+    /// at this point, errors included, with the same effects.
+    ///
+    /// The default answers `None` for every page.
+    fn read_resident_btree_page_data(
+        &self,
+        _cx: &Cx,
+        _page_no: PageNumber,
+    ) -> Option<Result<PageData>> {
+        None
+    }
+
+    /// [`Self::read_btree_page_data`] for a caller that
+    /// [`Self::read_resident_btree_page_data`] has just answered `None` for
+    /// the same page, with nothing run on this reader in between: an
+    /// implementation may skip the checks that answer already made. The
+    /// default is `read_btree_page_data` itself.
+    fn read_nonresident_btree_page_data<'a>(
+        &'a self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = Result<PageData>> + 'a {
+        self.read_btree_page_data(cx, page_no)
+    }
+
     /// Hint that a page is likely to be needed soon.
     ///
     /// Default implementation is a no-op so platforms without a safe prefetch
@@ -335,10 +367,24 @@ pub trait PageReader {
     fn is_dirty(&self, _page_no: PageNumber) -> bool {
         false
     }
+
+    /// Whether [`Self::is_dirty`] reports every page the current transaction
+    /// has changed. A table descent reuses the pages already on its cursor's
+    /// stack only when it does (bd-t0g9w): a reader that cannot tell could
+    /// hand back an image the cursor's own split or delete replaced.
+    fn tracks_dirty_pages(&self) -> bool {
+        false
+    }
 }
 
 /// Trait for writing pages (needed for insert/delete).
 pub trait PageWriter: PageReader {
+    /// Whether discarded cell bytes must be overwritten on pages we already
+    /// write. Full-page erasure on free is the pager's responsibility.
+    fn secure_delete_mode(&self) -> SecureDeleteMode {
+        SecureDeleteMode::Off
+    }
+
     /// Write raw data to a page.
     fn write_page<'a>(
         &'a mut self,
@@ -401,6 +447,11 @@ pub trait PageWriter: PageReader {
         cx: &'a Cx,
         page_no: PageNumber,
     ) -> impl Future<Output = Result<()>> + 'a;
+    /// Record a cleared image for an already-freed page, without requiring an
+    /// additional page write. The pager uses zeroed bytes if this page becomes
+    /// a freelist trunk; an unwritten freelist leaf needs no I/O in FAST mode.
+    fn note_freed_page_zeroed(&mut self, _page_no: PageNumber) {}
+
     /// Drop a just-freed page's cached buffer from the page pool.
     ///
     /// Default is a no-op. The teardown path
@@ -423,12 +474,82 @@ pub trait PageWriter: PageReader {
     ///
     /// Returns `Ok(false)` when this writer keeps no such set; the caller then
     /// restages the page's current bytes instead, which conflicts the same way.
+    /// A successful claim must be visible to every competing writer, including
+    /// writers in other processes. A process-local commit index alone cannot
+    /// satisfy this contract for a file-backed WAL database: the unchanged
+    /// page must also be published in the WAL, so those writers discover the
+    /// structural change during first-committer-wins validation (bd-73pfl).
     fn claim_write_conflict_page<'a>(
         &'a mut self,
         _cx: &'a Cx,
         _page_no: PageNumber,
     ) -> impl Future<Output = Result<bool>> + 'a {
         async { Ok(false) }
+    }
+
+    /// Returns `Some((usable_size, full_page_size))` when auto-vacuum pointer
+    /// maps are active for this writer, or `None` for ordinary `NONE` databases.
+    fn pointer_map_page_sizes(&self) -> Option<(u32, u32)> {
+        None
+    }
+
+    /// Read the 5-byte pointer-map entry for `child_page`.
+    fn read_ptrmap_entry<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        _child_page: PageNumber,
+    ) -> impl Future<Output = Result<PtrMapEntry>> + 'a {
+        async { Err(FrankenError::Unsupported) }
+    }
+
+    /// Write the 5-byte pointer-map entry for `child_page`.
+    fn write_ptrmap_entry<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        _child_page: PageNumber,
+        _entry: PtrMapEntry,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async { Ok(()) }
+    }
+
+    /// Write raw page bytes without B-tree child pointer-map inspection
+    /// (used for overflow pages and auto-vacuum page relocations).
+    fn write_raw_page_data<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+        data: PageData,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        self.write_page_data(cx, page_no, data)
+    }
+
+    /// Write an overflow page and, when pointer maps are enabled and
+    /// `prev_overflow` is `Some(prev)`, update `page_no`'s pointer-map entry to
+    /// `(PtrMapType::Overflow2, Some(prev))`.
+    fn write_overflow_page_data<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+        data: PageData,
+        prev_overflow: Option<PageNumber>,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move {
+            self.write_raw_page_data(cx, page_no, data).await?;
+            if self.pointer_map_page_sizes().is_some()
+                && let Some(prev) = prev_overflow
+            {
+                self.write_ptrmap_entry(
+                    cx,
+                    page_no,
+                    PtrMapEntry {
+                        kind: PtrMapType::Overflow2,
+                        parent: Some(prev),
+                    },
+                )
+                .await?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -506,6 +627,23 @@ impl<T: TransactionHandle + ?Sized> PageReader for TransactionPageIo<'_, T> {
         self.txn.get_page(cx, page_no)
     }
 
+    // `read_btree_page_data` is the default one, which reads `get_page`.
+    fn read_resident_btree_page_data(
+        &self,
+        cx: &Cx,
+        page_no: PageNumber,
+    ) -> Option<Result<PageData>> {
+        self.txn.get_resident_page(cx, page_no)
+    }
+
+    fn read_nonresident_btree_page_data<'a>(
+        &'a self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = Result<PageData>> + 'a {
+        self.txn.get_nonresident_page(cx, page_no)
+    }
+
     fn prefetch_page_hint(&self, cx: &Cx, page_no: PageNumber) {
         self.txn.prefetch_page_hint(cx, page_no);
     }
@@ -513,28 +651,64 @@ impl<T: TransactionHandle + ?Sized> PageReader for TransactionPageIo<'_, T> {
     fn is_dirty(&self, page_no: PageNumber) -> bool {
         self.txn.is_page_dirty(page_no)
     }
+
+    fn tracks_dirty_pages(&self) -> bool {
+        true
+    }
 }
 
 impl<T: TransactionHandle + ?Sized> PageWriter for TransactionPageIo<'_, T> {
-    fn write_page<'a>(
-        &'a mut self,
-        cx: &'a Cx,
-        page_no: PageNumber,
-        data: &'a [u8],
-    ) -> impl Future<Output = Result<()>> + 'a {
-        self.txn.write_page(cx, page_no, data)
+    fn secure_delete_mode(&self) -> SecureDeleteMode {
+        self.txn.secure_delete_mode()
     }
 
-    fn write_page_data<'a>(
-        &'a mut self,
-        cx: &'a Cx,
+    async fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
+        self.txn.write_page(cx, page_no, data).await?;
+        if let Some((usable_size, page_size)) = self.txn.pointer_map_page_sizes()
+            && !is_ptrmap_page(page_no, usable_size, page_size)
+        {
+            crate::freelist::ptrmap_sync_btree_page_children_on_txn(
+                cx,
+                self.txn,
+                page_no,
+                data,
+                usable_size,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn write_page_data(
+        &mut self,
+        cx: &Cx,
         page_no: PageNumber,
         data: PageData,
-    ) -> impl Future<Output = Result<()>> + 'a {
-        self.txn.write_page_data(cx, page_no, data)
+    ) -> Result<()> {
+        let ptrmap_sizes = self.txn.pointer_map_page_sizes();
+        if let Some((usable_size, page_size)) = ptrmap_sizes
+            && !is_ptrmap_page(page_no, usable_size, page_size)
+        {
+            let cloned = data.clone();
+            self.txn.write_page_data(cx, page_no, data).await?;
+            crate::freelist::ptrmap_sync_btree_page_children_on_txn(
+                cx,
+                self.txn,
+                page_no,
+                cloned.as_bytes(),
+                usable_size,
+            )
+            .await?;
+            Ok(())
+        } else {
+            self.txn.write_page_data(cx, page_no, data).await
+        }
     }
 
     fn try_take_staged_page_data(&mut self, page_no: PageNumber) -> Option<PageData> {
+        if self.txn.pointer_map_page_sizes().is_some() {
+            return None;
+        }
         <T as TransactionHandle>::try_take_staged_page_data(self.txn, page_no)
     }
 
@@ -543,6 +717,9 @@ impl<T: TransactionHandle + ?Sized> PageWriter for TransactionPageIo<'_, T> {
         page_no: PageNumber,
         f: &mut dyn FnMut(&mut PageData),
     ) -> bool {
+        if self.txn.pointer_map_page_sizes().is_some() {
+            return false;
+        }
         <T as TransactionHandle>::try_mutate_staged_page_data(self.txn, page_no, f)
     }
 
@@ -570,12 +747,46 @@ impl<T: TransactionHandle + ?Sized> PageWriter for TransactionPageIo<'_, T> {
         self.txn.free_page(cx, page_no)
     }
 
+    fn note_freed_page_zeroed(&mut self, page_no: PageNumber) {
+        self.txn.note_freed_page_zeroed(page_no);
+    }
+
     fn forget_page(&mut self, page_no: PageNumber) {
         self.txn.forget_cached_page(page_no);
     }
 
     fn record_write_witness(&mut self, cx: &Cx, key: WitnessKey) {
         self.txn.record_write_witness(cx, key);
+    }
+
+    fn pointer_map_page_sizes(&self) -> Option<(u32, u32)> {
+        self.txn.pointer_map_page_sizes()
+    }
+
+    fn read_ptrmap_entry<'a>(
+        &'a self,
+        cx: &'a Cx,
+        child_page: PageNumber,
+    ) -> impl Future<Output = Result<PtrMapEntry>> + 'a {
+        self.txn.read_ptrmap_entry(cx, child_page)
+    }
+
+    fn write_ptrmap_entry<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        child_page: PageNumber,
+        entry: PtrMapEntry,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        self.txn.write_ptrmap_entry(cx, child_page, entry)
+    }
+
+    fn write_raw_page_data<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+        data: PageData,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        self.txn.write_page_data(cx, page_no, data)
     }
 }
 
@@ -595,6 +806,9 @@ pub struct MemPageStore {
     >,
     page_size: u32,
     page_slots: Vec<u8>,
+    secure_delete_mode: SecureDeleteMode,
+    pointer_map_enabled: bool,
+    free_pages: Vec<PageNumber>,
 }
 
 impl MemPageStore {
@@ -608,7 +822,139 @@ impl MemPageStore {
             )),
             page_size,
             page_slots: Vec::new(),
+            secure_delete_mode: SecureDeleteMode::Off,
+            pointer_map_enabled: false,
+            free_pages: Vec::new(),
         }
+    }
+
+    /// Create a new page store with pointer-map maintenance active (`bd-1q134`),
+    /// pre-initializing pointer-map page 2 and root page 3 as an empty leaf table.
+    #[must_use]
+    pub fn with_pointer_map_leaf_table(page_size: u32) -> (Self, PageNumber) {
+        let mut store = Self::new(page_size);
+        store.pointer_map_enabled = true;
+        // Initialize page 2 (first pointer-map page) with zeros.
+        let pm2 = PageNumber::new(2).expect("2 is non-zero");
+        store.pages.insert(2, vec![0_u8; page_size as usize]);
+        store.set_page_slot_present(pm2, true);
+        // Initialize page 3 as the table root and record its RootPage ptrmap entry.
+        let root = PageNumber::new(3).expect("3 is non-zero");
+        store.init_leaf_table_root(root);
+        store.write_ptrmap_entry_sync(
+            root,
+            PtrMapEntry {
+                kind: PtrMapType::RootPage,
+                parent: None,
+            },
+        );
+        (store, root)
+    }
+
+    /// Return the current highest page number in the store.
+    #[must_use]
+    pub fn max_page_number(&self) -> u32 {
+        self.pages.keys().copied().max().unwrap_or(0)
+    }
+
+    /// Return all currently freed pages recorded while pointer-map mode is enabled.
+    #[must_use]
+    pub fn free_pages_snapshot(&self) -> &[PageNumber] {
+        &self.free_pages
+    }
+
+    /// Truncate all pages strictly above `new_db_size` and replace `free_pages`.
+    pub fn truncate_to_db_size(&mut self, new_db_size: u32, remaining_freelist: Vec<PageNumber>) {
+        self.pages.retain(|&pgno, _| pgno <= new_db_size);
+        self.shared_pages
+            .get_mut()
+            .retain(|&pgno, _| pgno <= new_db_size);
+        if (new_db_size as usize) < self.page_slots.len() {
+            self.page_slots.truncate(new_db_size as usize);
+        }
+        self.free_pages = remaining_freelist;
+    }
+
+    fn write_ptrmap_entry_sync(&mut self, child_page: PageNumber, entry: PtrMapEntry) {
+        if !self.pointer_map_enabled {
+            return;
+        }
+        let ps = self.page_size;
+        let Some(pm_page) = ptrmap_page_for(child_page, ps, ps) else {
+            return;
+        };
+        let Some(offset) = ptrmap_entry_offset(child_page, ps, ps) else {
+            return;
+        };
+        let off = offset as usize;
+        let encoded = entry.encode();
+        self.shared_pages.get_mut().remove(&pm_page.get());
+        let page = self
+            .pages
+            .entry(pm_page.get())
+            .or_insert_with(|| vec![0_u8; ps as usize]);
+        if page.len() < off + 5 {
+            page.resize(ps as usize, 0);
+        }
+        page[off..off + 5].copy_from_slice(&encoded);
+        self.set_page_slot_present(pm_page, true);
+    }
+
+    fn sync_btree_page_children_sync(&mut self, page_no: PageNumber, data: &[u8]) -> Result<()> {
+        if !self.pointer_map_enabled {
+            return Ok(());
+        }
+        let ps = self.page_size;
+        if is_ptrmap_page(page_no, ps, ps) {
+            return Ok(());
+        }
+        let hdr_off = cell::header_offset_for_page(page_no);
+        if data.len() < hdr_off + 8 || BtreePageType::from_flag(data[hdr_off]).is_none() {
+            return Ok(());
+        }
+        let children = crate::freelist::ptrmap_collect_btree_page_children(page_no, data, ps)?;
+        for (child_pg, child_kind) in children {
+            self.write_ptrmap_entry_sync(
+                child_pg,
+                PtrMapEntry {
+                    kind: child_kind,
+                    parent: Some(page_no),
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn write_raw_bytes_sync(&mut self, page_no: PageNumber, data: &[u8]) -> Result<()> {
+        let page_size = self.page_size as usize;
+        if data.len() > page_size {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "test page store refused oversized page write: {} > {}",
+                    data.len(),
+                    page_size
+                ),
+            });
+        }
+        let pgno = page_no.get();
+        self.shared_pages.get_mut().remove(&pgno);
+        let copy_len = data.len().min(page_size);
+        if let Some(existing) = self.pages.get_mut(&pgno) {
+            existing.resize(page_size, 0);
+            existing[..copy_len].copy_from_slice(&data[..copy_len]);
+            existing[copy_len..].fill(0);
+        } else {
+            let mut page = vec![0_u8; page_size];
+            page[..copy_len].copy_from_slice(&data[..copy_len]);
+            self.pages.insert(pgno, page);
+        }
+        self.set_page_slot_present(page_no, true);
+        Ok(())
+    }
+
+    /// Select the cell-erasure policy for cursors backed by this store.
+    pub fn set_secure_delete_mode(&mut self, mode: SecureDeleteMode) {
+        self.secure_delete_mode = mode;
     }
 
     /// Iterate over all `(page_number, page_bytes)` entries in the store.
@@ -756,6 +1102,10 @@ impl PageReader for MemPageStore {
 
 #[allow(clippy::manual_async_fn)]
 impl PageWriter for MemPageStore {
+    fn secure_delete_mode(&self) -> SecureDeleteMode {
+        self.secure_delete_mode
+    }
+
     fn write_page<'a>(
         &'a mut self,
         _cx: &'a Cx,
@@ -763,29 +1113,8 @@ impl PageWriter for MemPageStore {
         data: &'a [u8],
     ) -> impl Future<Output = Result<()>> + 'a {
         async move {
-            let page_size = self.page_size as usize;
-            if data.len() > page_size {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "test page store refused oversized page write: {} > {}",
-                        data.len(),
-                        page_size
-                    ),
-                });
-            }
-            let pgno = page_no.get();
-            self.shared_pages.get_mut().remove(&pgno);
-            let copy_len = data.len().min(page_size);
-            if let Some(existing) = self.pages.get_mut(&pgno) {
-                existing.resize(page_size, 0);
-                existing[..copy_len].copy_from_slice(&data[..copy_len]);
-                existing[copy_len..].fill(0);
-            } else {
-                let mut page = vec![0_u8; page_size];
-                page[..copy_len].copy_from_slice(&data[..copy_len]);
-                self.pages.insert(pgno, page);
-            }
-            self.set_page_slot_present(page_no, true);
+            self.write_raw_bytes_sync(page_no, data)?;
+            self.sync_btree_page_children_sync(page_no, data)?;
             Ok(())
         }
     }
@@ -831,8 +1160,18 @@ impl PageWriter for MemPageStore {
                 self.shared_pages.get_mut().remove(&pgno);
             }
             self.set_page_slot_present(page_no, true);
+            self.sync_btree_page_children_sync(page_no, raw)?;
             Ok(())
         }
+    }
+
+    fn write_raw_page_data<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        page_no: PageNumber,
+        data: PageData,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move { self.write_raw_bytes_sync(page_no, data.as_bytes()) }
     }
 
     fn allocate_page<'a>(
@@ -840,7 +1179,18 @@ impl PageWriter for MemPageStore {
         _cx: &'a Cx,
     ) -> impl Future<Output = Result<PageNumber>> + 'a {
         async move {
-            let next = self
+            if self.pointer_map_enabled
+                && let Some(reused) = self.free_pages.pop()
+            {
+                self.shared_pages.get_mut().remove(&reused.get());
+                self.pages
+                    .insert(reused.get(), vec![0u8; self.page_size as usize]);
+                self.set_page_slot_present(reused, true);
+                return Ok(reused);
+            }
+            let ps = self.page_size;
+            let lock_byte = ptrmap_lock_byte_page(ps);
+            let mut next = self
                 .pages
                 .keys()
                 .copied()
@@ -848,9 +1198,26 @@ impl PageWriter for MemPageStore {
                 .unwrap_or(1)
                 .checked_add(1)
                 .ok_or(FrankenError::DatabaseFull)?;
+            loop {
+                if next == lock_byte {
+                    next = next.checked_add(1).ok_or(FrankenError::DatabaseFull)?;
+                    continue;
+                }
+                if self.pointer_map_enabled
+                    && let Some(pg) = PageNumber::new(next)
+                    && is_ptrmap_page(pg, ps, ps)
+                {
+                    self.shared_pages.get_mut().remove(&next);
+                    self.pages.insert(next, vec![0u8; ps as usize]);
+                    self.set_page_slot_present(pg, true);
+                    next = next.checked_add(1).ok_or(FrankenError::DatabaseFull)?;
+                    continue;
+                }
+                break;
+            }
             let pgno = PageNumber::new(next).ok_or(FrankenError::DatabaseFull)?;
             self.shared_pages.get_mut().remove(&next);
-            self.pages.insert(next, vec![0u8; self.page_size as usize]);
+            self.pages.insert(next, vec![0u8; ps as usize]);
             self.set_page_slot_present(pgno, true);
             Ok(pgno)
         }
@@ -863,9 +1230,72 @@ impl PageWriter for MemPageStore {
     ) -> impl Future<Output = Result<()>> + 'a {
         async move {
             let pgno = page_no.get();
+            if self.pointer_map_enabled {
+                if is_ptrmap_page(page_no, self.page_size, self.page_size) {
+                    return Ok(());
+                }
+                if !self.free_pages.contains(&page_no) {
+                    self.free_pages.push(page_no);
+                }
+                self.write_ptrmap_entry_sync(
+                    page_no,
+                    PtrMapEntry {
+                        kind: PtrMapType::FreePage,
+                        parent: None,
+                    },
+                );
+                return Ok(());
+            }
             self.shared_pages.get_mut().remove(&pgno);
             self.pages.remove(&pgno);
             self.set_page_slot_present(page_no, false);
+            Ok(())
+        }
+    }
+
+    fn pointer_map_page_sizes(&self) -> Option<(u32, u32)> {
+        self.pointer_map_enabled
+            .then_some((self.page_size, self.page_size))
+    }
+
+    fn read_ptrmap_entry<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        child_page: PageNumber,
+    ) -> impl Future<Output = Result<PtrMapEntry>> + 'a {
+        async move {
+            if !self.pointer_map_enabled {
+                return Err(FrankenError::Unsupported);
+            }
+            let ps = self.page_size;
+            let pm_page = ptrmap_page_for(child_page, ps, ps).ok_or_else(|| {
+                FrankenError::DatabaseCorrupt {
+                    detail: format!("page {} has no pointer-map page", child_page.get()),
+                }
+            })?;
+            let offset = ptrmap_entry_offset(child_page, ps, ps).ok_or_else(|| {
+                FrankenError::DatabaseCorrupt {
+                    detail: format!("page {} has no pointer-map offset", child_page.get()),
+                }
+            })? as usize;
+            let bytes =
+                self.pages
+                    .get(&pm_page.get())
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!("missing pointer-map page {}", pm_page.get()),
+                    })?;
+            PtrMapEntry::decode(&bytes[offset..offset + 5])
+        }
+    }
+
+    fn write_ptrmap_entry<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        child_page: PageNumber,
+        entry: PtrMapEntry,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move {
+            self.write_ptrmap_entry_sync(child_page, entry);
             Ok(())
         }
     }
@@ -1077,7 +1507,7 @@ impl Drop for StackEntry {
 // ---------------------------------------------------------------------------
 
 const CURSOR_STACK_INLINE_DEPTH: usize = 4;
-const TABLE_SEEK_CACHE_SLOTS: usize = 4;
+const TABLE_SEEK_CACHE_SLOTS: usize = 8;
 const CELL_SLOT_CACHE_ENTRIES: usize = 64;
 
 type CursorStack = SmallVec<[StackEntry; CURSOR_STACK_INLINE_DEPTH]>;
@@ -1418,6 +1848,149 @@ struct TableSeekCacheEntry {
     last_rowid: i64,
 }
 
+/// The table seek cache's `TABLE_SEEK_CACHE_SLOTS` slots, newest first
+/// (bd-w4pr1.12, lever SC8 v4). Slot 0 lives in the cursor; slots 1.. live
+/// in one allocation made the first time a landing needs a second slot. The
+/// cursor so holds one slot and a pointer, no more than the four inline
+/// slots it held before, and a cursor that never seeks across leaves
+/// allocates nothing. Filled slots are always a prefix.
+///
+/// Slots 1.. are read and moved as one slice ([`Self::rest`],
+/// [`Self::push_front`]'s rotate), not slot by slot through the box: SC8 v3
+/// did that and paid about 259 instructions a missed probe for it (219 in
+/// its per-slot push_front, 73 in the per-slot scan; callgrind of
+/// rowid_lookups_200k).
+#[derive(Debug, Clone, Default)]
+struct TableSeekCache {
+    first: Option<TableSeekCacheEntry>,
+    rest: Option<Box<[Option<TableSeekCacheEntry>; TABLE_SEEK_CACHE_SLOTS - 1]>>,
+    /// The answer of the slot scan [`BtCursor::try_table_seek_within_leaf`]
+    /// ran for a probe it then left to the general path: the probe's rowid
+    /// and the first slot that admits it (`TABLE_SEEK_CACHE_SLOTS` when none
+    /// does). [`BtCursor::try_table_seek_cache`] starts its scan there for
+    /// the same rowid, so a probe scans the slots once (bd-w4pr1.12, lever
+    /// SL2 v3). Every change to the slots drops it.
+    hint: Option<(i64, u8)>,
+}
+
+impl TableSeekCache {
+    /// Slots 1.., in order; empty before they are allocated.
+    #[inline]
+    fn rest(&self) -> &[Option<TableSeekCacheEntry>] {
+        self.rest.as_deref().map_or(&[], |rest| rest.as_slice())
+    }
+
+    /// Slot `slot`, `None` when it is empty or out of range.
+    #[inline]
+    fn get(&self, slot: usize) -> Option<TableSeekCacheEntry> {
+        if slot == 0 {
+            self.first
+        } else {
+            self.rest().get(slot - 1).copied().flatten()
+        }
+    }
+
+    /// Empty every slot; an allocation made for slots 1.. is kept.
+    fn clear(&mut self) {
+        self.first = None;
+        self.hint = None;
+        if let Some(rest) = self.rest.as_mut() {
+            rest.fill(None);
+        }
+    }
+
+    /// Record that no slot before `from` admits `rowid` (the `hint` field).
+    #[inline]
+    fn set_hint(&mut self, rowid: i64, from: usize) {
+        // Slot numbers stay below `TABLE_SEEK_CACHE_SLOTS`, far under u8::MAX;
+        // u8::MAX itself starts a scan past every slot.
+        self.hint = Some((rowid, u8::try_from(from).unwrap_or(u8::MAX)));
+    }
+
+    /// The slot a scan for `rowid` starts at: the recorded one when the hint
+    /// is for `rowid`, else 0. The hint is used once.
+    #[inline]
+    fn take_hint(&mut self, rowid: i64) -> usize {
+        match self.hint.take() {
+            Some((hinted, from)) if hinted == rowid => usize::from(from),
+            _ => 0,
+        }
+    }
+
+    /// The slots in order, newest first.
+    fn iter(&self) -> impl Iterator<Item = Option<TableSeekCacheEntry>> + '_ {
+        (0..TABLE_SEEK_CACHE_SLOTS).map(|slot| self.get(slot))
+    }
+
+    /// The allocated slots in order, for tests that age the cached bounds.
+    #[cfg(test)]
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut Option<TableSeekCacheEntry>> {
+        self.hint = None;
+        std::iter::once(&mut self.first)
+            .chain(self.rest.iter_mut().flat_map(|rest| rest.iter_mut()))
+    }
+
+    /// The slot a landing on `page_no` takes the place of: the one that
+    /// already names the leaf, else the first empty one, else the last
+    /// (least recent) one.
+    #[inline]
+    fn landing_slot(&self, page_no: PageNumber) -> usize {
+        let gives_way = |slot: &Option<TableSeekCacheEntry>| {
+            slot.is_none_or(|cached| cached.page_no == page_no)
+        };
+        if gives_way(&self.first) {
+            return 0;
+        }
+        self.rest.as_deref().map_or(1, |rest| {
+            rest.iter()
+                .position(gives_way)
+                .map_or(TABLE_SEEK_CACHE_SLOTS - 1, |idx| idx + 1)
+        })
+    }
+
+    /// Slots `0..end` move down one place (slot `end`'s entry is dropped)
+    /// and `entry` takes slot 0: slots 1..=end rotate as one slice.
+    #[inline]
+    fn push_front(&mut self, end: usize, entry: TableSeekCacheEntry) {
+        debug_assert!(end < TABLE_SEEK_CACHE_SLOTS);
+        self.hint = None;
+        if end > 0 {
+            let rest = self
+                .rest
+                .get_or_insert_with(|| Box::new([None; TABLE_SEEK_CACHE_SLOTS - 1]));
+            rest[..end].rotate_right(1);
+            rest[0] = self.first;
+        }
+        self.first = Some(entry);
+    }
+}
+
+/// Equal when every slot holds the same entry, whether or not slots 1.. are
+/// allocated.
+impl PartialEq for TableSeekCache {
+    fn eq(&self, other: &Self) -> bool {
+        self.iter().eq(other.iter())
+    }
+}
+
+impl std::ops::Index<usize> for TableSeekCache {
+    type Output = Option<TableSeekCacheEntry>;
+
+    #[inline]
+    fn index(&self, slot: usize) -> &Self::Output {
+        const EMPTY: &Option<TableSeekCacheEntry> = &None;
+        if slot == 0 {
+            &self.first
+        } else {
+            assert!(
+                slot < TABLE_SEEK_CACHE_SLOTS,
+                "seek-cache slot {slot} out of range"
+            );
+            self.rest.as_ref().map_or(EMPTY, |rest| &rest[slot - 1])
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CursorPositionStamp {
     page_no: u32,
@@ -1463,6 +2036,17 @@ impl Drop for RightmostLeafCacheEntry {
     fn drop(&mut self) {
         recycle_cell_pointers(std::mem::take(&mut self.cell_pointers));
     }
+}
+
+/// What an append to the cached rightmost leaf did in the transaction's
+/// staged image of that leaf (bd-i3csr.4).
+enum StagedLeafAppend {
+    /// The store holds no unpublished staged image of the leaf, or a
+    /// different one; nothing changed.
+    NotStaged,
+    /// The append ran there: the row's index and cell offset, or `None` when
+    /// it does not fit the leaf.
+    Ran(Option<(u16, u16)>),
 }
 
 /// Opaque retained append hint for monotonic table inserts.
@@ -1751,6 +2335,7 @@ pub struct TableLeafDeleteRun {
     entry: StackEntry,
     tree_depth: usize,
     dirty: bool,
+    secure_delete_mode: SecureDeleteMode,
     compact_cell_area: bool,
     profile_delete_leaf_run: bool,
     deleted_cell_indices: SmallVec<[u16; 16]>,
@@ -1762,6 +2347,13 @@ impl TableLeafDeleteRun {
     #[must_use]
     pub const fn leaf_page(&self) -> PageNumber {
         self.entry.page_no
+    }
+
+    /// The erasure policy selected when this run began. A caller retaining a
+    /// run across statements must flush it before appending under another mode.
+    #[must_use]
+    pub const fn secure_delete_mode(&self) -> SecureDeleteMode {
+        self.secure_delete_mode
     }
 
     pub fn max_rowid(&self) -> Result<i64> {
@@ -2528,6 +3120,12 @@ pub struct BtCursor<P> {
     /// repopulated from the live cell pointer array. Eliminates the per-
     /// `remove_cell_from_leaf` allocation (N * 24 bytes for N cells).
     defrag_cells_scratch: Vec<(usize, usize, usize)>,
+    /// The table leaf image (page, `PageData::image_token`) the last compact
+    /// descending leaf delete produced. That image is compact and its pointers
+    /// descend by construction, so a delete on exactly this image skips
+    /// re-checking the pointer order (bd-w4pr1.13.20). Any other image of the
+    /// page carries another token and is checked.
+    descending_leaf_image: Option<(PageNumber, u64)>,
     /// PERF-W5-1: LRU cache of parsed cell slots keyed by page and page-image
     /// mutation signature.
     ///
@@ -2567,12 +3165,19 @@ pub struct BtCursor<P> {
     /// Whether the last `index_insert` seek ran past the last cell of the
     /// rightmost leaf, i.e. the key sorts after every key already stored.
     last_index_insert_past_rightmost: bool,
-    /// Four-entry LRU of table-seek leaf anchors.
+    /// Set the first time [`Self::try_table_seek_within_leaf`] finds a cached
+    /// leaf other than the current one that the reader does not hold
+    /// resident; from then on that fast path declines such leaves without
+    /// asking the reader again (bd-w4pr1.12, lever SL2 v3). A reader that
+    /// holds no resident images (a `:memory:` mirror, the default reader)
+    /// pays one failed lookup per cursor instead of one per probe.
+    resident_seek_declined: bool,
+    /// `TABLE_SEEK_CACHE_SLOTS`-entry LRU of table-seek leaf anchors.
     ///
     /// Each slot remembers the rowid probe plus the leaf page/cell position
     /// where that seek landed. Later seeks probe cached leaves before they
     /// fall back to a full root-to-leaf descent.
-    seek_cache: [Option<TableSeekCacheEntry>; TABLE_SEEK_CACHE_SLOTS],
+    seek_cache: TableSeekCache,
     /// Monotonic epoch for the current row image visible through this cursor.
     ///
     /// `(page_no, cell_idx)` already identifies logical movement. This epoch
@@ -2604,7 +3209,7 @@ impl<P> BtCursor<P> {
         self.stack.clear();
         self.rightmost_leaf_cache = None;
         self.last_known_depth = None;
-        self.seek_cache.fill(None);
+        self.seek_cache.clear();
         self.clear_cell_slot_caches();
         self.bump_row_image_epoch();
     }
@@ -2679,7 +3284,7 @@ impl<P> BtCursor<P> {
     }
 
     fn clear_seek_cache(&mut self) {
-        self.seek_cache.fill(None);
+        self.seek_cache.clear();
     }
 
     fn clear_rightmost_leaf_cache(&mut self) {
@@ -2756,26 +3361,41 @@ impl<P> BtCursor<P> {
         {
             TABLE_SEEK_MRU_SHORT_CIRCUIT_HITS_FOR_BENCH
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.seek_cache[0] = Some(entry);
+            self.seek_cache.first = Some(entry);
+            self.seek_cache.hint = None;
             return;
         }
 
-        let mut refreshed = [None; TABLE_SEEK_CACHE_SLOTS];
-        refreshed[0] = Some(entry);
+        // The landing takes the front. The slot that already names its leaf
+        // gives way, or else the first empty slot, or else the last (least
+        // recent) one; the slots before it move down one. Filled slots are
+        // always a prefix, so this is the order a rebuild would give, without
+        // copying the slots.
+        let end = self.seek_cache.landing_slot(page_no);
+        self.seek_cache.push_front(end, entry);
+    }
 
-        let mut next_slot = 1usize;
-        for existing in self.seek_cache.into_iter().flatten() {
-            if existing.page_no == page_no {
-                continue;
-            }
-            if next_slot >= TABLE_SEEK_CACHE_SLOTS {
-                break;
-            }
-            refreshed[next_slot] = Some(existing);
-            next_slot += 1;
+    /// The first seek-cache slot at or after `from` whose landing admits
+    /// `target_rowid`: [`Self::try_table_seek_cache`]'s filter. A landing
+    /// on a leaf's first cell admits no smaller rowid, and no slot admits a
+    /// rowid outside the bounds its leaf held (bd-w4pr1.13.13). Slot 0 is
+    /// read in the cursor and slots 1.. as one slice.
+    #[inline]
+    fn next_table_seek_slot(&self, target_rowid: i64, from: usize) -> Option<usize> {
+        let admits = |cached: &TableSeekCacheEntry| {
+            !(target_rowid < cached.rowid && cached.cell_idx == 0)
+                && target_rowid >= cached.first_rowid
+                && target_rowid <= cached.last_rowid
+        };
+        if from == 0 && self.seek_cache.first.as_ref().is_some_and(admits) {
+            return Some(0);
         }
-
-        self.seek_cache = refreshed;
+        self.seek_cache
+            .rest()
+            .iter()
+            .enumerate()
+            .skip(from.saturating_sub(1))
+            .find_map(|(idx, slot)| slot.as_ref().is_some_and(admits).then_some(idx + 1))
     }
 }
 
@@ -3144,6 +3764,7 @@ impl<P: PageReader> BtCursor<P> {
             cell_buf: Vec::new(),
             defrag_ptrs_scratch: Vec::new(),
             defrag_cells_scratch: Vec::new(),
+            descending_leaf_image: None,
             cell_slot_cache: RefCell::new(CellSlotCache::default()),
             current_cell_memo: std::cell::Cell::new(None),
             last_insert_rowid: None,
@@ -3151,7 +3772,8 @@ impl<P: PageReader> BtCursor<P> {
             last_known_depth: None,
             decoded_pages: DecodedPageMemo::default(),
             last_index_insert_past_rightmost: false,
-            seek_cache: [None; TABLE_SEEK_CACHE_SLOTS],
+            resident_seek_declined: false,
+            seek_cache: TableSeekCache::default(),
             row_image_epoch: 0,
         }
     }
@@ -3468,6 +4090,140 @@ impl<P: PageReader> BtCursor<P> {
 
         self.active_op_stats = saved_stats;
         result
+    }
+
+    /// Estimate this B-tree's entry count from its leftmost root-to-leaf path,
+    /// reading depth + 1 pages instead of the whole tree.
+    ///
+    /// The estimate is the product of each interior page's fan-out (its cells
+    /// plus the right child) along the path, times the leaf's cell count, as
+    /// SQLite's `sqlite3BtreeRowCountEst` multiplies along its path. A
+    /// single-page tree is counted exactly; a deeper one is off by how far the
+    /// sampled pages' fill differs from the average, which is enough for a
+    /// planner that needs only the order of magnitude when `sqlite_stat1` has
+    /// no row count (bd-prkvt). The leftmost path, rather than the rightmost,
+    /// avoids the partly filled page that appends leave at the end.
+    pub async fn estimate_entry_count(&mut self, cx: &Cx) -> Result<u64> {
+        let mut page_no = self.root_page;
+        let mut fan_out = 1_u64;
+        for _ in 0..BTREE_MAX_DEPTH {
+            observe_cursor_cancellation(cx)?;
+            let page_data = self.pager.read_btree_page_data(cx, page_no).await?;
+            let page_bytes = cell::usable_prefix(page_data.as_bytes(), self.usable_size);
+            let header = cell::parse_page_header(page_bytes, page_no)?;
+            if header.page_type.is_leaf() {
+                return Ok(fan_out.saturating_mul(u64::from(header.cell_count)));
+            }
+            fan_out = fan_out.saturating_mul(u64::from(header.cell_count) + 1);
+            page_no = if header.cell_count == 0 {
+                header
+                    .right_child
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: "interior page has no right child in estimate_entry_count"
+                            .to_owned(),
+                    })?
+            } else {
+                let cell_ptr = Self::read_cell_pointer_inline(
+                    page_bytes,
+                    page_no,
+                    usize::from(header.page_type.header_size()),
+                    0,
+                )?;
+                Self::read_child_at_offset(page_bytes, usize::from(cell_ptr))?
+            };
+        }
+        Err(FrankenError::DatabaseCorrupt {
+            detail: format!("B-tree depth exceeds maximum of {BTREE_MAX_DEPTH}"),
+        })
+    }
+
+    /// Estimate how many entries of this index B-tree share one leading key
+    /// value, from the keys of a single page on its leftmost path, for a
+    /// planner without `sqlite_stat1` (bd-prkvt).
+    ///
+    /// The path is followed down to the first page that is a leaf or holds at
+    /// least 16 keys, and its first 64 keys at most are read. They are in
+    /// order, so equal leading values are adjacent and form runs; a single run
+    /// over the whole sample is taken to span the whole page. On a leaf the
+    /// estimate is the spanned entries per run. On an interior page each key
+    /// separates whole subtrees: when the sampled separators fall into runs
+    /// fewer than half of them, a value repeats across pages, and the estimate
+    /// is the entries under the spanned separators per run; when they mostly
+    /// differ, the page cannot tell a selective value from one spanning a
+    /// single subtree, and the result is `None`, as for an empty index or a
+    /// table B-tree. A leading field that does not fit a cell's local payload
+    /// counts as a run of its own.
+    pub async fn estimate_rows_per_leading_key(&mut self, cx: &Cx) -> Result<Option<u64>> {
+        const MIN_SAMPLED_KEYS: u16 = 16;
+        const MAX_SAMPLED_KEYS: u16 = 64;
+        let mut page_no = self.root_page;
+        let mut fan_out_above = 1_u64;
+        for _ in 0..BTREE_MAX_DEPTH {
+            observe_cursor_cancellation(cx)?;
+            let page_data = self.pager.read_btree_page_data(cx, page_no).await?;
+            let page_bytes = cell::usable_prefix(page_data.as_bytes(), self.usable_size);
+            let header = cell::parse_page_header(page_bytes, page_no)?;
+            if header.page_type.is_table() {
+                return Ok(None);
+            }
+            let header_size = usize::from(header.page_type.header_size());
+            let is_leaf = header.page_type.is_leaf();
+            if is_leaf || header.cell_count >= MIN_SAMPLED_KEYS {
+                let sampled = header.cell_count.min(MAX_SAMPLED_KEYS);
+                let mut runs = 0_u16;
+                let mut previous: Option<(u64, &[u8])> = None;
+                for cell_idx in 0..sampled {
+                    let cell_ptr =
+                        Self::read_cell_pointer_inline(page_bytes, page_no, header_size, cell_idx)?;
+                    let cell = CellRef::parse(
+                        page_bytes,
+                        usize::from(cell_ptr),
+                        header.page_type,
+                        self.usable_size,
+                    )?;
+                    let leading = record_leading_field(cell.local_payload(page_bytes));
+                    if leading.is_none() || leading != previous {
+                        runs += 1;
+                    }
+                    previous = leading;
+                }
+                if runs == 0 {
+                    return Ok(None);
+                }
+                // One run over the whole sample may go on past it: take the
+                // whole page as that run, the larger and safer estimate.
+                let span = if runs == 1 {
+                    header.cell_count
+                } else {
+                    sampled
+                };
+                if is_leaf {
+                    return Ok(Some(u64::from(span).div_ceil(u64::from(runs))));
+                }
+                if u32::from(runs) * 2 > u32::from(sampled) {
+                    return Ok(None);
+                }
+                let entries_spanned = self.estimate_entry_count(cx).await? / fan_out_above
+                    * u64::from(span)
+                    / u64::from(header.cell_count);
+                return Ok(Some((entries_spanned / u64::from(runs)).max(1)));
+            }
+            fan_out_above = fan_out_above.saturating_mul(u64::from(header.cell_count) + 1);
+            page_no = if header.cell_count == 0 {
+                header
+                    .right_child
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: "interior page has no right child in estimate_rows_per_leading_key"
+                            .to_owned(),
+                    })?
+            } else {
+                let cell_ptr = Self::read_cell_pointer_inline(page_bytes, page_no, header_size, 0)?;
+                Self::read_child_at_offset(page_bytes, usize::from(cell_ptr))?
+            };
+        }
+        Err(FrankenError::DatabaseCorrupt {
+            detail: format!("B-tree depth exceeds maximum of {BTREE_MAX_DEPTH}"),
+        })
     }
 
     /// Count all rows in this table B-tree without decoding cell payloads.
@@ -3875,7 +4631,34 @@ impl<P: PageReader> BtCursor<P> {
         }
 
         self.note_page_visit(page_no);
-        let page_data = self.pager.read_btree_page_data(cx, page_no).await?;
+        // A page the transaction already holds (its staged write or an image
+        // it read) comes back without the async read chain (bd-w4pr1.13.18);
+        // any other page is read, past the checks the resident answer made.
+        let page_data = match self.pager.read_resident_btree_page_data(cx, page_no) {
+            Some(resident) => resident?,
+            None => {
+                self.pager
+                    .read_nonresident_btree_page_data(cx, page_no)
+                    .await?
+            }
+        };
+        self.stack_entry_for_page(page_no, page_data)
+    }
+
+    /// The stack entry for page `page_no` read as `page_data`: its header
+    /// and checked cell pointers, decoded once per image (see
+    /// `DecodedPageMemo`). The tail of [`Self::load_page`], also used by the
+    /// synchronous seek-cache hit on a resident leaf in
+    /// [`Self::try_table_seek_within_leaf`]. Always inlined: SL2 v2 called it
+    /// out of line from `load_page` and paid about 83 instructions a load for
+    /// the split (callgrind of rowid_lookups_200k, bd-w4pr1.12).
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn stack_entry_for_page(
+        &mut self,
+        page_no: PageNumber,
+        page_data: PageData,
+    ) -> Result<StackEntry> {
         let mutation_counter = Self::page_mutation_counter(&page_data);
         // The same image decodes to the same header and the same checked
         // pointers; see `DecodedPageMemo`.
@@ -4462,18 +5245,41 @@ impl<P: PageReader> BtCursor<P> {
             return Ok(result);
         }
 
-        self.stack.clear();
+        // bd-t0g9w: the descent keeps the pages the previous one left on the
+        // stack for as long as they are the pages it visits: the entry at each
+        // depth is reused when it is the page about to be read and this
+        // transaction has not changed it, which is `load_page`'s stack-top
+        // elision applied along the whole path (stock's moveToRoot keeps the
+        // root page the same way). The first page off the previous path
+        // truncates the stack there. A stack a seek-cache or same-leaf hit left
+        // holds only the landing leaf, so it offers no root to reuse. Only a
+        // reader that tracks dirty pages qualifies (`tracks_dirty_pages`).
+        let reuse_path = self.pager.tracks_dirty_pages();
+        let mut depth = 0_usize;
         let mut current_page = self.root_page;
 
         loop {
             observe_cursor_cancellation(cx)?;
-            if self.stack.len() >= BTREE_MAX_DEPTH as usize {
+            if depth >= BTREE_MAX_DEPTH as usize {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!("B-tree depth exceeds maximum of {}", BTREE_MAX_DEPTH),
                 });
             }
 
-            let entry = self.load_page(cx, current_page).await?;
+            if reuse_path
+                && self
+                    .stack
+                    .get(depth)
+                    .is_some_and(|previous| previous.page_no == current_page)
+                && !self.pager.is_dirty(current_page)
+            {
+                self.note_page_visit(current_page);
+            } else {
+                self.stack.truncate(depth);
+                let entry = self.load_page(cx, current_page).await?;
+                self.stack.push(entry);
+            }
+            let entry = &self.stack[depth];
 
             // Guard: detect is_table vs actual page-type mismatch early.
             // If the cursor was opened with is_table=true but the page is
@@ -4492,12 +5298,13 @@ impl<P: PageReader> BtCursor<P> {
             if entry.header.page_type.is_leaf() {
                 // Table leaf pages are integer-keyed by rowid, so use a
                 // bounded interpolation probe before falling back to binary.
-                let result = Self::search_integer_key_table_leaf(cx, &entry, target_rowid)?;
+                let result = Self::search_integer_key_table_leaf(cx, entry, target_rowid)?;
+                let cell_count = entry.header.cell_count;
+                // Nothing lies below a leaf: drop what the previous path had there.
+                self.stack.truncate(depth + 1);
                 match result {
                     BinarySearchResult::Found(idx) => {
-                        let mut entry = entry;
-                        entry.cell_idx = idx;
-                        self.stack.push(entry);
+                        self.stack[depth].cell_idx = idx;
                         self.at_eof = false;
                         self.remember_table_landing(target_rowid, current_page, idx);
                         self.record_point_witness(
@@ -4511,14 +5318,12 @@ impl<P: PageReader> BtCursor<P> {
                         return Ok(SeekResult::Found);
                     }
                     BinarySearchResult::NotFound(idx) => {
-                        let mut entry = entry;
-                        if idx >= entry.header.cell_count {
+                        if idx >= cell_count {
                             // Target is strictly greater than the last key on this leaf.
                             // Keep the path anchored to this right-most leaf and mark EOF,
                             // so callers (notably INSERT) still have a valid stack context.
-                            let landed_cell_idx = entry.header.cell_count.saturating_sub(1);
-                            entry.cell_idx = landed_cell_idx;
-                            self.stack.push(entry);
+                            let landed_cell_idx = cell_count.saturating_sub(1);
+                            self.stack[depth].cell_idx = landed_cell_idx;
                             self.at_eof = true;
                             self.remember_table_landing(
                                 target_rowid,
@@ -4526,8 +5331,7 @@ impl<P: PageReader> BtCursor<P> {
                                 landed_cell_idx,
                             );
                         } else {
-                            entry.cell_idx = idx;
-                            self.stack.push(entry);
+                            self.stack[depth].cell_idx = idx;
                             self.at_eof = false;
                             self.remember_table_landing(target_rowid, current_page, idx);
                         }
@@ -4545,13 +5349,12 @@ impl<P: PageReader> BtCursor<P> {
             }
 
             // Interior table page: binary search to find which child to descend.
-            let child_idx = Self::binary_search_table_interior(cx, &entry, target_rowid)?;
-            let child = Self::read_interior_child_inline(&entry, child_idx)?;
-            let mut entry = entry;
-            entry.cell_idx = child_idx;
-            self.stack.push(entry);
+            let child_idx = Self::binary_search_table_interior(cx, entry, target_rowid)?;
+            let child = Self::read_interior_child_inline(entry, child_idx)?;
+            self.stack[depth].cell_idx = child_idx;
             self.issue_prefetch_hint(cx, child);
             current_page = child;
+            depth += 1;
         }
     }
 
@@ -4562,22 +5365,17 @@ impl<P: PageReader> BtCursor<P> {
     ) -> Result<Option<SeekResult>> {
         observe_cursor_cancellation(cx)?;
 
-        for slot_idx in 0..TABLE_SEEK_CACHE_SLOTS {
+        // Only the slots whose landing admits the target are visited; the
+        // scan for them is synchronous and reads the slots in place, so a
+        // probe no slot admits costs one pass and copies nothing. A probe
+        // `try_table_seek_within_leaf` already scanned starts where that scan
+        // stopped (bd-w4pr1.12, lever SL2 v3).
+        let mut next_slot = self.seek_cache.take_hint(target_rowid);
+        while let Some(slot_idx) = self.next_table_seek_slot(target_rowid, next_slot) {
+            next_slot = slot_idx + 1;
             let Some(cached) = self.seek_cache[slot_idx] else {
                 continue;
             };
-
-            // If the cached landing point was the first cell on this leaf,
-            // any smaller rowid must belong to an earlier leaf.
-            if target_rowid < cached.rowid && cached.cell_idx == 0 {
-                continue;
-            }
-            // A landing below is an exact match or a gap strictly inside the
-            // leaf, so a target outside the rowids the leaf held cannot land
-            // here: skip the slot instead of loading its page to find out.
-            if target_rowid < cached.first_rowid || target_rowid > cached.last_rowid {
-                continue;
-            }
 
             // NOTE (bd-kwei8): this fast path deliberately rebuilds the stack
             // as JUST the landing leaf — no root-to-leaf path. That is fine
@@ -4690,11 +5488,12 @@ impl<P: PageReader> BtCursor<P> {
         page_no: PageNumber,
         cell_idx: u16,
     ) {
-        match self.seek_cache.get_mut(slot_idx) {
-            Some(Some(cached)) if cached.page_no == page_no => {
+        match self.seek_cache.get(slot_idx) {
+            Some(mut cached) if cached.page_no == page_no => {
+                // The slot's old entry is the one push_front drops.
                 cached.rowid = rowid;
                 cached.cell_idx = cell_idx;
-                self.seek_cache[..=slot_idx].rotate_right(1);
+                self.seek_cache.push_front(slot_idx, cached);
             }
             _ => self.remember_table_landing(rowid, page_no, cell_idx),
         }
@@ -5579,13 +6378,14 @@ impl<P: PageReader> BtCursor<P> {
         encoding: TextEncoding,
     ) -> Option<std::cmp::Ordering> {
         if let (SqliteValue::Text(left), SqliteValue::Text(right)) = (lhs, rhs) {
-            return Some(Self::cmp_index_text_collated(
-                left.as_bytes_direct(),
-                right.as_bytes_direct(),
-                coll_name,
-                registry,
-                encoding,
-            ));
+            if let Some(name) = coll_name
+                && !(name.eq_ignore_ascii_case("BINARY")
+                    && registry.uses_builtin_implementation("BINARY"))
+                && let Some(collation) = registry.find(name)
+            {
+                return Some(collation.compare(left.as_bytes_direct(), right.as_bytes_direct()));
+            }
+            return Some(left.cmp_binary_in(right, encoding));
         }
         lhs.partial_cmp(rhs)
     }
@@ -5904,6 +6704,125 @@ impl<P: PageReader> BtCursor<P> {
         self.advance_next_impl(cx, true).await
     }
 
+    /// Count this index B-tree's entries from the cursor's position onward
+    /// that order before `bound`, a key record compared as an index seek
+    /// compares one: with `inclusive`, an entry whose leading fields equal the
+    /// bound's counts (`key <= bound`); without it, it does not (`key <
+    /// bound`). `None` counts to the end of the index. A `[NULL]` bound with
+    /// `inclusive` counts the leading NULL keys.
+    ///
+    /// A leaf whose last entry orders before the bound is counted whole from
+    /// its cell count, so only the leaf the bound falls in is searched
+    /// (bd-2fb53). Interior separators are entries of their own and are
+    /// tested one by one. Moving from leaf to leaf goes through
+    /// `advance_next`, which records each page as a `Next` walk does. The
+    /// cursor is left on the first entry not counted, or at EOF.
+    pub async fn count_entries_before(
+        &mut self,
+        cx: &Cx,
+        bound: Option<&[u8]>,
+        inclusive: bool,
+    ) -> Result<u64> {
+        let bias = if inclusive {
+            IndexSeekBias::UpperBound
+        } else {
+            IndexSeekBias::LowerBound
+        };
+        let parsed_bound = bound.and_then(|key| {
+            let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
+            self.decode_index_key_for_compare(key)
+        });
+        let mut count = 0_u64;
+        loop {
+            observe_cursor_cancellation(cx)?;
+            if self.at_eof {
+                return Ok(count);
+            }
+            let Some(top) = self.stack.last() else {
+                return Ok(count);
+            };
+            let (cell_idx, cell_count) = (top.cell_idx, top.header.cell_count);
+            if !top.header.page_type.is_leaf() {
+                // An interior separator: an entry of an index B-tree.
+                if !self
+                    .top_cell_orders_before(cx, cell_idx, bound, parsed_bound.as_deref(), bias)
+                    .await?
+                {
+                    return Ok(count);
+                }
+                count += 1;
+                if !self.advance_next(cx).await? {
+                    return Ok(count);
+                }
+                continue;
+            }
+            if cell_idx >= cell_count {
+                if !self.advance_next(cx).await? {
+                    return Ok(count);
+                }
+                continue;
+            }
+            let last = cell_count - 1;
+            if self
+                .top_cell_orders_before(cx, last, bound, parsed_bound.as_deref(), bias)
+                .await?
+            {
+                count += u64::from(cell_count - cell_idx);
+                if let Some(top) = self.stack.last_mut() {
+                    top.cell_idx = last;
+                }
+                if !self.advance_next(cx).await? {
+                    return Ok(count);
+                }
+                continue;
+            }
+            // The bound falls in this leaf: cells before `low` order before
+            // it, the cell at `high` does not.
+            let (mut low, mut high) = (cell_idx, last);
+            while low < high {
+                let mid = low + (high - low) / 2;
+                if self
+                    .top_cell_orders_before(cx, mid, bound, parsed_bound.as_deref(), bias)
+                    .await?
+                {
+                    low = mid + 1;
+                } else {
+                    high = mid;
+                }
+            }
+            count += u64::from(low - cell_idx);
+            if let Some(top) = self.stack.last_mut() {
+                top.cell_idx = low;
+            }
+            return Ok(count);
+        }
+    }
+
+    /// Whether the cell at `idx` of the page on top of the stack orders
+    /// before `bound` under `bias` (always, without a bound).
+    async fn top_cell_orders_before(
+        &self,
+        cx: &Cx,
+        idx: u16,
+        bound: Option<&[u8]>,
+        parsed_bound: Option<&[SqliteValue]>,
+        bias: IndexSeekBias,
+    ) -> Result<bool> {
+        let Some(bound) = bound else {
+            return Ok(true);
+        };
+        let entry = self
+            .stack
+            .last()
+            .ok_or_else(|| FrankenError::internal("count_entries_before: empty cursor stack"))?;
+        let cell = self.parse_cell_ref_at(entry, idx)?;
+        let payload = self.read_cell_payload(cx, entry, &cell).await?;
+        Ok(
+            self.compare_index_key_bytes_with_bias(&payload, bound, parsed_bound, bias)
+                == std::cmp::Ordering::Less,
+        )
+    }
+
     /// Synchronous fast path of [`BtreeCursorOps::next`]: step to the next
     /// cell when it lives on the current leaf page.
     ///
@@ -5930,6 +6849,139 @@ impl<P: PageReader> BtCursor<P> {
         observe_cursor_cancellation(cx)?;
         top.cell_idx = next_idx;
         Ok(Some(true))
+    }
+
+    /// Synchronous fast path of [`BtreeCursorOps::table_move_to`]: a rowid
+    /// seek that the seek cache answers on a leaf the cursor already holds:
+    /// the leaf it stands on (the newest slot's, SL1 v3), or a cached leaf
+    /// its reader returns without a storage read
+    /// (`read_resident_btree_page_data`; bd-w4pr1.12, lever SL2 v3).
+    ///
+    /// The newest slot on the current leaf is tested first, as before. Only
+    /// when it does not answer does the first slot whose landing admits the
+    /// target (the slot `try_table_seek_cache` would try first) get a turn,
+    /// and only until the reader has once refused a resident image to this
+    /// cursor ([`Self::resident_seek_declined`]). The scan that finds that
+    /// slot is the probe's only one: a probe left to the general path hands
+    /// its answer on, and `try_table_seek_cache` starts there.
+    ///
+    /// Returns `Ok(None)` with the cursor untouched whenever the general path
+    /// is needed: btree debug tracing on, no slot admitting the target, a
+    /// leaf this transaction has written, a leaf the reader does not hold,
+    /// or a target the leaf cannot place (before its first cell or past its
+    /// last). A resident read that fails returns its error, as the general
+    /// path would for that slot. Otherwise it does what that cache hit does
+    /// inside `table_move_to`: search the leaf, land on it as the cursor's
+    /// whole stack, remember the landing, record the point witness, and
+    /// refresh the depth gauge.
+    pub fn try_table_seek_within_leaf(
+        &mut self,
+        cx: &Cx,
+        target_rowid: i64,
+    ) -> Result<Option<SeekResult>> {
+        let admits = |cached: &TableSeekCacheEntry| {
+            !(target_rowid < cached.rowid && cached.cell_idx == 0)
+                && target_rowid >= cached.first_rowid
+                && target_rowid <= cached.last_rowid
+        };
+        let newest_on_top = self.seek_cache.first.filter(|cached| {
+            admits(cached)
+                && self
+                    .stack
+                    .last()
+                    .is_some_and(|top| top.page_no == cached.page_no)
+        });
+        let (slot_idx, cached) = if let Some(cached) = newest_on_top {
+            (0, cached)
+        } else {
+            // The probe's one slot scan. Whatever this path then decides, the
+            // general path starts its own scan where this one stopped
+            // (`TableSeekCache::take_hint`), so a probe no slot admits scans
+            // the slots once, as it did before this fast path looked past the
+            // newest slot (SL2 v2 scanned them twice: bd-w4pr1.12).
+            let slot = self.next_table_seek_slot(target_rowid, 0);
+            self.seek_cache
+                .set_hint(target_rowid, slot.unwrap_or(TABLE_SEEK_CACHE_SLOTS));
+            let Some(slot_idx) = slot else {
+                return Ok(None);
+            };
+            if self.resident_seek_declined {
+                return Ok(None);
+            }
+            let Some(cached) = self.seek_cache.get(slot_idx) else {
+                return Ok(None);
+            };
+            (slot_idx, cached)
+        };
+        if tracing::enabled!(target: "fsqlite.btree", Level::DEBUG)
+            || self.pager.is_dirty(cached.page_no)
+        {
+            return Ok(None);
+        }
+        let on_top = self
+            .stack
+            .last()
+            .is_some_and(|top| top.page_no == cached.page_no);
+        observe_cursor_cancellation(cx)?;
+        // The leaf the cursor stands on is searched in place; any other
+        // cached leaf only when the reader already holds its image.
+        let resident = if on_top {
+            None
+        } else {
+            let Some(page_data) = self.pager.read_resident_btree_page_data(cx, cached.page_no)
+            else {
+                self.resident_seek_declined = true;
+                return Ok(None);
+            };
+            Some(self.stack_entry_for_page(cached.page_no, page_data?)?)
+        };
+        let (idx, seek_result) = {
+            let Some(leaf) = resident.as_ref().or_else(|| self.stack.last()) else {
+                return Ok(None);
+            };
+            if !(leaf.header.page_type.is_leaf() && leaf.header.page_type.is_table()) {
+                return Ok(None);
+            }
+            match Self::search_integer_key_table_leaf(cx, leaf, target_rowid)? {
+                BinarySearchResult::Found(idx) => (idx, SeekResult::Found),
+                BinarySearchResult::NotFound(idx) if idx > 0 && idx < leaf.header.cell_count => {
+                    (idx, SeekResult::NotFound)
+                }
+                BinarySearchResult::NotFound(_) => return Ok(None),
+            }
+        };
+        instrumentation::record_operation(BtreeOpType::Seek);
+        self.note_page_visit(cached.page_no);
+        if let Some(mut leaf) = resident {
+            leaf.cell_idx = idx;
+            self.stack.clear();
+            self.stack.push(leaf);
+        } else {
+            if self.stack.len() > 1 {
+                let leaf = self
+                    .stack
+                    .pop()
+                    .ok_or_else(|| FrankenError::internal("cursor stack empty"))?;
+                self.stack.clear();
+                self.stack.push(leaf);
+            }
+            if let Some(leaf) = self.stack.last_mut() {
+                leaf.cell_idx = idx;
+            }
+        }
+        self.at_eof = false;
+        self.remember_table_cache_hit(slot_idx, target_rowid, cached.page_no, idx);
+        self.record_point_witness(
+            cx,
+            WitnessKey::Cell {
+                btree_root: self.root_page,
+                leaf_page: cached.page_no,
+                tag: Self::cell_tag_from_rowid(target_rowid),
+            },
+        );
+        self.last_known_depth = Some(self.stack.len());
+        instrumentation::set_depth_gauge(self.stack.len());
+        Ok(Some(seek_result))
     }
 
     /// Move to the previous entry. Returns false if at the beginning.
@@ -6298,6 +7350,20 @@ fn record_leading_integer(record: &[u8]) -> Option<i64> {
     }
 }
 
+/// The leading field of `record`: its serial type and value bytes, when both
+/// lie within `record` (a cell's local payload may stop short of them).
+fn record_leading_field(record: &[u8]) -> Option<(u64, &[u8])> {
+    let (header_size, header_varint_len) = read_varint(record)?;
+    let header_size = usize::try_from(header_size).ok()?;
+    if header_size <= header_varint_len || header_size > record.len() {
+        return None;
+    }
+    let (serial_type, _) = read_varint(&record[header_varint_len..header_size])?;
+    let len = usize::try_from(serial_type_len(serial_type)?).ok()?;
+    let body = record.get(header_size..header_size.checked_add(len)?)?;
+    Some((serial_type, body))
+}
+
 impl LeadingIntegerProbe {
     /// The order of the stored key `record` against the probe, when its
     /// leading term decides it: what
@@ -6505,6 +7571,15 @@ impl<P: PageWriter> BtCursor<P> {
             }
 
             self.pager.free_page(cx, current_page).await?;
+            if current_page == self.root_page
+                && self.pager.secure_delete_mode() == SecureDeleteMode::Fast
+            {
+                // DROP first clears its root, then releases it. FAST preserves
+                // that cleared image only when freelist metadata already
+                // requires writing the page; freed children and overflow pages
+                // are not cleared. Keep just the hint across batched teardown.
+                self.pager.note_freed_page_zeroed(current_page);
+            }
             // bd-pirr5 (GH#371): drop the just-freed page's buffer from the pool
             // so tearing down a large (e.g. WITHOUT ROWID) table does not retain
             // the whole b-tree in the page cache and exhaust the buffer pool.
@@ -9087,6 +10162,7 @@ impl<P: PageWriter> BtCursor<P> {
 
         let old_overflow = cell_ref.overflow_page;
         ptrs.remove(cell_idx_usize);
+        let scrub_cells = self.pager.secure_delete_mode().scrubs_cells();
 
         // Defragment.
         let mut new_content_offset = self.usable_size as usize;
@@ -9135,6 +10211,9 @@ impl<P: PageWriter> BtCursor<P> {
             ptrs[i] = new_content_offset as u16;
         }
 
+        header.first_freeblock = 0;
+        header.fragmented_free_bytes = 0;
+
         // Check if new cell fits.
         let ptr_array_end_with_new = ptr_array_end + 2;
         let fits = ptr_array_end_with_new
@@ -9161,6 +10240,9 @@ impl<P: PageWriter> BtCursor<P> {
             {
                 let page_bytes = page_data.as_bytes_mut();
                 page_bytes[new_content_offset..new_end].copy_from_slice(&new_cell);
+                if scrub_cells {
+                    page_bytes[ptr_array_end_with_new..new_content_offset].fill(0);
+                }
                 header.write(page_bytes, header_offset);
                 cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
             }
@@ -9189,6 +10271,9 @@ impl<P: PageWriter> BtCursor<P> {
             })?;
         {
             let page_bytes = page_data.as_bytes_mut();
+            if scrub_cells {
+                page_bytes[ptr_array_end..new_content_offset].fill(0);
+            }
             header.write(page_bytes, header_offset);
             cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
         }
@@ -9449,6 +10534,140 @@ impl<P: PageWriter> BtCursor<P> {
         None
     }
 
+    /// The plain delete of a table-leaf cell, without waiting
+    /// (bd-w4pr1.13.20, lever SD).
+    ///
+    /// Runs when the cursor stands on a cell of a table leaf it reached from
+    /// the root, the leaf is compact with descending pointers, the cell is
+    /// neither the leaf's only nor its last one and has no overflow chain,
+    /// b-tree tracing is off, and the store holds the leaf staged as the very
+    /// image the cursor shows. The leaf then ends byte for byte as the compact
+    /// descending branch of [`Self::remove_table_cell_from_leaf_deferred`]
+    /// leaves it (only the pointers from the removed index on are written; the
+    /// others are the same there too), and the cursor stands on the removed
+    /// cell's successor, as [`BtreeCursorOps::delete`] leaves it.
+    ///
+    /// Returns `false`, having changed nothing, in every other case. Those
+    /// take the ordinary delete, which balances a drained leaf, repairs the
+    /// separator of a removed maximum, steps to the next leaf, frees overflow
+    /// chains, writes a leaf the transaction has not staged yet and reports a
+    /// malformed page.
+    pub fn try_delete_table_leaf_cell_in_staged_image(&mut self) -> bool {
+        if !self.is_table || self.at_eof || tracing::enabled!(target: "fsqlite.btree", Level::DEBUG)
+        {
+            return false;
+        }
+        let depth = self.stack.len();
+        if depth == 0 || self.stack[0].page_no != self.root_page {
+            return false;
+        }
+        let top = &self.stack[depth - 1];
+        let header = top.header;
+        let delete_idx = usize::from(top.cell_idx);
+        let cell_count = top.cell_pointers.len();
+        if header.page_type != cell::BtreePageType::LeafTable
+            || header.first_freeblock != 0
+            || header.fragmented_free_bytes != 0
+            || cell_count != usize::from(header.cell_count)
+            || delete_idx + 1 >= cell_count
+        {
+            return false;
+        }
+        let leaf_page_no = top.page_no;
+        let content_offset = header.content_offset(self.usable_size);
+        let known_descending =
+            self.descending_leaf_image == Some((leaf_page_no, top.page_data.image_token()));
+        if usize::from(top.cell_pointers[cell_count - 1]) != content_offset
+            || !(known_descending || cell_ptrs_are_descending(&top.cell_pointers))
+        {
+            return false;
+        }
+        match self.parse_cell_at_uncached(top, top.cell_idx) {
+            Ok(cell_ref) if cell_ref.overflow_page.is_none() => {}
+            _ => return false,
+        }
+        let deleted_ptr = usize::from(top.cell_pointers[delete_idx]);
+        let deleted_upper = if delete_idx == 0 {
+            self.usable_size as usize
+        } else {
+            usize::from(top.cell_pointers[delete_idx - 1])
+        };
+        let header_offset = cell::header_offset_for_page(leaf_page_no);
+        let ptr_array_start = header_offset + usize::from(header.page_type.header_size());
+        let new_ptr_array_end = ptr_array_start + (cell_count - 1) * 2;
+        // The checks the compact branch makes before it changes a byte; a page
+        // that fails one is the ordinary delete's to report.
+        if deleted_ptr >= deleted_upper || content_offset > deleted_ptr {
+            return false;
+        }
+        let deleted_size = deleted_upper - deleted_ptr;
+        let new_content_offset = content_offset + deleted_size;
+        if new_content_offset > self.usable_size as usize || new_content_offset < new_ptr_array_end
+        {
+            return false;
+        }
+        let (Ok(pointer_shift), Ok(cell_content_offset)) = (
+            u16::try_from(deleted_size),
+            u32::try_from(new_content_offset),
+        ) else {
+            return false;
+        };
+        let mut new_header = header;
+        new_header.cell_count -= 1;
+        new_header.cell_content_offset = cell_content_offset;
+        let scrub_cells = self.pager.secure_delete_mode().scrubs_cells();
+
+        // The cells below the removed one move up by its size. Their pointers
+        // follow it in the array (the order descends), so each moves one slot
+        // down and rises by that size; nothing before the removed pointer
+        // changes. Each raised pointer stays below the removed cell's upper
+        // bound, so none leaves the u16 range.
+        let mut ptrs = std::mem::take(&mut self.stack[depth - 1].cell_pointers);
+        let mut rewrite = |page: &mut [u8]| {
+            if content_offset < deleted_ptr {
+                page.copy_within(content_offset..deleted_ptr, new_content_offset);
+            }
+            new_header.write(page, header_offset);
+            let moved = &mut page[ptr_array_start + delete_idx * 2..new_ptr_array_end];
+            let (slots, _) = moved.as_chunks_mut::<2>();
+            for (slot, &ptr) in slots.iter_mut().zip(&ptrs[delete_idx + 1..]) {
+                *slot = (ptr + pointer_shift).to_be_bytes();
+            }
+            if scrub_cells {
+                // Compaction leaves copies of moved cells as well as the
+                // removed cell in the newly freed interval. Existing unused
+                // space needs no additional per-row work.
+                page[content_offset..new_content_offset].fill(0);
+            }
+        };
+        let Some(image) =
+            self.try_rewrite_top_page_in_staged_image(depth, leaf_page_no, &mut rewrite)
+        else {
+            self.stack[depth - 1].cell_pointers = ptrs;
+            return false;
+        };
+        ptrs.remove(delete_idx);
+        for ptr in &mut ptrs[delete_idx..] {
+            *ptr += pointer_shift;
+        }
+        let image_token = image.image_token();
+        let top = &mut self.stack[depth - 1];
+        top.cell_pointers = ptrs;
+        top.header = new_header;
+        top.mutation_counter = Self::page_mutation_counter(&image);
+        top.page_data = image;
+        self.descending_leaf_image = Some((leaf_page_no, image_token));
+
+        // What `with_btree_op` and `delete` do around the ordinary delete.
+        instrumentation::record_operation(BtreeOpType::Delete);
+        self.clear_rightmost_leaf_cache();
+        self.clear_seek_cache();
+        self.last_known_depth = Some(depth);
+        instrumentation::set_depth_gauge(depth);
+        self.bump_row_image_epoch();
+        true
+    }
+
     async fn remove_table_cell_from_leaf_deferred(&mut self, cx: &Cx) -> Result<(PageNumber, u16)> {
         let depth = self.stack.len();
         if depth == 0 || self.at_eof {
@@ -9476,6 +10695,8 @@ impl<P: PageWriter> BtCursor<P> {
         let top = &self.stack[depth - 1];
         let header_offset = cell::header_offset_for_page(leaf_page_no);
         let mut header = top.header;
+        let known_descending =
+            self.descending_leaf_image == Some((leaf_page_no, top.page_data.image_token()));
         let mut ptrs = take_pooled_cell_pointers();
         ptrs.extend_from_slice(&top.cell_pointers);
         let original_len = ptrs.len();
@@ -9491,9 +10712,11 @@ impl<P: PageWriter> BtCursor<P> {
         }
         // A leaf whose pointers descend keeps its lowest cell last, so the
         // content-offset check reads that one pointer; only a leaf whose
-        // pointer order was disturbed needs the scan for the minimum.
+        // pointer order was disturbed needs the scan for the minimum. The
+        // image the previous compact descending delete wrote is known to
+        // descend and is not scanned again.
         let no_free_gaps = header.first_freeblock == 0 && header.fragmented_free_bytes == 0;
-        let ptrs_descend = no_free_gaps && cell_ptrs_are_descending(&ptrs);
+        let ptrs_descend = no_free_gaps && (known_descending || cell_ptrs_are_descending(&ptrs));
         let lowest_ptr = if ptrs_descend {
             ptrs.last().copied()
         } else {
@@ -9513,6 +10736,7 @@ impl<P: PageWriter> BtCursor<P> {
         // SQLite-compatible shape over a fragile micro-optimization.
         let ptr_array_end =
             header_offset + usize::from(header.page_type.header_size()) + (ptrs.len() - 1) * 2;
+        let scrub_cells = self.pager.secure_delete_mode().scrubs_cells();
 
         // Every check that can refuse the delete runs before any page byte
         // changes: the compact branches only plan the move, which may then be
@@ -9803,6 +11027,9 @@ impl<P: PageWriter> BtCursor<P> {
 
                 header.write(page_bytes, header_offset);
                 cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
+                if scrub_cells {
+                    page_bytes[ptr_array_end..new_content_offset].fill(0);
+                }
             }
             self.defrag_cells_scratch = cells_to_move;
             TableLeafDeleteRewrite::Rebuilt(page_data)
@@ -9821,6 +11048,9 @@ impl<P: PageWriter> BtCursor<P> {
                     }
                     header.write(page_bytes, header_offset);
                     cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
+                    if scrub_cells {
+                        page_bytes[old_content_offset..new_content_offset].fill(0);
+                    }
                 };
                 if let Some(rewritten) =
                     self.try_rewrite_top_page_in_staged_image(depth, leaf_page_no, &mut move_cells)
@@ -9844,6 +11074,12 @@ impl<P: PageWriter> BtCursor<P> {
                 return Err(error);
             }
         }
+        // The descending branch leaves the leaf compact and its pointers still
+        // strictly descending: those before the removed one are unchanged, and
+        // each after it rises by the removed size and so stays below its
+        // predecessor (the cell after the removed one ended where it began).
+        self.descending_leaf_image = (compact_cell_area && ptrs_descend)
+            .then(|| (leaf_page_no, refreshed_page_data.image_token()));
 
         let new_count = header.cell_count;
         let mutation_counter = Self::page_mutation_counter(&refreshed_page_data);
@@ -10015,8 +11251,10 @@ impl<P: PageWriter> BtCursor<P> {
                 return Err(err);
             }
 
-            // Fill the now-unused space with zeros for cleanliness (optional, but good for reproducibility/debugging).
-            if new_content_offset > ptr_array_end {
+            // Both secure modes erase the removed key and the stale copies
+            // left behind by compaction on this already-modified page.
+            if self.pager.secure_delete_mode().scrubs_cells() && new_content_offset > ptr_array_end
+            {
                 page_bytes[ptr_array_end..new_content_offset].fill(0);
             }
 
@@ -10164,6 +11402,31 @@ impl<P: PageWriter> BtCursor<P> {
         let varint_len = write_varint(&mut new_cell[4..], new_rowid as u64);
         let new_cell = &new_cell[..4 + varint_len];
 
+        // bd-w4pr1.13.20, lever J: a new rowid whose varint is exactly as long
+        // as the stored one is written over it. The cell keeps its size and
+        // its place, so no other cell and no pointer moves; the rewrite below
+        // (sizing, sorting and moving every cell of the page) cost ~50k
+        // instructions per repaired leaf maximum. A varint of another length
+        // still takes that rewrite.
+        let rowid_offset = usize::from(Self::read_stack_entry_cell_pointer_inline(
+            &entry,
+            separator_idx,
+        )?) + 4;
+        let stored_varint_len = entry
+            .page_data
+            .as_bytes()
+            .get(rowid_offset..self.usable_size as usize)
+            .and_then(read_varint)
+            .map(|(_, len)| len);
+        if stored_varint_len == Some(varint_len) {
+            let mut page_data = entry.page_data.clone();
+            drop(entry);
+            page_data.as_bytes_mut()[rowid_offset..rowid_offset + varint_len]
+                .copy_from_slice(&new_cell[4..]);
+            self.pager.write_page_data(cx, page_no, page_data).await?;
+            return self.refresh_stack_entries_showing(cx, page_no).await;
+        }
+
         let page_no = entry.page_no;
         let header_offset = cell::header_offset_for_page(page_no);
         let mut page_data = self.pager.read_btree_page_data(cx, page_no).await?;
@@ -10264,7 +11527,12 @@ impl<P: PageWriter> BtCursor<P> {
         }
 
         self.pager.write_page_data(cx, page_no, page_data).await?;
+        self.refresh_stack_entries_showing(cx, page_no).await
+    }
 
+    /// Reload `page_no` and put its fresh image into every stack entry that
+    /// shows it, each keeping its cell index.
+    async fn refresh_stack_entries_showing(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
         let refreshed = self.reload_page_fresh(cx, page_no).await?;
         for stack_entry in &mut self.stack {
             if stack_entry.page_no == page_no {
@@ -10477,6 +11745,90 @@ impl<P: PageWriter> BtCursor<P> {
         Ok(Some(result))
     }
 
+    /// bd-i3csr.4: appends the row to the cached rightmost leaf inside the
+    /// transaction's staged image of that leaf, when that staged image is the
+    /// one the cache holds (equal `PageData::image_token`: clones keep it,
+    /// every mutable access replaces it, so equal tokens mean equal bytes).
+    ///
+    /// The cache and the stack's top entry (which the previous append left
+    /// sharing the image) give up their references before the bytes change,
+    /// so the staged image is normally their only holder and takes the row
+    /// with no page copy and no page write; any other holder (a savepoint's
+    /// before-image) keeps its bytes through the copy-on-write of
+    /// `as_bytes_mut`. Afterwards the cache shares the staged image, and so
+    /// does the stack entry when the row did not go in.
+    ///
+    /// `NotStaged` when the store holds no unpublished staged image of the
+    /// leaf or a different one: nothing changed, and the caller appends to the
+    /// cache's own copy and writes it.
+    fn try_append_in_staged_image_of_cached_leaf(
+        &mut self,
+        cached: &mut RightmostLeafCacheEntry,
+        rowid: i64,
+        payload: &[u8],
+    ) -> Result<StagedLeafAppend> {
+        let page_no = cached.page_no;
+        let shown_token = cached.page_data.image_token();
+        let usable_size = self.usable_size;
+        let stack_top = self.stack.last_mut().filter(|entry| {
+            entry.page_no == page_no && entry.page_data.image_token() == shown_token
+        });
+        let mut stack_shown = stack_top
+            .map(|entry| std::mem::replace(&mut entry.page_data, PageData::from_vec(Vec::new())));
+        let restore_stack = stack_shown.is_some();
+        let mut shown = Some(std::mem::replace(
+            &mut cached.page_data,
+            PageData::from_vec(Vec::new()),
+        ));
+        let mut header = cached.header;
+        let mut outcome = None;
+        let mut append_staged = |staged: &mut PageData| {
+            if outcome.is_some() || staged.image_token() != shown_token {
+                return;
+            }
+            drop(shown.take());
+            drop(stack_shown.take());
+            let appended = Self::try_append_table_leaf_payload_in_place_no_overflow_mutate_only(
+                usable_size,
+                page_no,
+                staged,
+                &mut header,
+                rowid,
+                payload,
+            );
+            outcome = Some((appended, staged.clone()));
+        };
+        self.pager
+            .try_mutate_staged_page_data(page_no, &mut append_staged);
+        let Some((appended, image)) = outcome else {
+            if let Some(page_data) = shown {
+                cached.page_data = page_data;
+            }
+            if let (Some(page_data), Some(entry)) = (stack_shown, self.stack.last_mut()) {
+                entry.page_data = page_data;
+            }
+            return Ok(StagedLeafAppend::NotStaged);
+        };
+        let appended = match appended {
+            Ok(appended) => appended,
+            Err(error) => {
+                // The append refused before changing a byte.
+                if restore_stack && let Some(entry) = self.stack.last_mut() {
+                    entry.page_data = image.clone();
+                }
+                cached.page_data = image;
+                return Err(error);
+            }
+        };
+        if appended.is_some() {
+            cached.header = header;
+        } else if restore_stack && let Some(entry) = self.stack.last_mut() {
+            entry.page_data = image.clone();
+        }
+        cached.page_data = image;
+        Ok(StagedLeafAppend::Ran(appended))
+    }
+
     async fn try_append_on_cached_rightmost_leaf(
         &mut self,
         cx: &Cx,
@@ -10491,17 +11843,22 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(false);
         }
 
-        if let Some((insert_idx, new_cell_offset)) = self
-            .try_append_table_leaf_payload_in_place_no_overflow(
-                cx,
-                cached.page_no,
-                &mut cached.page_data,
-                &mut cached.header,
-                rowid,
-                data,
-            )
-            .await?
-        {
+        let appended =
+            match self.try_append_in_staged_image_of_cached_leaf(&mut cached, rowid, data)? {
+                StagedLeafAppend::Ran(appended) => appended,
+                StagedLeafAppend::NotStaged => {
+                    self.try_append_table_leaf_payload_in_place_no_overflow(
+                        cx,
+                        cached.page_no,
+                        &mut cached.page_data,
+                        &mut cached.header,
+                        rowid,
+                        data,
+                    )
+                    .await?
+                }
+            };
+        if let Some((insert_idx, new_cell_offset)) = appended {
             self.last_insert_rowid = Some(rowid);
             self.last_known_depth = Some(cached.tree_depth);
             cached.rowid = rowid;
@@ -11970,6 +13327,7 @@ impl<P: PageWriter> BtCursor<P> {
             entry: entry.clone(),
             tree_depth,
             dirty: false,
+            secure_delete_mode: self.pager.secure_delete_mode(),
             compact_cell_area: TableLeafDeleteRun::has_compact_cell_area_for_entry(
                 entry,
                 self.usable_size,
@@ -12020,7 +13378,16 @@ impl<P: PageWriter> BtCursor<P> {
         if run.is_dirty() {
             let materialize_start = instrumentation::profile_start();
             let leaf_page = run.leaf_page();
+            let erase_start = run
+                .secure_delete_mode()
+                .scrubs_cells()
+                .then(|| run.entry.header.content_offset(self.usable_size));
             run.materialize_deletions(self.usable_size)?;
+            if let Some(erase_start) = erase_start {
+                let content_offset = run.entry.header.content_offset(self.usable_size);
+                run.entry.page_data.as_bytes_mut()[erase_start..content_offset].fill(0);
+                run.entry.mutation_counter = run.entry.page_data.image_token();
+            }
             instrumentation::record_delete_leaf_run_materialize(materialize_start);
             let write_start = instrumentation::profile_start();
             self.pager
@@ -12067,7 +13434,10 @@ impl<P: PageWriter> BtCursor<P> {
 
         let leaf_page_no = top.page_no;
         let cell_idx = top.cell_idx;
-        let cell = self.parse_cell_at(top, cell_idx)?;
+        // Parsed without the cell-slot cache: the rewrite below gives the
+        // leaf a new image token, so a slot cached under the current one
+        // could never be read again (bd-w4pr1.13.20).
+        let cell = self.parse_cell_at_uncached(top, cell_idx)?;
         if cell.rowid != Some(rowid)
             || cell.overflow_page.is_some()
             || usize::try_from(cell.payload_size).ok() != Some(payload.len())
@@ -12307,6 +13677,26 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(None);
         };
         self.local_leaf_table_cell_span(top, top.cell_idx)
+    }
+
+    /// [`Self::current_local_table_row_span`] together with the payload bytes
+    /// [`Self::current_page_span`] would return for that span: what a column
+    /// read on a row new to it needs, in one call. `None` in the same cases as
+    /// either of the two.
+    #[allow(clippy::type_complexity)]
+    pub fn current_local_table_row(&self) -> Result<Option<(i64, std::ops::Range<usize>, &[u8])>> {
+        if self.at_eof {
+            return Ok(None);
+        }
+        let Some(top) = self.stack.last() else {
+            return Ok(None);
+        };
+        Ok(self
+            .local_leaf_table_cell_span(top, top.cell_idx)?
+            .and_then(|(rowid, payload)| {
+                let bytes = top.usable_bytes().get(payload.clone())?;
+                Some((rowid, payload, bytes))
+            }))
     }
 
     /// Bytes `span` of the page the cursor stands on, or `None` when the
@@ -13410,6 +14800,11 @@ mod tests {
     struct SeekProbeStore {
         inner: MemPageStore,
         read_pages: Rc<RefCell<Vec<PageNumber>>>,
+        /// Pages `read_resident_btree_page_data` answers; none unless a test
+        /// adds them. `read_pages` records only the async reads.
+        resident: Rc<RefCell<Vec<u32>>>,
+        /// A page whose resident answer is an error.
+        resident_refusal: Rc<RefCell<Option<u32>>>,
     }
 
     impl SeekProbeStore {
@@ -13417,6 +14812,8 @@ mod tests {
             Self {
                 inner,
                 read_pages: Rc::new(RefCell::new(Vec::new())),
+                resident: Rc::new(RefCell::new(Vec::new())),
+                resident_refusal: Rc::new(RefCell::new(None)),
             }
         }
 
@@ -13440,6 +14837,26 @@ mod tests {
                 self.read_pages.borrow_mut().push(page_no);
                 self.inner.read_page(cx, page_no).await
             }
+        }
+
+        fn read_resident_btree_page_data(
+            &self,
+            _cx: &Cx,
+            page_no: PageNumber,
+        ) -> Option<Result<PageData>> {
+            if *self.resident_refusal.borrow() == Some(page_no.get()) {
+                return Some(Err(FrankenError::internal("resident page refused")));
+            }
+            if !self.resident.borrow().contains(&page_no.get()) {
+                return None;
+            }
+            Some(
+                self.inner
+                    .pages
+                    .get(&page_no.get())
+                    .map(|page| PageData::from_vec(page.clone()))
+                    .ok_or_else(|| FrankenError::internal("page not found")),
+            )
         }
 
         fn prefetch_page_hint(&self, cx: &Cx, page_no: PageNumber) {
@@ -13635,6 +15052,10 @@ mod tests {
 
     #[allow(clippy::manual_async_fn)]
     impl PageWriter for ImageKeepingStore {
+        fn secure_delete_mode(&self) -> SecureDeleteMode {
+            self.inner.secure_delete_mode()
+        }
+
         fn write_page<'a>(
             &'a mut self,
             cx: &'a Cx,
@@ -14838,6 +16259,212 @@ mod tests {
         });
     }
 
+    /// bd-prkvt: the leftmost-path estimate is exact for an empty or
+    /// single-page tree and, for an appended multi-level tree, lands within 2x
+    /// of the true count, far above what the root page alone holds.
+    #[test]
+    fn test_estimate_entry_count_follows_the_leftmost_path() {
+        run_async(async {
+            let cx = Cx::new();
+            let root = PageNumber::new(2).unwrap();
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let mut cursor = BtCursor::new(store, root, USABLE, true);
+            assert_eq!(cursor.estimate_entry_count(&cx).await.unwrap(), 0);
+
+            let payload = vec![0x5Au8; 24];
+            for rowid in 1..=10_i64 {
+                cursor.table_insert(&cx, rowid, &payload).await.unwrap();
+            }
+            assert_eq!(cursor.estimate_entry_count(&cx).await.unwrap(), 10);
+
+            let row_count = 30_000_i64;
+            for rowid in 11..=row_count {
+                cursor.table_insert(&cx, rowid, &payload).await.unwrap();
+            }
+            assert!(cursor.measure_tree_depth(&cx).await.unwrap() >= 2);
+            let estimate = i64::try_from(cursor.estimate_entry_count(&cx).await.unwrap()).unwrap();
+            assert!(
+                (row_count / 2..=row_count * 2).contains(&estimate),
+                "estimate {estimate} for {row_count} rows"
+            );
+            // The walk leaves the cursor usable.
+            assert!(cursor.first(&cx).await.unwrap());
+            assert_eq!(cursor.count_all_rows(&cx).await.unwrap(), row_count);
+        });
+    }
+
+    /// bd-prkvt: a leaf root gives its entries per run of equal leading values;
+    /// a two-valued key over many pages gives a large estimate, and over a few
+    /// pages one leaf's entries per run; a thousand-valued key over many pages
+    /// gives no estimate (its separators mostly differ), as does a table.
+    #[test]
+    fn test_estimate_rows_per_leading_key_separates_repeated_from_spread_keys() {
+        run_async(async {
+            async fn index_with(
+                cx: &Cx,
+                keys: impl Iterator<Item = (i64, i64)>,
+            ) -> BtCursor<MemPageStore> {
+                let root = pn(2);
+                let store = MemPageStore::with_empty_index(root, USABLE);
+                let mut cursor = BtCursor::new(store, root, USABLE, false);
+                for (value, rowid) in keys {
+                    let key = serialize_record(&[
+                        SqliteValue::Integer(value),
+                        SqliteValue::Integer(rowid),
+                    ]);
+                    cursor.index_insert(cx, &key).await.unwrap();
+                }
+                cursor
+            }
+
+            let cx = Cx::new();
+            let mut leaf = index_with(
+                &cx,
+                [(3, 1), (1, 2), (1, 3), (2, 4), (1, 5), (3, 6)].into_iter(),
+            )
+            .await;
+            assert_eq!(
+                leaf.estimate_rows_per_leading_key(&cx).await.unwrap(),
+                Some(2)
+            );
+
+            let mut flag = index_with(&cx, (1..=20_000_i64).map(|rowid| (rowid % 2, rowid))).await;
+            assert!(flag.measure_tree_depth(&cx).await.unwrap() >= 2);
+            let estimate = flag.estimate_rows_per_leading_key(&cx).await.unwrap();
+            assert!(
+                estimate.is_some_and(|rows| rows >= 2_000),
+                "two-valued key over 20,000 entries: {estimate:?}"
+            );
+
+            let mut small_flag =
+                index_with(&cx, (1..=1_500_i64).map(|rowid| (rowid % 2, rowid))).await;
+            let estimate = small_flag.estimate_rows_per_leading_key(&cx).await.unwrap();
+            assert!(
+                estimate.is_some_and(|rows| rows >= 50),
+                "two-valued key over a few pages: {estimate:?}"
+            );
+
+            let mut spread =
+                index_with(&cx, (1..=20_000_i64).map(|rowid| (rowid % 1000, rowid))).await;
+            assert_eq!(
+                spread.estimate_rows_per_leading_key(&cx).await.unwrap(),
+                None
+            );
+
+            let root = pn(2);
+            let mut table = BtCursor::new(
+                MemPageStore::with_empty_table(root, USABLE),
+                root,
+                USABLE,
+                true,
+            );
+            assert_eq!(
+                table.estimate_rows_per_leading_key(&cx).await.unwrap(),
+                None
+            );
+        });
+    }
+
+    /// bd-2fb53: counting from a position up to a bound agrees with the
+    /// entries' own order, for bounds inside one leaf, across leaves and
+    /// interior separators, at both ends, past the end, and the leading NULL
+    /// keys, whatever seek placed the cursor.
+    #[test]
+    fn test_count_entries_before_matches_the_key_order() {
+        // A key edge: the leading value (None = NULL) and whether it is passed
+        // over (a start) or included (a bound).
+        type Edge = Option<(Option<i64>, bool)>;
+        // Index order of a leading key: NULL first, then integers.
+        fn rank(value: Option<i64>) -> (u8, i64) {
+            value.map_or((0, 0), |v| (1, v))
+        }
+        fn record(value: Option<i64>) -> Vec<u8> {
+            serialize_record(&[value.map_or(SqliteValue::Null, SqliteValue::Integer)])
+        }
+        run_async(async {
+            let cx = Cx::new();
+            let root = pn(2);
+            let store = MemPageStore::with_empty_index(root, USABLE);
+            let mut cursor = BtCursor::new(store, root, USABLE, false);
+            let mut values = Vec::new();
+            for rowid in 1..=6_000_i64 {
+                let value = (rowid % 11 != 0).then_some((rowid * 37) % 500);
+                values.push(value);
+                let key = serialize_record(&[
+                    value.map_or(SqliteValue::Null, SqliteValue::Integer),
+                    SqliteValue::Integer(rowid),
+                ]);
+                cursor.index_insert(&cx, &key).await.unwrap();
+            }
+            assert!(cursor.measure_tree_depth(&cx).await.unwrap() >= 2);
+
+            // (start: None = the first entry, Some((key, past)) = a seek to the first
+            // key >= it, or > it when `past`), (bound, inclusive).
+            let cases: &[(Edge, Edge)] = &[
+                (None, Some((None, true))),
+                (Some((None, true)), None),
+                (Some((Some(100), false)), Some((Some(200), true))),
+                (Some((Some(100), true)), Some((Some(200), false))),
+                (Some((Some(250), false)), Some((Some(250), true))),
+                (Some((Some(250), false)), Some((Some(250), false))),
+                (Some((Some(0), false)), Some((Some(499), true))),
+                (Some((Some(499), false)), None),
+                (Some((Some(600), false)), None),
+                (None, None),
+                (Some((None, true)), Some((Some(0), false))),
+                (Some((Some(-5), false)), Some((Some(3), true))),
+            ];
+            for &(start, bound) in cases {
+                match start {
+                    None => {
+                        cursor.first(&cx).await.unwrap();
+                    }
+                    Some((key, false)) => {
+                        cursor.index_move_to(&cx, &record(key)).await.unwrap();
+                    }
+                    Some((key, true)) => {
+                        cursor
+                            .index_move_to_upper_bound(&cx, &record(key))
+                            .await
+                            .unwrap();
+                    }
+                }
+                let bound_record = bound.map(|(key, _)| record(key));
+                let counted = cursor
+                    .count_entries_before(
+                        &cx,
+                        bound_record.as_deref(),
+                        bound.is_some_and(|(_, inclusive)| inclusive),
+                    )
+                    .await
+                    .unwrap();
+                let expected = values
+                    .iter()
+                    .filter(|&&value| {
+                        start.is_none_or(|(key, past)| {
+                            if past {
+                                rank(value) > rank(key)
+                            } else {
+                                rank(value) >= rank(key)
+                            }
+                        }) && bound.is_none_or(|(key, inclusive)| {
+                            if inclusive {
+                                rank(value) <= rank(key)
+                            } else {
+                                rank(value) < rank(key)
+                            }
+                        })
+                    })
+                    .count();
+                assert_eq!(
+                    counted,
+                    u64::try_from(expected).unwrap(),
+                    "start {start:?}, bound {bound:?}"
+                );
+            }
+        });
+    }
+
     /// Helper: build a leaf table page with sorted (rowid, payload) entries.
     fn build_leaf_table(entries: &[(i64, &[u8])]) -> Vec<u8> {
         let mut page = vec![0u8; USABLE as usize];
@@ -15605,87 +17232,116 @@ mod tests {
         });
     }
 
-    #[test]
-    fn test_table_seek_cache_uses_four_slot_lru() {
-        run_async(async {
-            let mut store = MemPageStore::new(USABLE);
+    /// Page of leaf `i` in [`seek_cache_slots_tree`].
+    fn seek_cache_leaf_page(i: usize) -> PageNumber {
+        pn(u32::try_from(3 + i).unwrap())
+    }
+
+    /// First rowid of leaf `i` in [`seek_cache_slots_tree`]; the leaf also
+    /// holds that rowid + 5 and + 10, and the next leaf starts 20 above it.
+    fn seek_cache_leaf_first(i: usize) -> i64 {
+        i64::try_from(20 * i + 10).unwrap()
+    }
+
+    /// `leaves` table leaves under root page 2, leaf `i` on page `3 + i`, so a
+    /// test can use more leaves than the seek cache has slots whatever
+    /// `TABLE_SEEK_CACHE_SLOTS` is.
+    fn seek_cache_slots_tree(leaves: usize) -> MemPageStore {
+        let mut store = MemPageStore::new(USABLE);
+        let children: Vec<(PageNumber, i64)> = (0..leaves - 1)
+            .map(|i| (seek_cache_leaf_page(i), seek_cache_leaf_first(i) + 10))
+            .collect();
+        store.pages.insert(
+            2,
+            build_interior_table(&children, seek_cache_leaf_page(leaves - 1)),
+        );
+        for i in 0..leaves {
+            let first = seek_cache_leaf_first(i);
             store.pages.insert(
-                2,
-                build_interior_table(&[(pn(3), 20), (pn(4), 40), (pn(5), 60), (pn(6), 80)], pn(7)),
+                u32::try_from(3 + i).unwrap(),
+                build_leaf_table(&[(first, b"a"), (first + 5, b"b"), (first + 10, b"c")]),
             );
-            store
-                .pages
-                .insert(3, build_leaf_table(&[(10, b"a"), (20, b"b")]));
-            store
-                .pages
-                .insert(4, build_leaf_table(&[(30, b"c"), (40, b"d")]));
-            store
-                .pages
-                .insert(5, build_leaf_table(&[(50, b"e"), (60, b"f")]));
-            store
-                .pages
-                .insert(6, build_leaf_table(&[(70, b"g"), (80, b"h")]));
-            store
-                .pages
-                .insert(7, build_leaf_table(&[(90, b"i"), (100, b"j")]));
+        }
+        store
+    }
 
+    #[test]
+    fn test_table_seek_cache_is_an_lru_of_its_slots() {
+        run_async(async {
+            let slots = TABLE_SEEK_CACHE_SLOTS;
+            let page = seek_cache_leaf_page;
+            let first = seek_cache_leaf_first;
+            let cached = |cursor: &BtCursor<SeekProbeStore>| -> Vec<PageNumber> {
+                cursor
+                    .seek_cache
+                    .iter()
+                    .flatten()
+                    .map(|entry| entry.page_no)
+                    .collect()
+            };
             let cx = Cx::new();
-            let mut cursor = BtCursor::new(SeekProbeStore::new(store), pn(2), USABLE, true);
+            let mut cursor = BtCursor::new(
+                SeekProbeStore::new(seek_cache_slots_tree(slots + 1)),
+                pn(2),
+                USABLE,
+                true,
+            );
 
-            for rowid in [10_i64, 30, 50, 70] {
-                assert!(cursor.table_move_to(&cx, rowid).await.unwrap().is_found());
+            // Landing on the first `slots` leaves fills the cache, newest first.
+            for i in 0..slots {
+                assert!(
+                    cursor
+                        .table_move_to(&cx, first(i))
+                        .await
+                        .unwrap()
+                        .is_found()
+                );
             }
+            let mut expected: Vec<PageNumber> = (0..slots).rev().map(page).collect();
+            assert_eq!(cached(&cursor), expected);
 
-            let cache_pages: Vec<PageNumber> = cursor
-                .seek_cache
-                .iter()
-                .flatten()
-                .map(|entry| entry.page_no)
-                .collect();
-            assert_eq!(cache_pages, vec![pn(6), pn(5), pn(4), pn(3)]);
-
+            // A gap inside the least recent leaf reads only that leaf and
+            // moves it to the front.
             cursor.pager.clear_reads();
-            let result = cursor.table_move_to(&cx, 15).await.unwrap();
+            let result = cursor.table_move_to(&cx, first(0) + 3).await.unwrap();
             assert!(!result.is_found());
-            assert_eq!(cursor.pager.read_pages(), vec![pn(3)]);
-            let cache_pages: Vec<PageNumber> = cursor
-                .seek_cache
-                .iter()
-                .flatten()
-                .map(|entry| entry.page_no)
-                .collect();
-            assert_eq!(cache_pages, vec![pn(3), pn(6), pn(5), pn(4)]);
+            assert_eq!(cursor.pager.read_pages(), vec![page(0)]);
+            expected.pop();
+            expected.insert(0, page(0));
+            assert_eq!(cached(&cursor), expected);
 
+            // bd-w4pr1.13.13: no cached leaf can hold the last leaf's first
+            // rowid, so none is loaded on the way to the root. The new landing
+            // takes the front and the least recent slot (leaf 1) goes.
             cursor.pager.clear_reads();
-            assert!(cursor.table_move_to(&cx, 90).await.unwrap().is_found());
-            // bd-w4pr1.13.13: none of the four cached leaves can hold 90, so
-            // none is loaded on the way to the root (was 6, 5, 4, 2, 7).
-            assert_eq!(cursor.pager.read_pages(), vec![pn(2), pn(7)]);
-            let cache_pages: Vec<PageNumber> = cursor
-                .seek_cache
-                .iter()
-                .flatten()
-                .map(|entry| entry.page_no)
-                .collect();
-            assert_eq!(cache_pages, vec![pn(7), pn(3), pn(6), pn(5)]);
+            assert!(
+                cursor
+                    .table_move_to(&cx, first(slots))
+                    .await
+                    .unwrap()
+                    .is_found()
+            );
+            assert_eq!(cursor.pager.read_pages(), vec![pn(2), page(slots)]);
+            expected.pop();
+            expected.insert(0, page(slots));
+            assert_eq!(cached(&cursor), expected);
+            assert!(!expected.contains(&page(1)));
 
+            // The evicted leaf is found through the root again; leaf 0, which
+            // holds the rowids below it, is not loaded for it.
             cursor.pager.clear_reads();
-            let result = cursor.table_move_to(&cx, 35).await.unwrap();
+            let result = cursor.table_move_to(&cx, first(1) + 3).await.unwrap();
             assert!(!result.is_found());
-            // Leaf 3 holds 10..=20 and is not loaded for 35 (was 3, 2, 4).
-            assert_eq!(cursor.pager.read_pages(), vec![pn(2), pn(4)]);
-            let cache_pages: Vec<PageNumber> = cursor
-                .seek_cache
-                .iter()
-                .flatten()
-                .map(|entry| entry.page_no)
-                .collect();
-            assert_eq!(cache_pages, vec![pn(4), pn(7), pn(3), pn(6)]);
+            assert_eq!(cursor.pager.read_pages(), vec![pn(2), page(1)]);
+            expected.pop();
+            expected.insert(0, page(1));
+            assert_eq!(cached(&cursor), expected);
 
+            // A leaf still cached is read alone.
             cursor.pager.clear_reads();
-            let result = cursor.table_move_to(&cx, 12).await.unwrap();
+            let result = cursor.table_move_to(&cx, first(0) + 7).await.unwrap();
             assert!(!result.is_found());
-            assert_eq!(cursor.pager.read_pages(), vec![pn(3)]);
+            assert_eq!(cursor.pager.read_pages(), vec![page(0)]);
         });
     }
 
@@ -15727,7 +17383,6 @@ mod tests {
                     .iter()
                     .flatten()
                     .find(|entry| entry.page_no == pn(page))
-                    .copied()
                     .unwrap()
             };
 
@@ -15774,11 +17429,150 @@ mod tests {
         });
     }
 
+    /// bd-w4pr1.12 (lever SC8): the seek cache takes no more room in the
+    /// cursor than the four inline slots it replaced (eight inline slots
+    /// would), and only a second leaf allocates the out-of-line slots: seeks
+    /// that stay on one leaf allocate nothing.
+    #[test]
+    fn test_table_seek_cache_keeps_the_cursor_footprint() {
+        let four_inline = std::mem::size_of::<[Option<TableSeekCacheEntry>; 4]>();
+        let cache = std::mem::size_of::<TableSeekCache>();
+        eprintln!(
+            "SC8 sizes: BtCursor<MemPageStore> {} B, TableSeekCache {cache} B, four inline slots {four_inline} B",
+            std::mem::size_of::<BtCursor<MemPageStore>>()
+        );
+        assert!(
+            cache <= four_inline,
+            "the seek cache holds {cache} B in the cursor, more than four inline slots' {four_inline} B"
+        );
+
+        run_async(async {
+            let first = seek_cache_leaf_first;
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(
+                SeekProbeStore::new(seek_cache_slots_tree(3)),
+                pn(2),
+                USABLE,
+                true,
+            );
+            for target in [first(0), first(0) + 5, first(0) + 10, first(0) + 5] {
+                assert!(cursor.table_move_to(&cx, target).await.unwrap().is_found());
+            }
+            assert!(cursor.seek_cache.first.is_some());
+            assert!(cursor.seek_cache.rest.is_none());
+            assert!(
+                cursor
+                    .table_move_to(&cx, first(1))
+                    .await
+                    .unwrap()
+                    .is_found()
+            );
+            assert!(cursor.seek_cache.rest.is_some());
+            let pages: Vec<PageNumber> = cursor
+                .seek_cache
+                .iter()
+                .flatten()
+                .map(|entry| entry.page_no)
+                .collect();
+            assert_eq!(
+                pages,
+                vec![seek_cache_leaf_page(1), seek_cache_leaf_page(0)]
+            );
+            // Clearing keeps the allocation and empties every slot.
+            cursor.clear_seek_cache();
+            assert!(cursor.seek_cache.iter().all(|slot| slot.is_none()));
+            assert!(cursor.seek_cache.rest.is_some());
+        });
+    }
+
     /// bd-w4pr1.13.13: a cached leaf is loaded only when the target can be on
     /// it. Random probes over more leaves than the cache has slots used to
     /// load every cached leaf before descending from the root.
     #[test]
     fn test_table_seek_cache_loads_only_a_leaf_that_can_hold_the_target() {
+        run_async(async {
+            let slots = TABLE_SEEK_CACHE_SLOTS;
+            let page = seek_cache_leaf_page;
+            let first = seek_cache_leaf_first;
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(
+                SeekProbeStore::new(seek_cache_slots_tree(slots + 2)),
+                pn(2),
+                USABLE,
+                true,
+            );
+            // The first `slots` leaves fill the slots; the last two are not
+            // cached.
+            for i in 0..slots {
+                assert!(
+                    cursor
+                        .table_move_to(&cx, first(i))
+                        .await
+                        .unwrap()
+                        .is_found()
+                );
+            }
+
+            // (target, found, pages read). A cached leaf is the only page read
+            // for a key or a gap inside it, whichever slot it is in and
+            // wherever in the leaf the earlier seek landed: each leaf's last
+            // key, a gap in every leaf but the last going down, and the middle
+            // key of every leaf but the first going up. No two probes in a row
+            // share a leaf (a seek on the cursor's own leaf reads no page).
+            let cached_probes: Vec<(i64, bool, Vec<PageNumber>)> = (0..slots)
+                .map(|i| (first(i) + 10, true, vec![page(i)]))
+                .chain(
+                    (0..slots - 1)
+                        .rev()
+                        .map(|i| (first(i) + 2, false, vec![page(i)])),
+                )
+                .chain((1..slots).map(|i| (first(i) + 5, true, vec![page(i)])))
+                .collect();
+            for (target, found, reads) in cached_probes {
+                cursor.pager.clear_reads();
+                let result = cursor.table_move_to(&cx, target).await.unwrap();
+                assert_eq!(result.is_found(), found, "target {target}");
+                assert_eq!(cursor.pager.read_pages(), reads, "target {target}");
+            }
+
+            // A target on no cached leaf reads the root and its own leaf, and
+            // nothing else: below every cached leaf, between two of them, on
+            // a leaf that is not cached, and past the last one.
+            for (target, found, leaf) in [
+                (5_i64, false, page(0)),
+                (first(1) - 5, false, page(1)),
+                (first(slots) + 10, true, page(slots)),
+                (first(slots) + 5, true, page(slots)),
+                (first(slots + 1), true, page(slots + 1)),
+                (first(slots + 1) + 400, false, page(slots + 1)),
+            ] {
+                // Refill the slots with the first `slots` leaves so the
+                // target's own leaf is not among them (first(1) - 5 lands on
+                // leaf 1 through the root: the gap before its first key is not
+                // a landing).
+                for i in 0..slots {
+                    assert!(
+                        cursor
+                            .table_move_to(&cx, first(i))
+                            .await
+                            .unwrap()
+                            .is_found()
+                    );
+                }
+                cursor.pager.clear_reads();
+                let result = cursor.table_move_to(&cx, target).await.unwrap();
+                assert_eq!(result.is_found(), found, "target {target}");
+                assert_eq!(
+                    cursor.pager.read_pages(),
+                    vec![pn(2), leaf],
+                    "target {target}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn test_load_page_takes_a_resident_page_without_the_async_read() {
         run_async(async {
             let mut store = MemPageStore::new(USABLE);
             store.pages.insert(
@@ -15809,55 +17603,38 @@ mod tests {
             }
 
             let cx = Cx::new();
-            let mut cursor = BtCursor::new(SeekProbeStore::new(store), pn(2), USABLE, true);
-            // Leaves 3, 4, 5 and 6 fill the four slots; 6 is the most recent.
-            for rowid in [10_i64, 30, 50, 70] {
-                assert!(cursor.table_move_to(&cx, rowid).await.unwrap().is_found());
-            }
-
-            // (target, found, pages read). A cached leaf is the only page read
-            // for a key or a gap inside it, whichever slot it is in and
-            // wherever in the leaf the earlier seek landed.
+            let probe = SeekProbeStore::new(store);
+            probe.resident.borrow_mut().extend([2_u32, 3, 4]);
+            let mut cursor = BtCursor::new(probe, pn(2), USABLE, true);
+            // (target, found, async reads). The root and leaves 3 and 4 are
+            // resident; each target below misses the seek cache, so the seek
+            // loads the root and the target's leaf, and only a leaf that is not
+            // resident goes through the async read.
             for (target, found, reads) in [
-                (20_i64, true, vec![pn(3)]),
-                (40, true, vec![pn(4)]),
-                (12, false, vec![pn(3)]),
+                (10_i64, true, vec![]),
+                (35, true, vec![]),
                 (55, true, vec![pn(5)]),
-                (79, false, vec![pn(6)]),
-                (35, true, vec![pn(4)]),
+                (112, false, vec![pn(8)]),
             ] {
                 cursor.pager.clear_reads();
                 let result = cursor.table_move_to(&cx, target).await.unwrap();
                 assert_eq!(result.is_found(), found, "target {target}");
+                if found {
+                    assert_eq!(cursor.rowid(&cx).await.unwrap(), target);
+                }
                 assert_eq!(cursor.pager.read_pages(), reads, "target {target}");
             }
 
-            // A target on no cached leaf reads the root and its own leaf, and
-            // nothing else: below every cached leaf, between two of them, on
-            // a leaf that is not cached, and past the last one.
-            for (target, found, leaf) in [
-                (5_i64, false, pn(3)),
-                (25, false, pn(4)),
-                (100, true, pn(7)),
-                (95, true, pn(7)),
-                (110, true, pn(8)),
-                (500, false, pn(8)),
-            ] {
-                // Refill the slots with leaves 3 to 6 so the target's own
-                // leaf is not among them (25 lands on leaf 4 through the
-                // root: the gap before its first key is not a landing).
-                for rowid in [10_i64, 30, 50, 70] {
-                    assert!(cursor.table_move_to(&cx, rowid).await.unwrap().is_found());
-                }
-                cursor.pager.clear_reads();
-                let result = cursor.table_move_to(&cx, target).await.unwrap();
-                assert_eq!(result.is_found(), found, "target {target}");
-                assert_eq!(
-                    cursor.pager.read_pages(),
-                    vec![pn(2), leaf],
-                    "target {target}"
-                );
-            }
+            // A resident refusal is the load's error, not a cue to read the
+            // page again. Leaf 7 is in no seek-cache slot, so the seek starts
+            // at the refused root.
+            *cursor.pager.resident_refusal.borrow_mut() = Some(2);
+            cursor.pager.clear_reads();
+            assert!(cursor.table_move_to(&cx, 90).await.is_err());
+            assert!(
+                cursor.pager.read_pages().is_empty(),
+                "the refused root is not read through the async path"
+            );
         });
     }
 
@@ -18596,6 +20373,242 @@ mod tests {
     }
 
     #[test]
+    fn test_secure_delete_scrubs_table_cells_in_all_compaction_paths() {
+        run_async(async {
+            const MARKER: &[u8] = b"private-table-cell-bd-i2u1c-marker";
+            let cx = Cx::new();
+            for mode in [
+                SecureDeleteMode::Off,
+                SecureDeleteMode::On,
+                SecureDeleteMode::Fast,
+            ] {
+                for page_size in [4_096, 8_192] {
+                    for disturbed in [false, true] {
+                        let mut store = MemPageStore::with_empty_table(pn(2), page_size);
+                        store.set_secure_delete_mode(mode);
+                        let mut cursor = BtCursor::new(store, pn(2), page_size, true);
+                        // The last inserted cell is physically lowest. In the
+                        // disturbed case it is in the middle of the rowid order,
+                        // exercising both small-page and rebuilt-page deletes.
+                        let order = if disturbed {
+                            [10, 30, 20]
+                        } else {
+                            [10, 20, 30]
+                        };
+                        let target = order[2];
+                        for rowid in order {
+                            let payload = if rowid == target { MARKER } else { b"survivor" };
+                            cursor.table_insert(&cx, rowid, payload).await.unwrap();
+                        }
+                        assert!(cursor.table_move_to(&cx, target).await.unwrap().is_found());
+                        cursor.delete(&cx).await.unwrap();
+                        let page = cursor.pager.read_page(&cx, pn(2)).await.unwrap();
+                        assert_eq!(
+                            page.windows(MARKER.len()).any(|bytes| bytes == MARKER),
+                            mode == SecureDeleteMode::Off,
+                            "mode={mode:?}, page_size={page_size}, disturbed={disturbed}"
+                        );
+                        let expected: BTreeMap<_, _> = order
+                            .into_iter()
+                            .filter(|rowid| *rowid != target)
+                            .map(|rowid| (rowid, b"survivor".to_vec()))
+                            .collect();
+                        assert_eq!(scan_table_rows(&mut cursor).await, expected);
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn test_secure_delete_scrubs_synchronous_staged_delete() {
+        run_async(async {
+            const MARKER: &[u8] = b"private-staged-cell-bd-i2u1c-marker";
+            let cx = Cx::new();
+            for mode in [
+                SecureDeleteMode::Off,
+                SecureDeleteMode::On,
+                SecureDeleteMode::Fast,
+            ] {
+                let mut store = MemPageStore::with_empty_table(pn(2), USABLE);
+                store.set_secure_delete_mode(mode);
+                let mut cursor =
+                    BtCursor::new(ImageKeepingStore::new(store, false), pn(2), USABLE, true);
+                let mut payload = MARKER.to_vec();
+                payload.extend_from_slice(&[b'x'; 96]);
+                cursor.table_insert(&cx, 1, b"before").await.unwrap();
+                cursor.table_insert(&cx, 2, &payload).await.unwrap();
+                cursor.table_insert(&cx, 3, b"after").await.unwrap();
+                assert!(cursor.table_move_to(&cx, 2).await.unwrap().is_found());
+                assert!(cursor.try_delete_table_leaf_cell_in_staged_image());
+                let page = cursor.pager.page_bytes(2).unwrap();
+                assert_eq!(
+                    page.windows(MARKER.len()).any(|bytes| bytes == MARKER),
+                    mode == SecureDeleteMode::Off,
+                    "mode={mode:?}"
+                );
+                assert_eq!(
+                    scan_table_rows(&mut cursor).await,
+                    BTreeMap::from([(1, b"before".to_vec()), (3, b"after".to_vec())])
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn test_secure_delete_scrubs_batched_leaf_deletes() {
+        run_async(async {
+            const MARKER: &[u8] = b"private-batched-cell-bd-i2u1c-marker";
+            let cx = Cx::new();
+            for mode in [
+                SecureDeleteMode::Off,
+                SecureDeleteMode::On,
+                SecureDeleteMode::Fast,
+            ] {
+                for (delete_count, disturbed) in [(1, false), (8, false), (8, true)] {
+                    let mut store = MemPageStore::with_empty_table(pn(2), USABLE);
+                    store.set_secure_delete_mode(mode);
+                    let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+                    let target = if disturbed { 10 } else { 20 };
+                    for rowid in (1..=20).filter(|rowid| *rowid != target) {
+                        cursor.table_insert(&cx, rowid, b"survivor").await.unwrap();
+                    }
+                    cursor.table_insert(&cx, target, MARKER).await.unwrap();
+                    assert!(cursor.table_move_to(&cx, target).await.unwrap().is_found());
+                    let mut run = cursor
+                        .table_leaf_delete_run_current(target)
+                        .unwrap()
+                        .unwrap();
+                    let deleted: Vec<_> = std::iter::once(target).chain(1..delete_count).collect();
+                    for rowid in &deleted {
+                        assert!(run.delete_rowid(&cx, *rowid, USABLE).unwrap());
+                    }
+                    cursor.flush_table_leaf_delete_run(&cx, run).await.unwrap();
+                    let page = cursor.pager.read_page(&cx, pn(2)).await.unwrap();
+                    assert_eq!(
+                        page.windows(MARKER.len()).any(|bytes| bytes == MARKER),
+                        mode == SecureDeleteMode::Off,
+                        "mode={mode:?}, delete_count={delete_count}, disturbed={disturbed}"
+                    );
+                    let expected: BTreeMap<_, _> = (1..=20)
+                        .filter(|rowid| !deleted.contains(rowid))
+                        .map(|rowid| (rowid, b"survivor".to_vec()))
+                        .collect();
+                    assert_eq!(scan_table_rows(&mut cursor).await, expected);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn test_secure_delete_batched_deletes_keep_the_original_policy() {
+        run_async(async {
+            const MARKER: &[u8] = b"private-policy-switch-bd-i2u1c-marker";
+            let cx = Cx::new();
+            for (original, current) in [
+                (SecureDeleteMode::On, SecureDeleteMode::Off),
+                (SecureDeleteMode::Fast, SecureDeleteMode::Off),
+                (SecureDeleteMode::Off, SecureDeleteMode::On),
+            ] {
+                let mut store = MemPageStore::with_empty_table(pn(2), USABLE);
+                store.set_secure_delete_mode(original);
+                let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+                cursor.table_insert(&cx, 1, b"survivor").await.unwrap();
+                cursor.table_insert(&cx, 2, MARKER).await.unwrap();
+                assert!(cursor.table_move_to(&cx, 2).await.unwrap().is_found());
+                let mut run = cursor.table_leaf_delete_run_current(2).unwrap().unwrap();
+                assert_eq!(run.secure_delete_mode(), original);
+                assert!(run.delete_rowid(&cx, 2, USABLE).unwrap());
+
+                cursor.pager.set_secure_delete_mode(current);
+                cursor.flush_table_leaf_delete_run(&cx, run).await.unwrap();
+
+                let page = cursor.pager.read_page(&cx, pn(2)).await.unwrap();
+                assert_eq!(
+                    page.windows(MARKER.len()).any(|bytes| bytes == MARKER),
+                    original == SecureDeleteMode::Off,
+                    "original={original:?}, current={current:?}"
+                );
+                assert_eq!(
+                    scan_table_rows(&mut cursor).await,
+                    BTreeMap::from([(1, b"survivor".to_vec())])
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn test_secure_delete_scrubs_index_leaf_cells_only_when_enabled() {
+        run_async(async {
+            const MARKER: &[u8] = b"private-index-leaf-bd-i2u1c-marker";
+            let cx = Cx::new();
+            for mode in [
+                SecureDeleteMode::Off,
+                SecureDeleteMode::On,
+                SecureDeleteMode::Fast,
+            ] {
+                let mut store = MemPageStore::with_empty_index(pn(2), USABLE);
+                store.set_secure_delete_mode(mode);
+                let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+                cursor.index_insert(&cx, b"alpha").await.unwrap();
+                cursor.index_insert(&cx, MARKER).await.unwrap();
+                assert!(cursor.index_move_to(&cx, MARKER).await.unwrap().is_found());
+                cursor.delete(&cx).await.unwrap();
+                let page = cursor.pager.read_page(&cx, pn(2)).await.unwrap();
+                assert_eq!(
+                    page.windows(MARKER.len()).any(|bytes| bytes == MARKER),
+                    mode == SecureDeleteMode::Off,
+                    "mode={mode:?}"
+                );
+                assert!(cursor.first(&cx).await.unwrap());
+                assert_eq!(cursor.payload(&cx).await.unwrap(), b"alpha");
+                assert!(!cursor.next(&cx).await.unwrap());
+            }
+        });
+    }
+
+    #[test]
+    fn test_secure_delete_scrubs_replaced_interior_index_cell() {
+        run_async(async {
+            const MARKER: &[u8] = b"middle-private-index-cell-bd-i2u1c-marker";
+            let cx = Cx::new();
+            let mut old_key = MARKER.to_vec();
+            old_key.extend_from_slice(&[b'x'; 96]);
+            for mode in [
+                SecureDeleteMode::Off,
+                SecureDeleteMode::On,
+                SecureDeleteMode::Fast,
+            ] {
+                let mut store = MemPageStore::new(USABLE);
+                store.set_secure_delete_mode(mode);
+                store.pages.insert(
+                    2,
+                    build_interior_index(&[(pn(3), b"alpha"), (pn(4), &old_key)], pn(5)),
+                );
+                let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+                assert!(
+                    cursor
+                        .index_move_to(&cx, &old_key)
+                        .await
+                        .unwrap()
+                        .is_found()
+                );
+                assert!(!cursor.replace_interior_cell(&cx, b"middle").await.unwrap());
+                assert_eq!(cursor.payload(&cx).await.unwrap(), b"middle");
+                let page = cursor.pager.read_page(&cx, pn(2)).await.unwrap();
+                assert_eq!(
+                    page.windows(MARKER.len()).any(|bytes| bytes == MARKER),
+                    mode == SecureDeleteMode::Off,
+                    "mode={mode:?}"
+                );
+                let header = cell::parse_page_header(&page, pn(2)).unwrap();
+                assert_eq!(header.cell_count, 2);
+                assert_eq!(header.right_child, Some(pn(5)));
+            }
+        });
+    }
+
+    #[test]
     fn test_cursor_delete_single_leaf() {
         run_async(async {
             let mut store = MemPageStore::new(USABLE);
@@ -18771,6 +20784,7 @@ mod tests {
             )
             .unwrap();
             let leftmost_max_rowid = first_divider_cell.rowid.unwrap();
+            let leftmost_leaf = first_divider_cell.left_child.unwrap().get();
             assert!(
                 leftmost_max_rowid >= 1,
                 "leftmost leaf must hold >= 2 cells for this proof"
@@ -18778,23 +20792,58 @@ mod tests {
 
             // Phase A: delete every cell of the leftmost leaf EXCEPT the last. The
             // leaf stays non-empty, so the deferred-delete strategy performs no
-            // rebalance (balance_for_delete is gated on new_count == 0). The balance
-            // counter lives on the leaf-reuse snapshot; the DELETE op total on the
-            // metrics snapshot.
-            let before_balance = btree_leaf_reuse_snapshot();
+            // rebalance (balance_for_delete is gated on new_count == 0).
+            //
+            // The rebalance count is read per thread: the process-global
+            // `balance_for_delete_calls` also counts every concurrently running test
+            // whose delete empties a leaf while this test has metrics enabled (one
+            // such sibling made a gate read 1 here). The thread count is this
+            // cursor's alone, so its zero is exact; and no page but the leaf itself
+            // may change, which a rebalance or a separator rewrite would do.
+            let pages_before = cursor.pager.inner.pages.clone();
+            let before_thread_balance = crate::instrumentation::thread_balance_for_delete_calls();
             let before_ops = btree_metrics_snapshot();
             for rowid in 0..leftmost_max_rowid {
                 assert!(cursor.table_move_to(&cx, rowid).await.unwrap().is_found());
                 cursor.delete(&cx).await.unwrap();
             }
+            let after_partial_thread_balance =
+                crate::instrumentation::thread_balance_for_delete_calls();
             let after_partial_balance = btree_leaf_reuse_snapshot();
             let after_partial_ops = btree_metrics_snapshot();
             assert_eq!(
-                after_partial_balance.balance_for_delete_calls
-                    - before_balance.balance_for_delete_calls,
+                after_partial_thread_balance - before_thread_balance,
                 0,
                 "deleting non-emptying cells must defer rebalancing (zero balance_for_delete)"
             );
+            let pages_after = &cursor.pager.inner.pages;
+            assert_eq!(
+                pages_after.len(),
+                pages_before.len(),
+                "Phase A allocated or freed a page"
+            );
+            for (page_no, bytes) in &pages_before {
+                if *page_no != leftmost_leaf {
+                    assert_eq!(
+                        pages_after.get(page_no),
+                        Some(bytes),
+                        "Phase A changed page {page_no}, not only the leaf it deleted from"
+                    );
+                }
+            }
+            let leaf = pages_after.get(&leftmost_leaf).unwrap();
+            let leaf_header = BtreePageHeader::parse(leaf, 0).unwrap();
+            assert_eq!(leaf_header.page_type, cell::BtreePageType::LeafTable);
+            assert_eq!(
+                leaf_header.cell_count, 1,
+                "the leaf keeps only its last cell"
+            );
+            for rowid in 0..leftmost_max_rowid {
+                assert!(
+                    !cursor.table_move_to(&cx, rowid).await.unwrap().is_found(),
+                    "Phase A must have performed real DELETEs (rowid {rowid} still found)"
+                );
+            }
             assert!(
                 after_partial_ops.fsqlite_btree_operations_total.delete
                     - before_ops.fsqlite_btree_operations_total.delete
@@ -18803,7 +20852,8 @@ mod tests {
             );
 
             // Phase B: delete the final cell of the leftmost leaf -> it empties ->
-            // the deferred rebalance runs exactly now.
+            // the deferred rebalance runs exactly now, on this thread, and takes the
+            // empty leaf out of the root.
             assert!(
                 cursor
                     .table_move_to(&cx, leftmost_max_rowid)
@@ -18814,11 +20864,33 @@ mod tests {
             cursor.delete(&cx).await.unwrap();
             let after_empty_balance = btree_leaf_reuse_snapshot();
             assert!(
-                after_empty_balance.balance_for_delete_calls
-                    - after_partial_balance.balance_for_delete_calls
+                crate::instrumentation::thread_balance_for_delete_calls()
+                    - after_partial_thread_balance
                     >= 1,
                 "emptying a leaf must trigger the deferred rebalance exactly then"
             );
+            assert!(
+                after_empty_balance.balance_for_delete_calls
+                    - after_partial_balance.balance_for_delete_calls
+                    >= 1,
+                "the process-wide metric counts the rebalance too"
+            );
+            let root_page = cursor.pager.inner.pages.get(&2).unwrap();
+            let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
+            if root_header.page_type == cell::BtreePageType::InteriorTable {
+                let root_ptrs = cell::read_cell_pointers(root_page, &root_header, 0).unwrap();
+                let mut children = vec![root_header.right_child.map(PageNumber::get)];
+                for ptr in root_ptrs {
+                    let divider =
+                        CellRef::parse(root_page, usize::from(ptr), root_header.page_type, USABLE)
+                            .unwrap();
+                    children.push(divider.left_child.map(PageNumber::get));
+                }
+                assert!(
+                    !children.contains(&Some(leftmost_leaf)),
+                    "the emptied leaf must leave the root after the rebalance"
+                );
+            }
 
             set_btree_metrics_enabled(false);
 
@@ -19020,6 +21092,116 @@ mod tests {
                 .expect("table invariants should still hold after ancestor separator repair");
             assert!(!cursor.table_move_to(&cx, 15).await.unwrap().is_found());
             assert!(cursor.table_move_to(&cx, 10).await.unwrap().is_found());
+        });
+    }
+
+    /// Lever J (bd-w4pr1.13.20): deleting a leaf's maximum writes the new
+    /// separator's varint over the old one when both have one length, and
+    /// rewrites the page only when the length changes (128 -> 127).
+    #[test]
+    fn test_separator_repair_writes_a_same_length_varint_in_place() {
+        /// (cell offset, rowid) of every separator of the root page 2.
+        async fn root_separators(
+            cursor: &mut BtCursor<PrefetchProbeStore>,
+            cx: &Cx,
+        ) -> Vec<(usize, i64)> {
+            let root = cursor.load_page(cx, pn(2)).await.unwrap();
+            assert_eq!(root.header.page_type, cell::BtreePageType::InteriorTable);
+            (0..root.header.cell_count)
+                .map(|idx| {
+                    let offset =
+                        BtCursor::<PrefetchProbeStore>::read_stack_entry_cell_pointer_inline(
+                            &root, idx,
+                        )
+                        .unwrap();
+                    let rowid = cursor.parse_cell_at(&root, idx).unwrap().rowid.unwrap();
+                    (usize::from(offset), rowid)
+                })
+                .collect()
+        }
+
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            // 60-byte rows: several dozen to a leaf under one interior root.
+            for rowid in 1..=400_i64 {
+                cursor.table_insert(&cx, rowid, &[b'r'; 60]).await.unwrap();
+            }
+            assert_eq!(measure_tree_depth(&cursor.pager, pn(2), USABLE).await, 2);
+
+            // The leaf holding 128; its rows from its maximum down to 128 are
+            // deleted, each one the leaf's maximum when it goes, and 127 stays
+            // on the leaf.
+            assert!(cursor.table_move_to(&cx, 128).await.unwrap().is_found());
+            let (leaf_min, leaf_max) = {
+                let top = cursor.stack.last().unwrap();
+                let last = top.header.cell_count - 1;
+                (
+                    cursor.parse_cell_at(top, 0).unwrap().rowid.unwrap(),
+                    cursor.parse_cell_at(top, last).unwrap().rowid.unwrap(),
+                )
+            };
+            assert!(leaf_min < 127, "the leaf must hold 127 and a row below it");
+            assert!(leaf_max > 130, "the leaf must hold rows above 128");
+
+            for removed in (128..=leaf_max).rev() {
+                let before_bytes = cursor.pager.read_page(&cx, pn(2)).await.unwrap();
+                let before = root_separators(&mut cursor, &cx).await;
+                let slot = before
+                    .iter()
+                    .position(|&(_, rowid)| rowid == removed)
+                    .expect("the leaf's maximum is a root separator");
+
+                assert!(cursor.table_move_to(&cx, removed).await.unwrap().is_found());
+                cursor.delete(&cx).await.unwrap();
+
+                let after_bytes = cursor.pager.read_page(&cx, pn(2)).await.unwrap();
+                let after = root_separators(&mut cursor, &cx).await;
+                assert_eq!(after.len(), before.len(), "row {removed}");
+                assert_eq!(after[slot].1, removed - 1, "row {removed}: the new maximum");
+                #[allow(clippy::cast_sign_loss)]
+                let (old_len, new_len) =
+                    (varint_len(removed as u64), varint_len((removed - 1) as u64));
+                if old_len == new_len {
+                    // Only the varint after the cell's 4-byte child changed.
+                    let varint_at = before[slot].0 + 4;
+                    let varint_end = varint_at + old_len;
+                    assert_eq!(after, {
+                        let mut expected = before.clone();
+                        expected[slot].1 = removed - 1;
+                        expected
+                    });
+                    for (at, (old, new)) in before_bytes.iter().zip(&after_bytes).enumerate() {
+                        assert!(
+                            old == new || (varint_at..varint_end).contains(&at),
+                            "row {removed}: root byte {at} changed outside the separator's varint"
+                        );
+                    }
+                } else {
+                    assert_eq!(removed, 128, "only 128 -> 127 shortens the varint here");
+                    assert_ne!(after[slot].0, before[slot].0, "the page was rewritten");
+                }
+                for entry in cursor.stack.iter().filter(|entry| entry.page_no == pn(2)) {
+                    assert_eq!(
+                        entry.page_data.as_bytes(),
+                        after_bytes.as_slice(),
+                        "row {removed}: the cursor shows the repaired root"
+                    );
+                }
+                validate_table_tree_invariants(&cursor.pager, pn(2), USABLE)
+                    .await
+                    .expect("table invariants hold after the separator repair");
+            }
+
+            for rowid in 1..=400_i64 {
+                assert_eq!(
+                    cursor.table_move_to(&cx, rowid).await.unwrap().is_found(),
+                    !(128..=leaf_max).contains(&rowid),
+                    "row {rowid}"
+                );
+            }
         });
     }
 
@@ -19500,6 +21682,262 @@ mod tests {
         });
     }
 
+    #[test]
+    fn test_secure_delete_erases_compacted_table_cells_without_extra_writes() {
+        run_async(async {
+            let cx = Cx::new();
+            let marker = b"private-cell-marker-erase-me";
+            let payload = marker.repeat(8);
+            for mode in [
+                SecureDeleteMode::Off,
+                SecureDeleteMode::On,
+                SecureDeleteMode::Fast,
+            ] {
+                let secure_delete = mode.scrubs_cells();
+                // Descending pointers, the small-page physical-neighbour
+                // path, and the larger-page general compactor.
+                for (usable, late_insert) in [(4096, false), (4096, true), (8192, true)] {
+                    let mut store =
+                        ImageKeepingStore::new(MemPageStore::with_empty_table(pn(2), usable), true);
+                    store.inner.set_secure_delete_mode(mode);
+                    let mut cursor = BtCursor::new(store, pn(2), usable, true);
+                    let order = if late_insert {
+                        [1, 3, 4, 2]
+                    } else {
+                        [1, 2, 3, 4]
+                    };
+                    let removed = if late_insert { 2 } else { 4 };
+                    for rowid in order {
+                        cursor
+                            .table_insert(
+                                &cx,
+                                rowid,
+                                if rowid == removed {
+                                    &payload
+                                } else {
+                                    b"survivor"
+                                },
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    assert!(cursor.table_move_to(&cx, removed).await.unwrap().is_found());
+                    let writes = cursor.pager.page_writes;
+                    cursor.delete(&cx).await.unwrap();
+                    assert_eq!(cursor.pager.page_writes, writes + 1);
+                    let page = cursor.pager.page_bytes(2).unwrap();
+                    assert_eq!(
+                        page.windows(marker.len()).any(|bytes| bytes == marker),
+                        !secure_delete,
+                        "mode={mode:?}, usable={usable}, late={late_insert}"
+                    );
+                    for rowid in [1, 2, 3, 4] {
+                        let found = cursor.table_move_to(&cx, rowid).await.unwrap().is_found();
+                        assert_eq!(found, rowid != removed);
+                        if found {
+                            assert_eq!(cursor.payload(&cx).await.unwrap(), b"survivor");
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn test_secure_delete_erases_staged_cell_and_shorter_replacement() {
+        run_async(async {
+            let cx = Cx::new();
+            let marker = b"private-staged-marker-erase-me";
+            let payload = marker.repeat(8);
+            for mode in [
+                SecureDeleteMode::Off,
+                SecureDeleteMode::On,
+                SecureDeleteMode::Fast,
+            ] {
+                let secure_delete = mode.scrubs_cells();
+                let mut store =
+                    ImageKeepingStore::new(MemPageStore::with_empty_table(pn(2), USABLE), false);
+                store.inner.set_secure_delete_mode(mode);
+                let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+                cursor.table_insert(&cx, 1, b"before").await.unwrap();
+                cursor.table_insert(&cx, 2, &payload).await.unwrap();
+                cursor.table_insert(&cx, 3, b"after").await.unwrap();
+                assert!(cursor.table_move_to(&cx, 2).await.unwrap().is_found());
+                let writes = cursor.pager.page_writes;
+                let changes = cursor.pager.in_place_changes;
+                assert!(cursor.try_delete_table_leaf_cell_in_staged_image());
+                assert_eq!(cursor.pager.page_writes, writes);
+                assert_eq!(cursor.pager.in_place_changes, changes + 1);
+                let page = cursor.pager.page_bytes(2).unwrap();
+                assert_eq!(
+                    page.windows(marker.len()).any(|bytes| bytes == marker),
+                    !secure_delete
+                );
+                assert_eq!(cursor.rowid(&cx).await.unwrap(), 3);
+                assert_eq!(cursor.payload(&cx).await.unwrap(), b"after");
+
+                // A shorter UPDATE removes and reinserts a cell. The new
+                // payload must not hide a surviving old payload in the gap.
+                cursor.table_insert(&cx, 4, &payload).await.unwrap();
+                assert!(cursor.table_move_to(&cx, 4).await.unwrap().is_found());
+                assert!(
+                    !cursor
+                        .table_overwrite_current_payload_same_size_no_overflow(
+                            &cx,
+                            4,
+                            b"replacement",
+                        )
+                        .await
+                        .unwrap()
+                );
+                cursor.delete(&cx).await.unwrap();
+                cursor.table_insert(&cx, 4, b"replacement").await.unwrap();
+                assert!(cursor.table_move_to(&cx, 4).await.unwrap().is_found());
+                assert_eq!(cursor.payload(&cx).await.unwrap(), b"replacement");
+                let page = cursor.pager.page_bytes(2).unwrap();
+                assert_eq!(
+                    page.windows(marker.len()).any(|bytes| bytes == marker),
+                    !secure_delete
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn test_secure_delete_erases_batched_cells_on_every_materializer() {
+        run_async(async {
+            let cx = Cx::new();
+            let marker = b"private-batch-marker-erase-me";
+            let payload = marker.repeat(4);
+            for mode in [
+                SecureDeleteMode::Off,
+                SecureDeleteMode::On,
+                SecureDeleteMode::Fast,
+            ] {
+                let secure_delete = mode.scrubs_cells();
+                for late_insert in [false, true] {
+                    for deleted in [&[16_i64][..], &[2, 4, 6, 8, 10, 12, 14, 16][..]] {
+                        let mut store = ImageKeepingStore::new(
+                            MemPageStore::with_empty_table(pn(2), USABLE),
+                            false,
+                        );
+                        store.inner.set_secure_delete_mode(mode);
+                        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+                        let mut order: Vec<i64> = (1..=16).collect();
+                        if late_insert {
+                            order.swap(14, 15);
+                        }
+                        for rowid in order {
+                            cursor
+                                .table_insert(
+                                    &cx,
+                                    rowid,
+                                    if deleted.contains(&rowid) {
+                                        &payload
+                                    } else {
+                                        b"survivor"
+                                    },
+                                )
+                                .await
+                                .unwrap();
+                        }
+                        assert!(
+                            cursor
+                                .table_move_to(&cx, deleted[0])
+                                .await
+                                .unwrap()
+                                .is_found()
+                        );
+                        let mut run = cursor
+                            .table_leaf_delete_run_current(deleted[0])
+                            .unwrap()
+                            .unwrap();
+                        for &rowid in deleted {
+                            assert!(run.delete_rowid(&cx, rowid, USABLE).unwrap());
+                        }
+                        let writes = cursor.pager.page_writes;
+                        cursor.flush_table_leaf_delete_run(&cx, run).await.unwrap();
+                        assert_eq!(cursor.pager.page_writes, writes + 1);
+                        let page = cursor.pager.page_bytes(2).unwrap();
+                        assert_eq!(
+                            page.windows(marker.len()).any(|bytes| bytes == marker),
+                            !secure_delete,
+                            "mode={mode:?}, late={late_insert}, deleted={deleted:?}"
+                        );
+                        for rowid in 1..=16 {
+                            let found = cursor.table_move_to(&cx, rowid).await.unwrap().is_found();
+                            assert_eq!(found, !deleted.contains(&rowid));
+                            if found {
+                                assert_eq!(cursor.payload(&cx).await.unwrap(), b"survivor");
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn test_secure_delete_replacement_compacts_fragmented_index_separator() {
+        run_async(async {
+            let cx = Cx::new();
+            let marker = b"private-index-separator-erase-me";
+            let payload = marker.repeat(8);
+            for mode in [
+                SecureDeleteMode::Off,
+                SecureDeleteMode::On,
+                SecureDeleteMode::Fast,
+            ] {
+                let secure_delete = mode.scrubs_cells();
+                let mut pages = MemPageStore::new(USABLE);
+                pages.set_secure_delete_mode(mode);
+                let mut page = build_interior_index(&[(pn(3), &payload)], pn(4));
+                let mut header = cell::parse_page_header(&page, pn(2)).unwrap();
+                let old_offset = header.content_offset(USABLE);
+                // Model an imported interior page with a 16-byte freeblock
+                // and three fragmented bytes after its sole live cell. A
+                // full compaction must retire both pieces of free metadata.
+                let new_offset = old_offset - 19;
+                page.copy_within(old_offset..USABLE as usize, new_offset);
+                header.cell_content_offset = u32::try_from(new_offset).unwrap();
+                header.first_freeblock = u16::try_from(USABLE - 16).unwrap();
+                header.fragmented_free_bytes = 3;
+                let freeblock = usize::from(header.first_freeblock);
+                page[freeblock..freeblock + 2].copy_from_slice(&0_u16.to_be_bytes());
+                page[freeblock + 2..freeblock + 4].copy_from_slice(&16_u16.to_be_bytes());
+                header.write(&mut page, 0);
+                cell::write_cell_pointers(
+                    &mut page,
+                    0,
+                    &header,
+                    &[u16::try_from(new_offset).unwrap()],
+                );
+                pages.pages.insert(2, page);
+                let store = ImageKeepingStore::new(pages, false);
+                let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+                let entry = cursor.load_page(&cx, pn(2)).await.unwrap();
+                cursor.stack.push(entry);
+                cursor.at_eof = false;
+                assert!(
+                    !cursor
+                        .replace_interior_cell(&cx, b"replacement")
+                        .await
+                        .unwrap()
+                );
+                assert_eq!(cursor.pager.page_writes, 1);
+                assert_eq!(cursor.payload(&cx).await.unwrap(), b"replacement");
+                let page = cursor.pager.page_bytes(2).unwrap();
+                let header = cell::parse_page_header(&page, pn(2)).unwrap();
+                assert_eq!(header.first_freeblock, 0);
+                assert_eq!(header.fragmented_free_bytes, 0);
+                assert_eq!(
+                    page.windows(marker.len()).any(|bytes| bytes == marker),
+                    !secure_delete
+                );
+            }
+        });
+    }
+
     /// 1,200 rows, then: every seventh deleted by seek, a run deleted that
     /// drains whole leaves, every eleventh deleted during a scan (the cursor
     /// stays on the successor, as a one-pass DELETE uses it), and every fifth
@@ -19625,6 +22063,322 @@ mod tests {
                     assert!(
                         cursor.pager.in_place_changes > 300,
                         "deletes and rewrites on staged leaves change them in place: {}",
+                        cursor.pager.in_place_changes
+                    );
+                }
+            }
+        });
+    }
+
+    /// bd-w4pr1.13.20, lever SD: the synchronous delete of a cell on a
+    /// staged compact leaf leaves every page and the cursor exactly as the
+    /// ordinary delete does (the reference store holds no staged images, so
+    /// it never takes the synchronous path), and refuses, changing nothing, a
+    /// leaf's last cell, a leaf's only cell, a cell with an overflow chain and
+    /// a leaf whose pointers do not descend. A delete that rewrote each moved
+    /// pointer's value but not its slot, or left the cursor anywhere but on
+    /// the successor, makes the pages or the visited rows differ.
+    #[test]
+    fn test_synchronous_leaf_delete_matches_the_ordinary_delete_and_refuses_the_rest() {
+        async fn refused<P: PageWriter>(cursor: &mut BtCursor<P>, cx: &Cx, rowid: i64, what: &str) {
+            assert!(
+                cursor.table_move_to(cx, rowid).await.unwrap().is_found(),
+                "{what}"
+            );
+            let top = cursor.stack.last().unwrap();
+            let shown = (top.page_no, top.page_data.image_token(), top.cell_idx);
+            let before = cursor.pager.read_page(cx, shown.0).await.unwrap();
+            assert!(
+                !cursor.try_delete_table_leaf_cell_in_staged_image(),
+                "{what}: refused"
+            );
+            let top = cursor.stack.last().unwrap();
+            assert_eq!(
+                (top.page_no, top.page_data.image_token(), top.cell_idx),
+                shown,
+                "{what}: the cursor is unchanged"
+            );
+            assert_eq!(
+                cursor.pager.read_page(cx, shown.0).await.unwrap(),
+                before,
+                "{what}: the page is unchanged"
+            );
+            assert_eq!(cursor.rowid(cx).await.unwrap(), rowid, "{what}");
+        }
+
+        let _leaf_cursor_guard = LEAF_REUSE_CURSOR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        run_async(async {
+            let cx = Cx::new();
+            let mut reference = BtCursor::new(
+                MemPageStore::with_empty_table(pn(2), USABLE),
+                pn(2),
+                USABLE,
+                true,
+            );
+            let mut cursor = BtCursor::new(
+                ImageKeepingStore::new(MemPageStore::with_empty_table(pn(2), USABLE), false),
+                pn(2),
+                USABLE,
+                true,
+            );
+            for rowid in 1..=1_200 {
+                let payload = payload_for_rowid(rowid);
+                reference.table_insert(&cx, rowid, &payload).await.unwrap();
+                cursor.table_insert(&cx, rowid, &payload).await.unwrap();
+            }
+
+            // A one-pass DELETE's scan: delete where the cursor stands (it
+            // then stands on the successor), otherwise step.
+            assert!(reference.first(&cx).await.unwrap());
+            assert!(cursor.first(&cx).await.unwrap());
+            let mut synchronous = 0;
+            while !reference.eof() {
+                assert!(!cursor.eof());
+                let rowid = reference.rowid(&cx).await.unwrap();
+                assert_eq!(cursor.rowid(&cx).await.unwrap(), rowid);
+                if rowid % 3 == 1 {
+                    let more = reference.next(&cx).await.unwrap();
+                    assert_eq!(cursor.next(&cx).await.unwrap(), more, "row {rowid}");
+                    continue;
+                }
+                assert!(
+                    !reference.try_delete_table_leaf_cell_in_staged_image(),
+                    "a store without staged images never takes the synchronous delete"
+                );
+                reference.delete(&cx).await.unwrap();
+                if cursor.try_delete_table_leaf_cell_in_staged_image() {
+                    synchronous += 1;
+                } else {
+                    cursor.delete(&cx).await.unwrap();
+                }
+            }
+            assert!(cursor.eof());
+            assert!(
+                synchronous > 600,
+                "most of the 800 deletes run synchronously: {synchronous}"
+            );
+            let reference_pages: BTreeMap<u32, Vec<u8>> = reference
+                .pager
+                .pages_iter()
+                .map(|(page_no, bytes)| (*page_no, bytes.to_vec()))
+                .collect();
+            for (page_no, bytes) in &reference_pages {
+                assert_eq!(
+                    cursor.pager.page_bytes(*page_no).as_ref(),
+                    Some(bytes),
+                    "page {page_no} differs from the ordinary delete's"
+                );
+            }
+            assert_eq!(
+                scan_table_rows(&mut cursor).await,
+                scan_table_rows(&mut reference).await
+            );
+
+            // A leaf's last cell, on the staged store.
+            assert!(cursor.table_move_to(&cx, 601).await.unwrap().is_found());
+            let last = {
+                let top = cursor.stack.last().unwrap();
+                cursor
+                    .parse_cell_at(top, top.header.cell_count - 1)
+                    .unwrap()
+                    .rowid
+                    .unwrap()
+            };
+            refused(&mut cursor, &cx, last, "a leaf's last cell").await;
+
+            // A root leaf: its only cell, a cell with an overflow chain, and
+            // a leaf whose pointers no longer descend.
+            let mut small = BtCursor::new(
+                ImageKeepingStore::new(MemPageStore::with_empty_table(pn(2), USABLE), false),
+                pn(2),
+                USABLE,
+                true,
+            );
+            small.table_insert(&cx, 10, b"only").await.unwrap();
+            refused(&mut small, &cx, 10, "a leaf's only cell").await;
+            small.table_insert(&cx, 20, &[b'o'; 6_000]).await.unwrap();
+            small.table_insert(&cx, 30, b"after").await.unwrap();
+            refused(&mut small, &cx, 20, "a cell with an overflow chain").await;
+            small.table_insert(&cx, 15, b"late").await.unwrap();
+            refused(&mut small, &cx, 15, "a leaf whose pointers do not descend").await;
+            refused(&mut small, &cx, 10, "a leaf whose pointers do not descend").await;
+        });
+    }
+
+    /// bd-w4pr1.13.20, lever P: a delete on the very image the previous
+    /// compact descending delete wrote skips re-checking the pointer order;
+    /// once inserts have disturbed that order (same page, a new image) the
+    /// next delete checks it, takes the general branch, and the page ends
+    /// byte for byte as a fresh cursor per operation leaves it. The two
+    /// inserts leave the lowest cell last (the leaf still looks compact from
+    /// its last pointer) with a lower cell's pointer mid-array, so a verdict
+    /// remembered by page number alone takes the descending branch there,
+    /// sizes the removed cell from the wrong neighbour and corrupts the page.
+    #[test]
+    fn test_leaf_delete_reuses_the_pointer_order_only_for_the_image_it_wrote() {
+        enum Step {
+            Insert(i64),
+            Delete(i64),
+        }
+        fn payload(rowid: i64) -> Vec<u8> {
+            let len = usize::try_from(rowid).unwrap() / 10 * 7 + 3;
+            vec![b'a' + u8::try_from(rowid / 10).unwrap(); len]
+        }
+        async fn apply<P: PageWriter>(cursor: &mut BtCursor<P>, cx: &Cx, step: &Step) {
+            match *step {
+                Step::Insert(rowid) => cursor
+                    .table_insert(cx, rowid, &payload(rowid))
+                    .await
+                    .unwrap(),
+                Step::Delete(rowid) => {
+                    assert!(cursor.table_move_to(cx, rowid).await.unwrap().is_found());
+                    cursor.delete(cx).await.unwrap();
+                }
+            }
+        }
+        let steps: Vec<Step> = [10, 20, 30, 40, 60, 70, 80, 90]
+            .into_iter()
+            .map(Step::Insert)
+            .chain([
+                Step::Delete(30),
+                Step::Delete(70),
+                // Its cell lands lowest on the page, its pointer mid-array.
+                Step::Insert(50),
+                // Its cell lands lower still, its pointer last.
+                Step::Insert(95),
+                Step::Delete(50),
+                Step::Delete(20),
+                Step::Delete(90),
+            ])
+            .collect();
+        let empty_leaf = || {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
+            store
+        };
+
+        run_async(async {
+            let cx = Cx::new();
+            // Reference: a fresh cursor, with nothing remembered, per step.
+            let mut store = empty_leaf();
+            for step in &steps {
+                let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+                apply(&mut cursor, &cx, step).await;
+                store = cursor.pager;
+            }
+            let expected = store.pages.get(&2).unwrap().clone();
+
+            let mut cursor = BtCursor::new(empty_leaf(), pn(2), USABLE, true);
+            let mut remembered_after_delete = Vec::new();
+            for step in &steps {
+                apply(&mut cursor, &cx, step).await;
+                if matches!(step, Step::Delete(_)) {
+                    let shown = cursor.stack.last().map(|top| top.page_data.image_token());
+                    remembered_after_delete.push(cursor.descending_leaf_image.map(
+                        |(page, token)| {
+                            assert_eq!(page, pn(2));
+                            Some(token) == shown
+                        },
+                    ));
+                }
+            }
+            assert_eq!(cursor.pager.pages.get(&2), Some(&expected));
+            // Descending deletes remember the image they wrote (30, 70); the
+            // delete on the disturbed leaf (50) takes the general branch and
+            // remembers nothing; removing 50's pointer restores the order, so
+            // the next deletes (20 after a scan, 90 without one) descend.
+            assert_eq!(
+                remembered_after_delete,
+                vec![Some(true), Some(true), None, Some(true), Some(true)]
+            );
+            let leaf = BtreePageHeader::parse(&expected, 0).unwrap();
+            assert_eq!(leaf.cell_count, 5);
+            let ptrs = cell::read_cell_pointers(&expected, &leaf, 0).unwrap();
+            assert!(cell_ptrs_are_descending(&ptrs));
+        });
+    }
+
+    /// 3,000 rows appended past the end of the table (variable sizes, every
+    /// 257th with an overflow chain), and every 500 appends one row inserted
+    /// below the end, which drops the cached rightmost leaf. Returns the cursor
+    /// and the rows the table must hold.
+    async fn append_rows<P: PageWriter>(store: P) -> (BtCursor<P>, BTreeMap<i64, Vec<u8>>) {
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut expected = BTreeMap::new();
+        for i in 1..=3_000_i64 {
+            let rowid = 2 * i;
+            let payload = payload_for_rowid(rowid);
+            cursor.table_insert(&cx, rowid, &payload).await.unwrap();
+            expected.insert(rowid, payload);
+            if i % 500 == 0 {
+                let below = rowid - 401;
+                let payload = payload_for_rowid(below);
+                cursor.table_insert(&cx, below, &payload).await.unwrap();
+                expected.insert(below, payload);
+            }
+        }
+        (cursor, expected)
+    }
+
+    /// bd-i3csr.4: a row appended to the cached rightmost leaf goes into the
+    /// store's staged image of that leaf when it is the cache's image, and
+    /// every page ends byte for byte as the copy-and-write path leaves it (the
+    /// store without staged images). A store whose staged image is a different
+    /// one (the page before its last write) is never changed in place: an
+    /// append planned from the cache's view would corrupt it.
+    #[test]
+    fn test_appends_change_the_staged_rightmost_leaf_in_place_only_when_it_is_the_caches() {
+        // Leaf splits feed the global balance counter that
+        // `test_balance_for_delete_defers_until_leaf_empties` reads (bd-pyygd).
+        let _leaf_cursor_guard = LEAF_REUSE_CURSOR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        run_async(async {
+            let (mut reference, expected) =
+                append_rows(MemPageStore::with_empty_table(pn(2), USABLE)).await;
+            assert_eq!(scan_table_rows(&mut reference).await, expected);
+            let reference_pages: BTreeMap<u32, Vec<u8>> = reference
+                .pager
+                .pages_iter()
+                .map(|(page_no, bytes)| (*page_no, bytes.to_vec()))
+                .collect();
+
+            for offer_previous_image in [false, true] {
+                let store = ImageKeepingStore::new(
+                    MemPageStore::with_empty_table(pn(2), USABLE),
+                    offer_previous_image,
+                );
+                let (mut cursor, rows) = append_rows(store).await;
+                assert_eq!(rows, expected);
+                assert_eq!(
+                    scan_table_rows(&mut cursor).await,
+                    expected,
+                    "offer_previous_image={offer_previous_image}: the table reads back"
+                );
+                for (page_no, bytes) in &reference_pages {
+                    assert_eq!(
+                        cursor.pager.page_bytes(*page_no).as_ref(),
+                        Some(bytes),
+                        "offer_previous_image={offer_previous_image}: page {page_no} differs \
+                         from the copy-and-write path"
+                    );
+                }
+                assert_eq!(
+                    cursor.pager.inner.pages_iter().count(),
+                    reference_pages.len()
+                );
+                if offer_previous_image {
+                    assert_eq!(
+                        cursor.pager.in_place_changes, 0,
+                        "a staged image other than the cache's is never changed in place"
+                    );
+                } else {
+                    assert!(
+                        cursor.pager.in_place_changes > 2_000,
+                        "appends to the cached leaf change its staged image in place: {}",
                         cursor.pager.in_place_changes
                     );
                 }
@@ -20816,11 +23570,31 @@ mod tests {
                 "size-changing updates must fall back to delete+insert"
             );
             assert_eq!(cursor.payload(&cx).await.unwrap(), b"BBBBBBBB");
+            // The cursor stands on rowid 2: a same-size payload for another
+            // rowid is refused, and the cell keeps its bytes.
+            assert!(
+                !cursor
+                    .table_overwrite_current_payload_same_size_no_overflow(&cx, 3, b"CCCCCCCC")
+                    .await
+                    .unwrap(),
+                "an overwrite for a rowid the cursor is not on must be refused"
+            );
+            assert_eq!(cursor.rowid(&cx).await.unwrap(), 2);
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"BBBBBBBB");
+            // A second rewrite of the same cell, on the image the first wrote.
+            assert!(
+                cursor
+                    .table_overwrite_current_payload_same_size_no_overflow(&cx, 2, b"bbbbBBBB")
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"bbbbBBBB");
 
             assert!(cursor.table_move_to(&cx, 1).await.unwrap().is_found());
             assert_eq!(cursor.payload(&cx).await.unwrap(), b"aaaaaaaa");
             assert!(cursor.next(&cx).await.unwrap());
             assert_eq!(cursor.rowid(&cx).await.unwrap(), 2);
+            assert_eq!(cursor.payload(&cx).await.unwrap(), b"bbbbBBBB");
             assert!(cursor.next(&cx).await.unwrap());
             assert_eq!(cursor.payload(&cx).await.unwrap(), b"cccccccc");
         });
@@ -22221,6 +24995,613 @@ mod tests {
             assert!(stepped.eof() && reference.eof());
             assert_eq!(stepped.try_advance_next_within_leaf(&cx).unwrap(), None);
             assert_eq!(stepped.witness_keys(), reference.witness_keys());
+        });
+    }
+
+    #[test]
+    fn test_try_table_seek_within_leaf_matches_table_move_to_and_declines_off_its_leaf() {
+        fn five_leaf_tree() -> MemPageStore {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(
+                2,
+                build_interior_table(&[(pn(3), 20), (pn(4), 40), (pn(5), 60), (pn(6), 80)], pn(7)),
+            );
+            store
+                .pages
+                .insert(3, build_leaf_table(&[(10, b"a"), (14, b"b"), (20, b"c")]));
+            store
+                .pages
+                .insert(4, build_leaf_table(&[(30, b"d"), (40, b"e")]));
+            store
+                .pages
+                .insert(5, build_leaf_table(&[(50, b"f"), (60, b"g")]));
+            store
+                .pages
+                .insert(6, build_leaf_table(&[(70, b"h"), (80, b"i")]));
+            store
+                .pages
+                .insert(7, build_leaf_table(&[(90, b"j"), (100, b"k")]));
+            store
+        }
+
+        run_async(async {
+            let cx = Cx::new();
+            let mut reference = BtCursor::new(five_leaf_tree(), pn(2), USABLE, true);
+            let mut fast = BtCursor::new(five_leaf_tree(), pn(2), USABLE, true);
+
+            // No landing remembered yet: the fast path declines untouched.
+            assert_eq!(fast.try_table_seek_within_leaf(&cx, 14).unwrap(), None);
+            assert!(fast.position_stamp().is_none());
+
+            let mut answered = 0;
+            let mut declined = 0;
+            // Found and not-found targets on the current leaf (14, 12, 20,
+            // 60), targets the current leaf cannot place (5 before its first
+            // cell, 25 between leaves, 105 past the end) and leaf changes.
+            for target in [
+                14_i64, 12, 20, 10, 25, 30, 40, 35, 5, 60, 55, 50, 105, 100, 95, 14,
+            ] {
+                let expected = reference.table_move_to(&cx, target).await.unwrap();
+                let before = fast.position_stamp();
+                let result = match fast.try_table_seek_within_leaf(&cx, target).unwrap() {
+                    Some(result) => {
+                        answered += 1;
+                        result
+                    }
+                    None => {
+                        // Declining must leave the cursor exactly where it was.
+                        assert_eq!(fast.position_stamp(), before, "target {target}");
+                        declined += 1;
+                        fast.table_move_to(&cx, target).await.unwrap()
+                    }
+                };
+                assert_eq!(result.is_found(), expected.is_found(), "target {target}");
+                assert_eq!(fast.eof(), reference.eof(), "target {target}");
+                assert_eq!(
+                    fast.current_page_path(),
+                    reference.current_page_path(),
+                    "target {target}"
+                );
+                // The two cursors read separate stores, and each store gives
+                // its page images their own tokens: compare the position the
+                // stamp records, not the image identity.
+                let position = |stamp: Option<CursorPositionStamp>| {
+                    stamp.map(|stamp| (stamp.page_no(), stamp.cell_idx(), stamp.row_image_epoch()))
+                };
+                assert_eq!(
+                    position(fast.position_stamp()),
+                    position(reference.position_stamp()),
+                    "target {target}"
+                );
+                assert_eq!(fast.seek_cache, reference.seek_cache, "target {target}");
+                if !fast.eof() {
+                    assert_eq!(
+                        fast.rowid(&cx).await.unwrap(),
+                        reference.rowid(&cx).await.unwrap(),
+                        "target {target}"
+                    );
+                }
+            }
+            // Answered: 12, 20, 10 (leaf 3), 30, 40, 35 (leaf 4), 55, 50
+            // (leaf 5), 100, 95 (leaf 7). Declined: the first 14 (nothing
+            // remembered), 25, 5, 60, 105 and the last 14 (outside the latest
+            // landing's leaf).
+            assert_eq!(answered, 10);
+            assert_eq!(declined, 6);
+            assert_eq!(fast.witness_keys(), reference.witness_keys());
+
+            // A cursor moved off the leaf of the latest landing: the cache
+            // still names leaf 4 and admits 35, but the cursor is on leaf 3,
+            // so the fast path must not search the wrong page.
+            assert!(!fast.table_move_to(&cx, 25).await.unwrap().is_found());
+            assert!(fast.first(&cx).await.unwrap());
+            assert_eq!(fast.rowid(&cx).await.unwrap(), 10);
+            assert_eq!(fast.seek_cache[0].map(|cached| cached.page_no), Some(pn(4)));
+            let before = fast.position_stamp();
+            assert_eq!(fast.try_table_seek_within_leaf(&cx, 35).unwrap(), None);
+            assert_eq!(fast.position_stamp(), before);
+        });
+    }
+
+    /// bd-t0g9w: pages several cursors of one transaction share, as
+    /// `SharedTxnPageIo` shares the pager's staged writes, with the set of
+    /// pages written since the last `commit`.
+    #[derive(Debug, Default)]
+    struct SharedTxnPages {
+        pages: std::collections::HashMap<u32, Vec<u8>>,
+        dirty: BTreeSet<u32>,
+    }
+
+    /// One cursor's view of [`SharedTxnPages`]: it counts its own page reads
+    /// and says whether it reports dirty pages (`tracks`), which is what lets
+    /// a table descent reuse its stack.
+    #[derive(Debug)]
+    struct SharedTxnPageView {
+        shared: Rc<RefCell<SharedTxnPages>>,
+        reads: std::cell::Cell<u64>,
+        tracks: bool,
+    }
+
+    impl SharedTxnPageView {
+        fn new(shared: &Rc<RefCell<SharedTxnPages>>, tracks: bool) -> Self {
+            Self {
+                shared: Rc::clone(shared),
+                reads: std::cell::Cell::new(0),
+                tracks,
+            }
+        }
+
+        fn store(&self, page_no: PageNumber, mut bytes: Vec<u8>) {
+            bytes.resize(USABLE as usize, 0);
+            let mut shared = self.shared.borrow_mut();
+            shared.pages.insert(page_no.get(), bytes);
+            shared.dirty.insert(page_no.get());
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    impl PageReader for SharedTxnPageView {
+        fn read_page<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = Result<Vec<u8>>> + 'a {
+            self.reads.set(self.reads.get() + 1);
+            let bytes = self.shared.borrow().pages.get(&page_no.get()).cloned();
+            async move { bytes.ok_or_else(|| FrankenError::internal("page not found")) }
+        }
+
+        fn is_dirty(&self, page_no: PageNumber) -> bool {
+            self.shared.borrow().dirty.contains(&page_no.get())
+        }
+
+        fn tracks_dirty_pages(&self) -> bool {
+            self.tracks
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    impl PageWriter for SharedTxnPageView {
+        fn write_page<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            page_no: PageNumber,
+            data: &'a [u8],
+        ) -> impl Future<Output = Result<()>> + 'a {
+            self.store(page_no, data.to_vec());
+            async move { Ok(()) }
+        }
+
+        fn write_page_data<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            page_no: PageNumber,
+            data: PageData,
+        ) -> impl Future<Output = Result<()>> + 'a {
+            self.store(page_no, data.as_bytes().to_vec());
+            async move { Ok(()) }
+        }
+
+        fn allocate_page<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+        ) -> impl Future<Output = Result<PageNumber>> + 'a {
+            let next = self
+                .shared
+                .borrow()
+                .pages
+                .keys()
+                .max()
+                .map_or(2, |max| max + 1);
+            let page_no = PageNumber::new(next).ok_or_else(|| FrankenError::internal("page 0"));
+            if let Ok(page_no) = page_no {
+                self.store(page_no, Vec::new());
+            }
+            async move { page_no }
+        }
+
+        fn free_page<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = Result<()>> + 'a {
+            let mut shared = self.shared.borrow_mut();
+            shared.pages.remove(&page_no.get());
+            shared.dirty.insert(page_no.get());
+            async move { Ok(()) }
+        }
+
+        fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
+    }
+
+    fn bd_t0g9w_payload(rowid: i64) -> Vec<u8> {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let fill = (rowid % 251) as u8;
+        vec![fill; 120]
+    }
+
+    /// Seek `targets` with both cursors and require the same answers, the
+    /// same position, and the rows `rows` says the table holds.
+    ///
+    /// Each seek starts with an empty seek cache, so every probe takes the
+    /// full descent whose path reuse this keeper is about: with the eight-slot
+    /// cache (SC8 v4) a revisited target is answered from its cached leaf and
+    /// never reaches the root, and the dirty-reuse mutant then passed.
+    async fn bd_t0g9w_compare(
+        cx: &Cx,
+        reuse: &mut BtCursor<SharedTxnPageView>,
+        reference: &mut BtCursor<SharedTxnPageView>,
+        rows: &BTreeSet<i64>,
+        targets: &[i64],
+        phase: &str,
+    ) {
+        for &target in targets {
+            reuse.clear_seek_cache();
+            reference.clear_seek_cache();
+            let got = reuse.table_move_to(cx, target).await.unwrap();
+            let want = reference.table_move_to(cx, target).await.unwrap();
+            assert_eq!(got.is_found(), want.is_found(), "{phase}: target {target}");
+            assert_eq!(
+                got.is_found(),
+                rows.contains(&target),
+                "{phase}: target {target}"
+            );
+            assert_eq!(reuse.eof(), reference.eof(), "{phase}: target {target}");
+            assert_eq!(
+                reuse.current_page_path(),
+                reference.current_page_path(),
+                "{phase}: target {target}"
+            );
+            if !reuse.eof() {
+                assert_eq!(
+                    reuse.rowid(cx).await.unwrap(),
+                    reference.rowid(cx).await.unwrap(),
+                    "{phase}: target {target}"
+                );
+            }
+            if got.is_found() {
+                assert_eq!(
+                    reuse.payload(cx).await.unwrap(),
+                    bd_t0g9w_payload(target),
+                    "{phase}: target {target}"
+                );
+            }
+        }
+    }
+
+    /// bd-t0g9w: a table descent reuses the clean pages its previous descent
+    /// left on the stack, and reloads every page another cursor of the same
+    /// transaction rewrote. Cursor `reuse` reports dirty pages, cursor
+    /// `reference` does not (so it never reuses), and `writer` splits, grows
+    /// and shrinks the tree under both between their seeks. Every answer must
+    /// match the reference and the rows the table holds; a descent that reused
+    /// a rewritten root or leaf would land on a page that no longer holds the
+    /// target.
+    #[test]
+    fn test_table_descent_reuses_its_clean_path_and_reloads_pages_a_peer_cursor_rewrote() {
+        const ROWS: i64 = 1500;
+        let payload = bd_t0g9w_payload;
+
+        run_async(async {
+            let cx = Cx::new();
+            let root = pn(2);
+            let shared = Rc::new(RefCell::new(SharedTxnPages::default()));
+            for (page_no, bytes) in MemPageStore::with_empty_table(root, USABLE).pages {
+                shared.borrow_mut().pages.insert(page_no, bytes);
+            }
+            let mut writer =
+                BtCursor::new(SharedTxnPageView::new(&shared, false), root, USABLE, true);
+            let mut rows = BTreeSet::new();
+            for i in 1..=ROWS {
+                writer
+                    .table_insert(&cx, 3 * i, &payload(3 * i))
+                    .await
+                    .unwrap();
+                rows.insert(3 * i);
+            }
+            shared.borrow_mut().dirty.clear();
+
+            let mut reuse =
+                BtCursor::new(SharedTxnPageView::new(&shared, true), root, USABLE, true);
+            let mut reference =
+                BtCursor::new(SharedTxnPageView::new(&shared, false), root, USABLE, true);
+            // The index-driven shape: runs of ascending rowids a few leaves
+            // apart, with misses, both ends, and keys past the last row.
+            let mut targets: Vec<i64> = Vec::new();
+            for run in 0..17 {
+                targets.extend((0..80).map(|k| 3 * (1 + run + 17 * k)));
+            }
+            targets.extend([0, 1, 2, 4, 3 * ROWS, 3 * ROWS + 1, 6 * ROWS, 9 * ROWS + 7]);
+            targets.extend((0..300).map(|k| (k * 7919 + 13) % (9 * ROWS)));
+
+            // 1. A clean transaction: the reusing cursor reads far fewer pages.
+            bd_t0g9w_compare(&cx, &mut reuse, &mut reference, &rows, &targets, "clean").await;
+            let (reuse_reads, reference_reads) =
+                (reuse.pager.reads.get(), reference.pager.reads.get());
+            assert!(
+                reuse_reads + 300 < reference_reads,
+                "non-vacuity: the descents must reuse their path (reads {reuse_reads} against \
+                 {reference_reads})"
+            );
+
+            // 2. A peer cursor rewrites the tree under both, uncommitted: new
+            // rows between the old ones split every leaf and the root, and
+            // deletes empty others.
+            for i in 1..=ROWS {
+                writer
+                    .table_insert(&cx, 3 * i + 1, &payload(3 * i + 1))
+                    .await
+                    .unwrap();
+                rows.insert(3 * i + 1);
+            }
+            for i in (1..=ROWS).step_by(7) {
+                assert!(writer.table_move_to(&cx, 3 * i).await.unwrap().is_found());
+                writer.delete(&cx).await.unwrap();
+                rows.remove(&(3 * i));
+            }
+            let mut written: Vec<i64> = targets.iter().map(|target| target + 1).collect();
+            written.extend(targets.iter().copied());
+            bd_t0g9w_compare(
+                &cx,
+                &mut reuse,
+                &mut reference,
+                &rows,
+                &written,
+                "peer writes",
+            )
+            .await;
+
+            // 3. Committed: the clean path is reusable again.
+            shared.borrow_mut().dirty.clear();
+            bd_t0g9w_compare(
+                &cx,
+                &mut reuse,
+                &mut reference,
+                &rows,
+                &written,
+                "after commit",
+            )
+            .await;
+        });
+    }
+
+    /// bd-w4pr1.12 (lever SL2 v2): a seek-cache hit on a cached leaf other
+    /// than the cursor's own is answered without a wait when the reader holds
+    /// that leaf's image, landing exactly where `table_move_to` lands and
+    /// reading nothing through the async path. Declines leave the cursor
+    /// untouched: a slot whose bounds outlived its leaf's image, and a cached
+    /// leaf the reader does not hold. A resident read that fails returns the
+    /// error `table_move_to` returns for the same seek. Once the reader has
+    /// refused a resident image, the cursor stops asking for other cached
+    /// leaves, while its own leaf is still answered in place.
+    #[test]
+    fn test_try_table_seek_within_leaf_answers_resident_cached_leaves() {
+        run_async(async {
+            let page = seek_cache_leaf_page;
+            let first = seek_cache_leaf_first;
+            let leaves = 5;
+            let cx = Cx::new();
+            let mut reference = BtCursor::new(seek_cache_slots_tree(leaves), pn(2), USABLE, true);
+            let store = SeekProbeStore::new(seek_cache_slots_tree(leaves));
+            store
+                .resident
+                .borrow_mut()
+                .extend((0..leaves).map(|i| page(i).get()));
+            let mut fast = BtCursor::new(store, pn(2), USABLE, true);
+            let position = |stamp: Option<CursorPositionStamp>| {
+                stamp.map(|stamp| (stamp.page_no(), stamp.cell_idx(), stamp.row_image_epoch()))
+            };
+
+            // Land on every leaf once (nothing cached admits these: each goes
+            // through the root), then move between cached leaves: middle
+            // keys, gaps and last keys, never twice in a row on one leaf.
+            let warm_up: Vec<i64> = (0..leaves).map(first).collect();
+            let cross = [
+                first(3) + 5,
+                first(0) + 2,
+                first(4) + 10,
+                first(1) + 7,
+                first(2) + 5,
+                first(0) + 10,
+                first(3) + 3,
+            ];
+            let mut answered = 0;
+            for (n, &target) in warm_up.iter().chain(cross.iter()).enumerate() {
+                let expected = reference.table_move_to(&cx, target).await.unwrap();
+                let before = fast.position_stamp();
+                fast.pager.clear_reads();
+                let result = match fast.try_table_seek_within_leaf(&cx, target).unwrap() {
+                    Some(result) => {
+                        // Answered from the resident image: no async read.
+                        assert!(fast.pager.read_pages().is_empty(), "target {target}");
+                        answered += 1;
+                        result
+                    }
+                    None => {
+                        assert_eq!(fast.position_stamp(), before, "target {target}");
+                        assert!(n < leaves, "a cross-leaf seek declined: target {target}");
+                        fast.table_move_to(&cx, target).await.unwrap()
+                    }
+                };
+                assert_eq!(result.is_found(), expected.is_found(), "target {target}");
+                assert_eq!(fast.eof(), reference.eof(), "target {target}");
+                assert_eq!(
+                    fast.current_page_path(),
+                    reference.current_page_path(),
+                    "target {target}"
+                );
+                assert_eq!(
+                    position(fast.position_stamp()),
+                    position(reference.position_stamp()),
+                    "target {target}"
+                );
+                assert_eq!(fast.seek_cache, reference.seek_cache, "target {target}");
+                assert_eq!(
+                    fast.rowid(&cx).await.unwrap(),
+                    reference.rowid(&cx).await.unwrap(),
+                    "target {target}"
+                );
+            }
+            assert_eq!(answered, cross.len());
+            assert_eq!(fast.witness_keys(), reference.witness_keys());
+
+            // A slot whose bounds outlived its leaf's image: leaf 2 now ends
+            // before the last rowid its slot recorded, so the first slot that
+            // admits that rowid cannot land it. Decline untouched; the general
+            // seek then lands where the reference lands.
+            let shrunk = build_leaf_table(&[(first(2), b"a"), (first(2) + 5, b"b")]);
+            reference.pager.pages.insert(page(2).get(), shrunk.clone());
+            fast.pager.inner.pages.insert(page(2).get(), shrunk);
+            let before = fast.position_stamp();
+            assert_eq!(
+                fast.try_table_seek_within_leaf(&cx, first(2) + 10).unwrap(),
+                None
+            );
+            assert_eq!(fast.position_stamp(), before);
+            let expected = reference.table_move_to(&cx, first(2) + 10).await.unwrap();
+            let result = fast.table_move_to(&cx, first(2) + 10).await.unwrap();
+            assert_eq!(result.is_found(), expected.is_found());
+            assert_eq!(fast.eof(), reference.eof());
+            assert_eq!(
+                position(fast.position_stamp()),
+                position(reference.position_stamp())
+            );
+            assert_eq!(fast.seek_cache, reference.seek_cache);
+
+            // A resident read that fails: the same failure as table_move_to's.
+            *fast.pager.resident_refusal.borrow_mut() = Some(page(4).get());
+            let before = fast.position_stamp();
+            let fast_error = fast
+                .try_table_seek_within_leaf(&cx, first(4) + 5)
+                .unwrap_err();
+            assert_eq!(fast.position_stamp(), before);
+            let general_error = fast.table_move_to(&cx, first(4) + 5).await.unwrap_err();
+            assert_eq!(fast_error.to_string(), general_error.to_string());
+            *fast.pager.resident_refusal.borrow_mut() = None;
+
+            // Land on leaf 0 through the general path, so leaf 1 is cached but
+            // not current, then take leaf 1 out of the reader's resident set:
+            // decline untouched.
+            assert!(fast.table_move_to(&cx, first(0)).await.unwrap().is_found());
+            fast.pager
+                .resident
+                .borrow_mut()
+                .retain(|&held| held != page(1).get());
+            let before = fast.position_stamp();
+            assert_eq!(
+                fast.try_table_seek_within_leaf(&cx, first(1) + 5).unwrap(),
+                None
+            );
+            assert_eq!(fast.position_stamp(), before);
+
+            // From then on another cached leaf declines although the reader
+            // holds it (leaf 3 is resident), while the cursor's own leaf is
+            // still answered in place.
+            fast.pager.clear_reads();
+            let before = fast.position_stamp();
+            assert_eq!(
+                fast.try_table_seek_within_leaf(&cx, first(3) + 5).unwrap(),
+                None
+            );
+            assert_eq!(fast.position_stamp(), before);
+            assert!(
+                fast.try_table_seek_within_leaf(&cx, first(0) + 5)
+                    .unwrap()
+                    .is_some_and(SeekResult::is_found)
+            );
+            assert!(fast.pager.read_pages().is_empty());
+        });
+    }
+
+    /// bd-w4pr1.12 (lever SL2 v3): a probe `try_table_seek_within_leaf`
+    /// leaves to the general path hands that path its slot scan. The general
+    /// path starts at the slot the fast path found and did not answer, so it
+    /// lands from the cache with no descent, and a hint left for one rowid
+    /// does not apply to another. Every landing equals a reference cursor's.
+    /// The reader holds nothing resident and tracks no dirty pages, so a
+    /// descent reads the root (page 2) and a cache hit reads only its leaf.
+    #[test]
+    fn test_try_table_seek_within_leaf_hands_its_slot_scan_to_the_general_path() {
+        run_async(async {
+            let page = seek_cache_leaf_page;
+            let first = seek_cache_leaf_first;
+            let cx = Cx::new();
+            let mut reference = BtCursor::new(seek_cache_slots_tree(4), pn(2), USABLE, true);
+            let mut fast = BtCursor::new(
+                SeekProbeStore::new(seek_cache_slots_tree(4)),
+                pn(2),
+                USABLE,
+                true,
+            );
+            let position = |stamp: Option<CursorPositionStamp>| {
+                stamp.map(|stamp| (stamp.page_no(), stamp.cell_idx(), stamp.row_image_epoch()))
+            };
+            // Leaves 0 and 1 cached, leaf 1 current and newest.
+            for target in [first(0), first(1)] {
+                reference.table_move_to(&cx, target).await.unwrap();
+                fast.table_move_to(&cx, target).await.unwrap();
+            }
+
+            // Leaf 0's slot admits the target, but its leaf is not resident:
+            // the fast path declines, and the general path starts at that slot
+            // and lands from the cache (leaf 0's page only, no root).
+            let target = first(0) + 5;
+            let before = fast.position_stamp();
+            assert_eq!(fast.try_table_seek_within_leaf(&cx, target).unwrap(), None);
+            assert_eq!(fast.position_stamp(), before);
+            fast.pager.clear_reads();
+            let result = fast.table_move_to(&cx, target).await.unwrap();
+            assert_eq!(
+                fast.pager.read_pages(),
+                vec![page(0)],
+                "a cache hit, no descent"
+            );
+            let expected = reference.table_move_to(&cx, target).await.unwrap();
+            assert_eq!(result.is_found(), expected.is_found());
+            assert_eq!(
+                position(fast.position_stamp()),
+                position(reference.position_stamp())
+            );
+            assert_eq!(fast.seek_cache, reference.seek_cache);
+
+            // A probe no slot admits (leaf 3 was never visited) leaves a hint
+            // for its own rowid only: the next seek, for a rowid leaf 1's slot
+            // admits, still finds that slot and lands from the cache.
+            assert_eq!(
+                fast.try_table_seek_within_leaf(&cx, first(3) + 5).unwrap(),
+                None
+            );
+            fast.pager.clear_reads();
+            let target = first(1) + 5;
+            let result = fast.table_move_to(&cx, target).await.unwrap();
+            assert_eq!(
+                fast.pager.read_pages(),
+                vec![page(1)],
+                "a cache hit, no descent"
+            );
+            let expected = reference.table_move_to(&cx, target).await.unwrap();
+            assert_eq!(result.is_found(), expected.is_found());
+            assert_eq!(
+                position(fast.position_stamp()),
+                position(reference.position_stamp())
+            );
+            assert_eq!(fast.seek_cache, reference.seek_cache);
+
+            // The probe no slot admits, through both paths: one descent, the
+            // reference's landing.
+            let target = first(3) + 5;
+            assert_eq!(fast.try_table_seek_within_leaf(&cx, target).unwrap(), None);
+            fast.pager.clear_reads();
+            let result = fast.table_move_to(&cx, target).await.unwrap();
+            assert_eq!(fast.pager.read_pages(), vec![pn(2), page(3)], "a descent");
+            let expected = reference.table_move_to(&cx, target).await.unwrap();
+            assert_eq!(result.is_found(), expected.is_found());
+            assert_eq!(
+                position(fast.position_stamp()),
+                position(reference.position_stamp())
+            );
+            assert_eq!(fast.seek_cache, reference.seek_cache);
+            assert_eq!(fast.witness_keys(), reference.witness_keys());
         });
     }
 

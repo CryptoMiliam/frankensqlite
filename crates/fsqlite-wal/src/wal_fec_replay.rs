@@ -10,15 +10,24 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::Read;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::PageNumber;
+use fsqlite_types::cx::Cx;
+use fsqlite_types::flags::SyncFlags;
+use fsqlite_vfs::VfsFile;
+use tracing::{debug, error, info, warn};
 
 use super::{
     WalFecDecodeProof, WalFecGroupMeta, WalFecRecoveryFallbackReason, WalFecRecoveryGroupRecord,
-    WalFecRecoveryOutcome, WalFrameCandidate, read_length_prefixed,
-    recover_wal_fec_group_record_with_decoder, scan_offset_after_optional_pragma_header,
-    wal_fec_raptorq_decode,
+    WalFecRecoveryLog, WalFecRecoveryOutcome, WalFrameCandidate, read_length_prefixed,
+    record_raptorq_recovery_log_with_witness, recover_wal_fec_group_record_with_decoder,
+    scan_offset_after_optional_pragma_header, wal_fec_path_for_wal, wal_fec_raptorq_decode,
 };
 use crate::checksum::{
     SqliteWalChecksum, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WalChecksumTransform,
@@ -26,9 +35,8 @@ use crate::checksum::{
 };
 use crate::parallel_wal::{
     PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE, ParallelWalDurableCertificateRecord,
-    ParallelWalFramePayloadDigestBuilder,
 };
-use crate::wal::WalGenerationIdentity;
+use crate::wal::{WalFile, WalGenerationIdentity};
 
 /// Admission limits, checked before image copies or decoder construction.
 /// These bound input sizes and source/repair counts, not total process RSS.
@@ -476,8 +484,10 @@ pub fn recover_wal_fec_image_with_certificates<'a>(
         let meta = &group.meta;
         let source_pages = usize::try_from(meta.k_source)
             .map_err(|_| corrupt("FEC source count exceeds address space"))?;
+        // The repair bound counts every block's symbols (bd-mcpbv item 2).
         if source_pages > limits.max_source_pages
-            || usize::try_from(meta.r_repair).unwrap_or(usize::MAX) > limits.max_repair_symbols
+            || usize::try_from(meta.repair_symbol_count()).unwrap_or(usize::MAX)
+                > limits.max_repair_symbols
         {
             stop = Some(WalFecReplayStop {
                 frame_no: damaged_frame_no,
@@ -781,7 +791,7 @@ fn match_replay_certificate(
             return None;
         }
     }
-    let mut digest = ParallelWalFramePayloadDigestBuilder::new();
+    let mut digest = record.frame_payload_digest_builder();
     let mut terminal = None;
     for frame in image.get(start..end)?.chunks_exact(frame_size) {
         let header = WalFrameHeader::from_bytes(frame).ok()?;
@@ -844,18 +854,21 @@ fn find_recovery_group(
         }
         if matches
             && (usize::try_from(meta.k_source).unwrap_or(usize::MAX) > limits.max_source_pages
-                || usize::try_from(meta.r_repair).unwrap_or(usize::MAX) > limits.max_repair_symbols)
+                || usize::try_from(meta.repair_symbol_count()).unwrap_or(usize::MAX)
+                    > limits.max_repair_symbols)
         {
             return Err(Stop::ResourceLimit);
         }
         // Every iteration consumes at least a length prefix. A forged count
         // cannot spin past the admitted input size.
-        if u64::from(meta.r_repair) > u64::try_from((bytes.len() - cursor) / 4).unwrap_or(0) {
+        // r_repair per source block (bd-mcpbv item 2).
+        let repair_count = meta.repair_symbol_count();
+        if u64::from(repair_count) > u64::try_from((bytes.len() - cursor) / 4).unwrap_or(0) {
             return Err(Stop::UnusableSidecar);
         }
         let mut repair_symbols = Vec::new();
         let mut corruption_observations = 0_u32;
-        for _ in 0..meta.r_repair {
+        for _ in 0..repair_count {
             let payload = read_length_prefixed(bytes, &mut cursor)
                 .map_err(|_| Stop::UnusableSidecar)?
                 .ok_or(Stop::UnusableSidecar)?;
@@ -889,6 +902,451 @@ fn corrupt(detail: impl Into<String>) -> FrankenError {
     FrankenError::WalCorrupt {
         detail: detail.into(),
     }
+}
+
+/// Summary returned by [`repair_wal_file_in_place_with_fec`] (bd-1hi.11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalFecLiveRepairReport {
+    pub initial_committed_frames: usize,
+    pub final_committed_frames: usize,
+    pub repaired_frame_nos: Vec<u32>,
+    pub certificate_anchors: usize,
+    pub decode_proofs: Vec<WalFecDecodeProof>,
+    pub stop: Option<WalFecReplayStop>,
+    pub wrote_wal_bytes: bool,
+}
+
+/// Fast read-only probe checking whether `sidecar_path` contains a WAL-FEC
+/// group bound to `header.salts` that covers one-based `frame_no`.
+///
+/// Used on `WalScanStopKind::SaltMismatch` so normal stale tails left after a
+/// checkpoint reset never escalate to an exclusive recovery lock, while a
+/// real salt-field bit-flip inside a protected commit group still triggers
+/// live self-healing recovery (bd-1hi.11).
+#[must_use]
+pub fn wal_fec_sidecar_covers_frame(
+    sidecar_path: &Path,
+    header: &WalHeader,
+    frame_no: u32,
+) -> bool {
+    let limits = WalFecReplayLimits::default();
+    let Ok(Some(bytes)) = read_bounded_host_file(sidecar_path, limits.max_sidecar_bytes) else {
+        return false;
+    };
+    find_recovery_group(&bytes, header, frame_no, limits).is_ok()
+}
+
+fn companion_path(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut os = db_path.as_os_str().to_os_string();
+    os.push(suffix);
+    PathBuf::from(os)
+}
+
+/// Read a host file bounded by `max_bytes`. Returns `Ok(None)` if the file
+/// does not exist or exceeds `max_bytes`.
+fn read_bounded_host_file(path: &Path, max_bytes: usize) -> Result<Option<Vec<u8>>> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(FrankenError::Io(err)),
+    };
+    let len = file.metadata().map_err(FrankenError::Io)?.len();
+    let Ok(len_usize) = usize::try_from(len) else {
+        return Ok(None);
+    };
+    if len_usize > max_bytes {
+        return Ok(None);
+    }
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(len_usize)
+        .map_err(|_| FrankenError::OutOfMemory)?;
+    file.read_to_end(&mut buf).map_err(FrankenError::Io)?;
+    if buf.len() > max_bytes {
+        return Ok(None);
+    }
+    Ok(Some(buf))
+}
+
+/// Read the 16-byte `database_file_id` from bytes `76..92` of the main
+/// database header, returning `[0; 16]` when absent or shorter than 92 bytes.
+fn read_database_file_id(db_path: &Path) -> [u8; 16] {
+    let Ok(mut file) = File::open(db_path) else {
+        return [0; 16];
+    };
+    let mut header = [0_u8; 92];
+    if file.read_exact(&mut header).is_err() {
+        return [0; 16];
+    }
+    let mut id = [0_u8; 16];
+    id.copy_from_slice(&header[76..92]);
+    id
+}
+
+async fn read_bounded_vfs_file<F: VfsFile>(
+    cx: &Cx,
+    file: &F,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>> {
+    let file_size = file.file_size(cx)?;
+    let Ok(total_len) = usize::try_from(file_size) else {
+        return Ok(None);
+    };
+    if total_len > max_bytes {
+        return Ok(None);
+    }
+    let mut out = Vec::new();
+    out.try_reserve_exact(total_len)
+        .map_err(|_| FrankenError::OutOfMemory)?;
+    out.resize(total_len, 0);
+    let mut offset = 0_usize;
+    while offset < total_len {
+        let chunk_end = (offset + 65_536).min(total_len);
+        let read_offset = u64::try_from(offset).map_err(|_| corrupt("WAL read offset overflow"))?;
+        let n = file
+            .read(cx, &mut out[offset..chunk_end], read_offset)
+            .await?;
+        if n == 0 {
+            out.truncate(offset);
+            break;
+        }
+        offset += n;
+    }
+    Ok(Some(out))
+}
+
+async fn write_ranges_vfs<F: VfsFile>(
+    cx: &Cx,
+    file: &F,
+    image: &[u8],
+    ranges: &[Range<usize>],
+) -> Result<()> {
+    for range in ranges {
+        let bytes = image
+            .get(range.clone())
+            .ok_or_else(|| corrupt("WAL live repair range exceeds reconstructed image"))?;
+        let offset =
+            u64::try_from(range.start).map_err(|_| corrupt("WAL live repair offset overflow"))?;
+        file.write(cx, bytes, offset).await?;
+    }
+    Ok(())
+}
+
+async fn verify_ranges_vfs<F: VfsFile>(
+    cx: &Cx,
+    file: &F,
+    expected: &[u8],
+    ranges: &[Range<usize>],
+) -> Result<()> {
+    let mut scratch = Vec::new();
+    for range in ranges {
+        let want = expected
+            .get(range.clone())
+            .ok_or_else(|| corrupt("WAL live repair verify range exceeds image"))?;
+        scratch.resize(want.len(), 0);
+        let offset =
+            u64::try_from(range.start).map_err(|_| corrupt("WAL live repair verify offset"))?;
+        let n = file.read(cx, &mut scratch, offset).await?;
+        if n != want.len() || scratch.as_slice() != want {
+            return Err(corrupt(format!(
+                "WAL live repair readback mismatch at byte offset {}",
+                range.start
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn settle_live_wal_repair_writes<F: VfsFile>(
+    cx: &Cx,
+    file: &mut F,
+    original_wal: &[u8],
+    reconstructed_prefix: &[u8],
+    changed_ranges: &[Range<usize>],
+) -> Result<()> {
+    let write_outcome: Result<()> = async {
+        write_ranges_vfs(cx, file, reconstructed_prefix, changed_ranges).await?;
+        file.sync(cx, SyncFlags::FULL)?;
+        verify_ranges_vfs(cx, file, reconstructed_prefix, changed_ranges).await
+    }
+    .await;
+
+    match write_outcome {
+        Ok(()) => Ok(()),
+        Err(write_err) => {
+            let rollback_ranges: Vec<Range<usize>> = changed_ranges
+                .iter()
+                .filter_map(|range| {
+                    let end = range.end.min(original_wal.len());
+                    (range.start < end).then_some(range.start..end)
+                })
+                .collect();
+            let rollback_outcome: Result<()> = async {
+                write_ranges_vfs(cx, file, original_wal, &rollback_ranges).await?;
+                if reconstructed_prefix.len() > original_wal.len() {
+                    let orig_len = u64::try_from(original_wal.len())
+                        .map_err(|_| corrupt("original WAL length overflow"))?;
+                    file.truncate(cx, orig_len)?;
+                }
+                file.sync(cx, SyncFlags::FULL)?;
+                verify_ranges_vfs(cx, file, original_wal, &rollback_ranges).await
+            }
+            .await;
+            match rollback_outcome {
+                Ok(()) => Err(corrupt(format!(
+                    "live WAL-FEC repair write failed; exact original WAL restored: {write_err}"
+                ))),
+                Err(rollback_err) => Err(corrupt(format!(
+                    "live WAL-FEC repair write and rollback failed: write={write_err}; rollback={rollback_err}"
+                ))),
+            }
+        }
+    }
+}
+
+fn record_live_repair_telemetry(
+    wal_path: &Path,
+    replay: &WalFecReplayResult<'_>,
+    elapsed: Duration,
+) {
+    for proof in replay.decode_proofs() {
+        let log = WalFecRecoveryLog {
+            group_id: proof.group_id,
+            recovery_enabled: true,
+            outcome_is_recovered: proof.decode_succeeded && proof.fallback_reason.is_none(),
+            fallback_reason: proof.fallback_reason,
+            validated_source_symbols: proof.validated_source_symbols,
+            validated_repair_symbols: proof.validated_repair_symbols,
+            required_symbols: proof.required_symbols,
+            available_symbols: proof.available_symbols,
+            recovered_frame_nos: proof.recovered_frame_nos.clone(),
+            corruption_observations: proof.corruption_observations,
+            decode_attempted: proof.decode_attempted,
+            decode_succeeded: proof.decode_succeeded,
+        };
+        record_raptorq_recovery_log_with_witness(&log, proof.content_witness, elapsed);
+    }
+
+    if !replay.repaired_frame_nos().is_empty() {
+        info!(
+            target: "fsqlite.wal.fec_live_recovery",
+            bead_id = "bd-1hi.11",
+            wal_path = %wal_path.display(),
+            repaired_frames = ?replay.repaired_frame_nos(),
+            committed_frames = replay.committed_frames(),
+            certificate_anchors = replay.certificate_anchors().len(),
+            elapsed_us = elapsed.as_micros(),
+            "live WAL-FEC self-healing recovery repaired damaged WAL frames"
+        );
+    }
+    if let Some(stop) = replay.stop() {
+        match stop.reason {
+            WalFecReplayStopReason::Decode(
+                WalFecRecoveryFallbackReason::InsufficientSymbols
+                | WalFecRecoveryFallbackReason::DecodeFailed,
+            )
+            | WalFecReplayStopReason::UnusableSidecar => {
+                error!(
+                    target: "fsqlite.wal.fec_live_recovery",
+                    bead_id = "bd-1hi.11",
+                    wal_path = %wal_path.display(),
+                    stop_frame_no = stop.frame_no,
+                    stop_reason = ?stop.reason,
+                    committed_frames = replay.committed_frames(),
+                    "live WAL-FEC recovery hit unrecoverable boundary; falling back to SQLite pre-group prefix"
+                );
+            }
+            _ => {
+                warn!(
+                    target: "fsqlite.wal.fec_live_recovery",
+                    bead_id = "bd-1hi.11",
+                    wal_path = %wal_path.display(),
+                    stop_frame_no = stop.frame_no,
+                    stop_reason = ?stop.reason,
+                    committed_frames = replay.committed_frames(),
+                    "live WAL-FEC recovery stopped before WAL end; preserving verified committed prefix"
+                );
+            }
+        }
+    }
+}
+
+/// Attempt live automatic WAL-FEC self-healing repair in place on an open
+/// writable [`WalFile`] while the caller holds the exclusive whole-image
+/// maintenance/recovery fence (§3.4.1, bd-1hi.11).
+///
+/// Only damaged frame ranges accepted by [`recover_wal_fec_image_with_certificates`]
+/// are written back to the WAL file, followed by `SyncFlags::FULL`, byte-exact
+/// readback verification (with full rollback on error), and
+/// [`WalFile::rebuild_state_from_file`]. Unrecoverable damage, missing groups,
+/// or unusable sidecars leave the WAL untouched and return cleanly so SQLite
+/// pre-group truncation semantics apply.
+pub async fn repair_wal_file_in_place_with_fec<F: VfsFile>(
+    cx: &Cx,
+    wal: &mut WalFile<F>,
+    wal_path: &Path,
+    db_path: &Path,
+    limits: WalFecReplayLimits,
+) -> Result<WalFecLiveRepairReport> {
+    let initial_committed_frames = wal.frame_count();
+    let sidecar_path = wal_fec_path_for_wal(wal_path);
+    debug!(
+        target: "fsqlite.wal.fec_live_recovery",
+        bead_id = "bd-1hi.11",
+        wal_path = %wal_path.display(),
+        sidecar_path = %sidecar_path.display(),
+        initial_committed_frames,
+        damage_candidate_frame = ?wal.first_damage_candidate_frame(),
+        "starting live WAL-FEC recovery attempt"
+    );
+
+    let Some(sidecar_bytes) = read_bounded_host_file(&sidecar_path, limits.max_sidecar_bytes)?
+    else {
+        warn!(
+            target: "fsqlite.wal.fec_live_recovery",
+            bead_id = "bd-1hi.11",
+            wal_path = %wal_path.display(),
+            sidecar_path = %sidecar_path.display(),
+            "WAL-FEC sidecar absent or exceeds replay limit; keeping SQLite prefix"
+        );
+        return Ok(WalFecLiveRepairReport {
+            initial_committed_frames,
+            final_committed_frames: initial_committed_frames,
+            repaired_frame_nos: Vec::new(),
+            certificate_anchors: 0,
+            decode_proofs: Vec::new(),
+            stop: None,
+            wrote_wal_bytes: false,
+        });
+    };
+
+    let Some(wal_bytes) = read_bounded_vfs_file(cx, wal.file(), limits.max_wal_bytes).await? else {
+        warn!(
+            target: "fsqlite.wal.fec_live_recovery",
+            bead_id = "bd-1hi.11",
+            wal_path = %wal_path.display(),
+            "WAL exceeds live FEC replay input limit; keeping SQLite prefix"
+        );
+        return Ok(WalFecLiveRepairReport {
+            initial_committed_frames,
+            final_committed_frames: initial_committed_frames,
+            repaired_frame_nos: Vec::new(),
+            certificate_anchors: 0,
+            decode_proofs: Vec::new(),
+            stop: Some(WalFecReplayStop {
+                frame_no: wal.first_damage_candidate_frame().unwrap_or(1),
+                reason: WalFecReplayStopReason::ResourceLimit,
+            }),
+            wrote_wal_bytes: false,
+        });
+    };
+
+    let cert_path = companion_path(db_path, "-wal-cert");
+    let certificate_bytes =
+        read_bounded_host_file(&cert_path, limits.max_certificate_bytes)?.unwrap_or_default();
+    let database_file_id = read_database_file_id(db_path);
+
+    let started = Instant::now();
+    let replay = match recover_wal_fec_image_with_certificates(
+        &wal_bytes,
+        &sidecar_bytes,
+        &certificate_bytes,
+        database_file_id,
+        limits,
+    ) {
+        Ok(replay) => replay,
+        Err(err) => {
+            warn!(
+                target: "fsqlite.wal.fec_live_recovery",
+                bead_id = "bd-1hi.11",
+                wal_path = %wal_path.display(),
+                error = %err,
+                "live WAL-FEC replay refused input; keeping SQLite prefix"
+            );
+            return Ok(WalFecLiveRepairReport {
+                initial_committed_frames,
+                final_committed_frames: initial_committed_frames,
+                repaired_frame_nos: Vec::new(),
+                certificate_anchors: 0,
+                decode_proofs: Vec::new(),
+                stop: None,
+                wrote_wal_bytes: false,
+            });
+        }
+    };
+    let elapsed = started.elapsed();
+    record_live_repair_telemetry(wal_path, &replay, elapsed);
+
+    let repaired_frame_nos = replay.repaired_frame_nos().to_vec();
+    let certificate_anchors = replay.certificate_anchors().len();
+    let decode_proofs = replay.decode_proofs().to_vec();
+    let stop = replay.stop();
+
+    if repaired_frame_nos.is_empty() {
+        return Ok(WalFecLiveRepairReport {
+            initial_committed_frames,
+            final_committed_frames: initial_committed_frames,
+            repaired_frame_nos,
+            certificate_anchors,
+            decode_proofs,
+            stop,
+            wrote_wal_bytes: false,
+        });
+    }
+
+    let prefix = replay.replayable_prefix();
+    let page_size = usize::try_from(replay.header().page_size)
+        .map_err(|_| corrupt("WAL page size exceeds address space during live repair"))?;
+    let frame_size = WAL_FRAME_HEADER_SIZE
+        .checked_add(page_size)
+        .ok_or_else(|| corrupt("WAL frame size overflow during live repair"))?;
+    if prefix.get(..WAL_HEADER_SIZE) != wal_bytes.get(..WAL_HEADER_SIZE)
+        || replay.restored_tail_bytes() > page_size
+    {
+        return Err(corrupt(
+            "live WAL-FEC repair refused generation replacement or unbounded tail growth",
+        ));
+    }
+
+    let mut changed_ranges = Vec::new();
+    for offset in (WAL_HEADER_SIZE..prefix.len()).step_by(frame_size) {
+        let range = offset..offset + frame_size;
+        if wal_bytes.get(range.clone()) != Some(&prefix[range.clone()]) {
+            changed_ranges.push(range);
+        }
+    }
+    if changed_ranges.is_empty() {
+        return Ok(WalFecLiveRepairReport {
+            initial_committed_frames,
+            final_committed_frames: wal.frame_count(),
+            repaired_frame_nos,
+            certificate_anchors,
+            decode_proofs,
+            stop,
+            wrote_wal_bytes: false,
+        });
+    }
+
+    settle_live_wal_repair_writes(cx, wal.file_mut(), &wal_bytes, prefix, &changed_ranges).await?;
+    wal.rebuild_state_from_file(cx).await?;
+
+    let expected_min_frames = usize::try_from(replay.committed_frames()).unwrap_or(usize::MAX);
+    if wal.frame_count() < expected_min_frames {
+        return Err(corrupt(format!(
+            "live WAL-FEC rebuild validated {} frames, fewer than repaired {} frames",
+            wal.frame_count(),
+            expected_min_frames
+        )));
+    }
+
+    Ok(WalFecLiveRepairReport {
+        initial_committed_frames,
+        final_committed_frames: wal.frame_count(),
+        repaired_frame_nos,
+        certificate_anchors,
+        decode_proofs,
+        stop,
+        wrote_wal_bytes: true,
+    })
 }
 
 #[cfg(test)]
@@ -942,7 +1400,9 @@ mod tests {
                 f: u64::from(count) * u64::from(PAGE_SIZE_U32),
                 al: 1,
                 t: PAGE_SIZE_U32,
-                z: 1,
+                // As the commit pipeline writes it: one source block up to
+                // WAL_FEC_MAX_BLOCK_SOURCE_SYMBOLS frames (bd-mcpbv item 2).
+                z: crate::wal_fec::wal_fec_source_block_count(count),
                 n: 1,
             },
             object_id: ObjectId::derive_from_canonical_bytes(&[tag]),
@@ -1059,6 +1519,146 @@ mod tests {
             result.complete_image().is_err(),
             "fallback is not complete recovery"
         );
+    }
+
+    /// Admits the 600-frame groups below, which the default limits refuse.
+    fn large_commit_limits() -> WalFecReplayLimits {
+        WalFecReplayLimits {
+            max_source_pages: 1024,
+            ..WalFecReplayLimits::default()
+        }
+    }
+
+    /// The byte length of a group record's first `records` length-prefixed
+    /// records (the metadata, then the repair symbols in block order).
+    fn prefix_of_records(record: &[u8], records: usize) -> usize {
+        let mut cursor = 0;
+        for _ in 0..records {
+            let len = u32::from_le_bytes(record[cursor..cursor + 4].try_into().unwrap());
+            cursor += 4 + usize::try_from(len).unwrap();
+        }
+        cursor
+    }
+
+    #[test]
+    fn large_commit_repairs_damage_in_two_source_blocks_byte_identically() {
+        // bd-mcpbv item 2 keeper (a): a 600-frame commit (> K_max) is one group
+        // of three 200-frame source blocks, each with its own r = 2. Block 0
+        // holds frames 3..=202, block 1 203..=402, block 2 403..=602.
+        for magic in [WAL_MAGIC_LE, WAL_MAGIC_BE] {
+            let mut wal = header(magic).to_bytes().unwrap().to_vec();
+            let mut sidecar = append_group(&mut wal, 2, 2, 50);
+            sidecar.extend(append_group(&mut wal, 600, 2, 51));
+            append_group(&mut wal, 2, 2, 52); // Later healthy commit has no sidecar entry.
+            let groups =
+                crate::wal_fec::scan_wal_fec_bytes(std::path::Path::new("snapshot-only"), &sidecar)
+                    .unwrap()
+                    .groups;
+            assert_eq!(groups[1].meta.oti.z, 3);
+            assert_eq!(groups[1].repair_symbols.len(), 6);
+            let expected = wal.clone();
+            // Two frames in block 0 (its whole budget) and one in block 2.
+            for frame in [10, 202, 450] {
+                corrupt_payload(&mut wal, frame);
+            }
+            let result = recover_wal_fec_image(&wal, &sidecar, large_commit_limits()).unwrap();
+            assert_eq!(result.committed_frames(), 604);
+            assert_eq!(result.repaired_frame_nos(), &[10, 202, 450]);
+            assert!(result.decode_proofs()[0].decode_attempted);
+            assert_eq!(result.complete_image().unwrap().as_ref(), expected);
+        }
+    }
+
+    #[test]
+    fn one_block_past_its_budget_refuses_the_group_like_an_over_budget_group() {
+        // bd-mcpbv item 2 keeper (b), the negative. Three damaged frames in
+        // block 1 (203..=402) exceed its r = 2, although the group as a whole
+        // still holds 597 + 6 >= 600 symbols, so a group-wide count would admit
+        // it. The refusal must match today's over-budget one-block group (the
+        // 200-frame case): no decode, no partial or wrong repair.
+        let limits = large_commit_limits();
+        for (count, damaged) in [(600_u32, [210_u32, 300, 402]), (200, [10, 100, 202])] {
+            let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+            append_group(&mut wal, 2, 2, 53);
+            let accepted = wal.clone();
+            let sidecar = append_group(&mut wal, count, 2, 54);
+            for frame in damaged {
+                corrupt_payload(&mut wal, frame);
+            }
+            let result = recover_wal_fec_image(&wal, &sidecar, limits).unwrap();
+            assert_eq!(result.committed_frames(), 2, "{count} frames");
+            assert_eq!(result.replayable_prefix(), accepted);
+            assert!(result.repaired_frame_nos().is_empty());
+            assert_eq!(
+                result.stop().unwrap().reason,
+                WalFecReplayStopReason::Decode(WalFecRecoveryFallbackReason::InsufficientSymbols)
+            );
+            assert!(
+                !result.decode_proofs()[0].decode_attempted,
+                "refused before any decode"
+            );
+            assert!(result.complete_image().is_err());
+        }
+        // Control: the same number of damaged frames, one per block, repairs.
+        let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+        append_group(&mut wal, 2, 2, 53);
+        let sidecar = append_group(&mut wal, 600, 2, 54);
+        let expected = wal.clone();
+        for frame in [100, 300, 500] {
+            corrupt_payload(&mut wal, frame);
+        }
+        let result = recover_wal_fec_image(&wal, &sidecar, limits).unwrap();
+        assert_eq!(result.repaired_frame_nos(), &[100, 300, 500]);
+        assert_eq!(result.complete_image().unwrap().as_ref(), expected);
+    }
+
+    #[test]
+    fn crash_before_a_large_commit_frame_is_durable_leaves_no_trace() {
+        // bd-mcpbv item 2 keeper (c). A large commit's blocks reach the sidecar
+        // as one appended record; a crash mid-append leaves that record torn
+        // after some blocks. With the commit frame itself torn in the WAL,
+        // recovery keeps only the previous transaction, as stock does, with or
+        // without damage inside the lost transaction.
+        let limits = large_commit_limits();
+        let mut wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+        let sidecar = append_group(&mut wal, 2, 2, 55);
+        let accepted = wal.clone();
+        let large = append_group(&mut wal, 600, 2, 56);
+        // The commit frame (602) is torn: its last bytes never reached disk.
+        let torn = &wal[..wal.len() - 100];
+        // The metadata and block 0's symbols; and two blocks; and the metadata alone.
+        for records in [3, 5, 1] {
+            let mut crashed_sidecar = sidecar.clone();
+            crashed_sidecar.extend_from_slice(&large[..prefix_of_records(&large, records)]);
+            let scan = crate::wal_fec::scan_wal_fec_bytes(
+                std::path::Path::new("snapshot-only"),
+                &crashed_sidecar,
+            )
+            .unwrap();
+            assert!(scan.truncated_tail, "{records} records");
+            assert_eq!(
+                scan.groups.len(),
+                1,
+                "only the durable previous group remains"
+            );
+            for damaged in [None, Some(10_u32)] {
+                let mut crashed_wal = torn.to_vec();
+                if let Some(frame) = damaged {
+                    corrupt_payload(&mut crashed_wal, frame);
+                }
+                let result = recover_wal_fec_image(&crashed_wal, &crashed_sidecar, limits).unwrap();
+                assert_eq!(
+                    result.committed_frames(),
+                    2,
+                    "{records} records, damage {damaged:?}"
+                );
+                assert_eq!(result.replayable_prefix(), accepted);
+                assert!(result.repaired_frame_nos().is_empty());
+                if let Ok(image) = result.complete_image() {
+                    assert_eq!(image.as_ref(), accepted);
+                }
+            }
+        }
     }
 
     #[test]
@@ -1935,7 +2535,7 @@ mod tests {
     ) -> ParallelWalDurableCertificateRecord {
         use crate::parallel_wal::{
             PARALLEL_WAL_COMMIT_CERTIFICATE_VERSION, ParallelWalCommitCertificate,
-            ParallelWalOrderedResidue,
+            ParallelWalFramePayloadDigestBuilder, ParallelWalOrderedResidue,
         };
         use fsqlite_types::CommitSeq;
 
@@ -2282,5 +2882,194 @@ mod tests {
         assert_eq!(result.certificate_anchors().len(), 1);
         assert_eq!(result.replayable_prefix(), accepted);
         assert!(result.complete_image().is_err());
+    }
+
+    #[test]
+    fn test_bd_1hi_11_unit_compliance_gate() {
+        use crate::test_support::FutureResultTestExt as _;
+        use fsqlite_types::flags::VfsOpenFlags;
+        use fsqlite_vfs::MemoryVfs;
+        use fsqlite_vfs::traits::Vfs;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("unit_gate.db");
+        let wal_path = dir.path().join("unit_gate.db-wal");
+        let sidecar_path = wal_fec_path_for_wal(&wal_path);
+
+        // Build a 5-frame WAL group (K=5, R=3) so positive 2-frame repair has
+        // K+1 symbols (deterministic RFC 6330 decode) while negative 4-frame
+        // corruption falls strictly below K (InsufficientSymbols).
+        let mut clean_wal = header(WAL_MAGIC_LE).to_bytes().unwrap().to_vec();
+        let sidecar = append_group(&mut clean_wal, 5, 3, 91);
+        std::fs::write(&sidecar_path, &sidecar).expect("write sidecar");
+
+        // Positive case: corrupt 2 frames (within R=3 budget, K+1 symbols remain),
+        // open via WalFile, verify checksum_mismatch_stop is surfaced and live
+        // in-place repair heals all 5 frames.
+        let mut damaged_wal = clean_wal.clone();
+        corrupt_payload(&mut damaged_wal, 2);
+        corrupt_payload(&mut damaged_wal, 3);
+
+        let vfs = MemoryVfs::new();
+        let cx = Cx::new();
+        let mem_wal_path = Path::new("unit_gate_pos.wal");
+        let (file, _) = vfs
+            .open(
+                &cx,
+                Some(mem_wal_path),
+                VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL,
+            )
+            .expect("open mem wal");
+        file.write(&cx, &damaged_wal, 0).expect("seed damaged wal");
+        let mut wal = WalFile::open(&cx, file).expect("open damaged wal");
+        assert_eq!(wal.frame_count(), 0);
+        assert_eq!(
+            wal.last_scan_stop(),
+            Some(crate::wal::WalScanStopKind::FrameDamage { frame_no: 2 })
+        );
+
+        let report = repair_wal_file_in_place_with_fec(
+            &cx,
+            &mut wal,
+            &wal_path,
+            &db_path,
+            WalFecReplayLimits::default(),
+        )
+        .expect("live repair succeeds");
+        assert!(report.wrote_wal_bytes);
+        assert_eq!(report.initial_committed_frames, 0);
+        assert_eq!(report.final_committed_frames, 5);
+        assert_eq!(report.repaired_frame_nos, vec![2, 3]);
+        assert!(report.stop.is_none());
+        assert_eq!(report.decode_proofs.len(), 1);
+        assert!(report.decode_proofs[0].decode_succeeded);
+        assert_eq!(wal.frame_count(), 5);
+        assert_eq!(wal.last_scan_stop(), None);
+
+        // Verify the repaired VFS bytes match the clean WAL byte-for-byte.
+        let mut after_bytes = vec![0_u8; clean_wal.len()];
+        let n = wal.file().read(&cx, &mut after_bytes, 0).expect("readback");
+        assert_eq!(n, clean_wal.len());
+        assert_eq!(after_bytes, clean_wal);
+
+        // Planted negative control: corrupt 4 frames (> R=3 budget) -> MUST NOT
+        // write to WAL, MUST keep original bytes untouched, MUST fall back cleanly.
+        let mut unrecoverable = clean_wal;
+        corrupt_payload(&mut unrecoverable, 1);
+        corrupt_payload(&mut unrecoverable, 2);
+        corrupt_payload(&mut unrecoverable, 3);
+        corrupt_payload(&mut unrecoverable, 4);
+        let mem_neg_path = Path::new("unit_gate_neg.wal");
+        let (neg_file, _) = vfs
+            .open(
+                &cx,
+                Some(mem_neg_path),
+                VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL,
+            )
+            .expect("open neg wal");
+        neg_file
+            .write(&cx, &unrecoverable, 0)
+            .expect("seed unrecoverable wal");
+        let mut neg_wal = WalFile::open(&cx, neg_file).expect("open neg wal");
+        let neg_report = repair_wal_file_in_place_with_fec(
+            &cx,
+            &mut neg_wal,
+            &wal_path,
+            &db_path,
+            WalFecReplayLimits::default(),
+        )
+        .expect("fallback must not error");
+        assert!(!neg_report.wrote_wal_bytes);
+        assert_eq!(neg_report.final_committed_frames, 0);
+        assert!(neg_report.repaired_frame_nos.is_empty());
+        assert!(matches!(
+            neg_report.stop,
+            Some(WalFecReplayStop {
+                frame_no: 1,
+                reason: WalFecReplayStopReason::Decode(
+                    WalFecRecoveryFallbackReason::InsufficientSymbols
+                ),
+            })
+        ));
+        let mut neg_after = vec![0_u8; unrecoverable.len()];
+        let n_neg = neg_wal
+            .file()
+            .read(&cx, &mut neg_after, 0)
+            .expect("readback neg");
+        assert_eq!(n_neg, unrecoverable.len());
+        assert_eq!(neg_after, unrecoverable);
+    }
+
+    #[test]
+    fn prop_bd_1hi_11_structure_compliance() {
+        use crate::test_support::FutureResultTestExt as _;
+        use fsqlite_types::flags::VfsOpenFlags;
+        use fsqlite_vfs::MemoryVfs;
+        use fsqlite_vfs::traits::Vfs;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("prop_struct.db");
+        let wal_path = dir.path().join("prop_struct.db-wal");
+        let sidecar_path = wal_fec_path_for_wal(&wal_path);
+
+        // Two commit groups: G1 (frames 1..=3, R=2) and G2 (frames 4..=6, R=2).
+        let hdr = header(WAL_MAGIC_LE);
+        let mut clean_wal = hdr.to_bytes().unwrap().to_vec();
+        let mut sidecar = append_group(&mut clean_wal, 3, 2, 101);
+        sidecar.extend(append_group(&mut clean_wal, 3, 2, 102));
+        std::fs::write(&sidecar_path, &sidecar).expect("write sidecar");
+
+        // Sidecar coverage check distinguishes current-generation protected
+        // frames from unrelated stale-salt tails.
+        assert!(wal_fec_sidecar_covers_frame(&sidecar_path, &hdr, 2));
+        assert!(wal_fec_sidecar_covers_frame(&sidecar_path, &hdr, 5));
+        assert!(!wal_fec_sidecar_covers_frame(&sidecar_path, &hdr, 7));
+        let mut other_hdr = hdr;
+        other_hdr.salts.salt1 ^= 0xDEAD_BEEF;
+        assert!(!wal_fec_sidecar_covers_frame(&sidecar_path, &other_hdr, 2));
+
+        // Corrupt 1 frame in G1 (recoverable) and 3 frames in G2 (>R=2, unrecoverable):
+        // live repair MUST heal G1 and leave G2 cleanly truncated without corrupting G1.
+        let mut mixed = clean_wal.clone();
+        corrupt_payload(&mut mixed, 2);
+        corrupt_payload(&mut mixed, 4);
+        corrupt_payload(&mut mixed, 5);
+        corrupt_payload(&mut mixed, 6);
+
+        let vfs = MemoryVfs::new();
+        let cx = Cx::new();
+        let mem_path = Path::new("prop_struct_mixed.wal");
+        let (file, _) = vfs
+            .open(
+                &cx,
+                Some(mem_path),
+                VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL,
+            )
+            .expect("open mixed wal");
+        file.write(&cx, &mixed, 0).expect("seed mixed wal");
+        let mut wal = WalFile::open(&cx, file).expect("open mixed");
+        assert_eq!(wal.frame_count(), 0);
+
+        let report = repair_wal_file_in_place_with_fec(
+            &cx,
+            &mut wal,
+            &wal_path,
+            &db_path,
+            WalFecReplayLimits::default(),
+        )
+        .expect("partial live repair succeeds");
+        assert!(report.wrote_wal_bytes);
+        assert_eq!(report.repaired_frame_nos, vec![2]);
+        assert_eq!(report.final_committed_frames, 3);
+        assert!(matches!(
+            report.stop,
+            Some(WalFecReplayStop {
+                frame_no: 4,
+                reason: WalFecReplayStopReason::Decode(
+                    WalFecRecoveryFallbackReason::InsufficientSymbols
+                ),
+            })
+        ));
+        assert_eq!(wal.frame_count(), 3);
     }
 }

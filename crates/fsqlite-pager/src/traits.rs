@@ -20,7 +20,7 @@ use std::sync::Arc;
 use crate::pager::{RollbackCleanup, SimpleTransaction};
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
-use fsqlite_types::{CommitSeq, PageData, PageNumber, PageSize};
+use fsqlite_types::{CommitSeq, PageData, PageNumber, PageSize, SecureDeleteMode};
 #[cfg(all(feature = "native", target_os = "linux"))]
 use fsqlite_vfs::IoUringVfs;
 #[cfg(all(feature = "native", unix))]
@@ -247,6 +247,59 @@ impl WalNativeReadBinding {
 /// instead of writing a rollback journal.
 pub type WalFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
+/// A page image a pinned WAL read answers.
+///
+/// It is bytes read for this caller alone, or the immutable image a backend
+/// keeps of a committed frame, which the caller shares instead of copying
+/// (bd-05xlf). `Option<WalPageImage>` is as wide as the `Option<Vec<u8>>` the
+/// pinned reads answered before, so a lookup that finds no frame moves no more
+/// than it did.
+#[derive(Debug, Clone)]
+pub enum WalPageImage {
+    /// Bytes no one else holds.
+    Owned(Vec<u8>),
+    /// A committed frame's image, shared with the backend's frame cache.
+    Shared(Arc<[u8]>),
+}
+
+/// Two images are equal when their bytes are, however each is held.
+impl PartialEq for WalPageImage {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl Eq for WalPageImage {}
+
+impl WalPageImage {
+    /// The page bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Shared(bytes) => bytes,
+        }
+    }
+
+    /// The bytes as an owned buffer; a shared image is copied.
+    #[must_use]
+    pub fn into_vec(self) -> Vec<u8> {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Shared(bytes) => bytes.to_vec(),
+        }
+    }
+
+    /// The image as page data; a shared image stays shared.
+    #[must_use]
+    pub fn into_page_data(self) -> PageData {
+        match self {
+            Self::Owned(bytes) => PageData::from_vec(bytes),
+            Self::Shared(bytes) => PageData::from_shared(bytes),
+        }
+    }
+}
+
 /// Source guard for the conservative tracked-WAL defaults.
 ///
 /// Constructing the guard before the async block is returned is intentional:
@@ -344,6 +397,14 @@ pub trait WalBackend: Send + Sync {
         false
     }
 
+    /// bd-j2dtf item 2: whether this backend reads the WAL through its own
+    /// index because the connection may not write the `-shm`. Its read
+    /// windows then hold stock's `WAL_READ_LOCK(0)` claim on a read-only
+    /// `-shm` descriptor instead of publishing a reader slot.
+    fn reads_through_private_index(&self) -> bool {
+        false
+    }
+
     /// The exact native reader binding currently protecting the pinned image.
     fn native_read_binding(&self) -> Option<WalNativeReadBinding> {
         None
@@ -422,6 +483,17 @@ pub trait WalBackend: Send + Sync {
     /// `None`.
     #[must_use]
     fn pinned_read_snapshot(&self) -> Option<WalPublicationSnapshot> {
+        None
+    }
+
+    /// The frames of the pinned read snapshot and the WAL file's descriptor,
+    /// for a [`crate::SnapshotPageReader`] of that snapshot (bd-w4pr1.13.11).
+    ///
+    /// `publication` must equal [`Self::pinned_read_snapshot`]. `None`, the
+    /// default, for a backend that pins no snapshot, whose page index is
+    /// partial, or whose WAL file has no positional descriptor.
+    #[must_use]
+    fn pinned_snapshot_frames(&self) -> Option<crate::snapshot_reader::WalSnapshotFrames> {
         None
     }
 
@@ -746,12 +818,16 @@ pub trait WalBackend: Send + Sync {
     /// immutable pinned snapshot should override this to avoid contention with
     /// the append path.
     ///
+    /// A backend that keeps committed frames in memory answers such a frame
+    /// with [`WalPageImage::Shared`], so the caller's read cache holds the
+    /// same image instead of a copy (bd-05xlf).
+    ///
     /// # bd-db300.3.8.7: write-lock-scope narrowing
     fn read_page_pinned<'a>(
         &'a self,
         _cx: &'a Cx,
         _page_number: u32,
-    ) -> WalFuture<'a, Option<Vec<u8>>> {
+    ) -> WalFuture<'a, Option<WalPageImage>> {
         Box::pin(async {
             // Default: signal that the implementation doesn't support pinned reads.
             // Callers must fall back to read_page(&mut self) via write lock.
@@ -759,6 +835,22 @@ pub trait WalBackend: Send + Sync {
                 "read_page_pinned not supported by this WalBackend; use read_page",
             ))
         })
+    }
+
+    /// [`Self::read_page_pinned`]'s answer when the pinned snapshot gives it
+    /// without reading the WAL: no frame of `page_number` in the snapshot, the
+    /// image of the snapshot's committed frame of it that the backend already
+    /// keeps, or the refusal `read_page_pinned` raises before it looks. `None`
+    /// means a frame must be read (or a partial index scanned), so only
+    /// `read_page_pinned` can answer. Synchronous: a page-cache miss answered
+    /// this way skips the boxed read futures (bd-w4pr1.13.18, bd-05xlf).
+    ///
+    /// The default answers `None` for every page.
+    fn read_page_pinned_without_io(
+        &self,
+        _page_number: u32,
+    ) -> Option<Result<Option<WalPageImage>>> {
+        None
     }
 
     /// Whether this backend supports `read_page_pinned` (shared-lock reads).
@@ -1123,6 +1215,12 @@ pub trait MvccPager: sealed::Sealed + Send + Sync {
     /// Whether this pager was opened read-only.
     fn is_readonly(&self) -> bool;
 
+    /// Whether this pager was opened `immutable=1` (bd-j2dtf): read-only,
+    /// lock-free, and reading the main file alone, never a `-wal`.
+    fn is_immutable(&self) -> bool {
+        false
+    }
+
     /// Switch the journal mode.
     ///
     /// Switching from `Delete` to `Wal` requires providing a [`WalBackend`]
@@ -1194,6 +1292,21 @@ impl PagerCommitState {
 ///
 /// This trait is sealed — only this crate can implement it.
 pub trait TransactionHandle: sealed::Sealed + Send {
+    /// Scrubbing policy for subsequent mutations on this handle.
+    /// Read-only snapshot handles need no policy and retain the default.
+    fn secure_delete_mode(&self) -> SecureDeleteMode {
+        SecureDeleteMode::Off
+    }
+
+    /// Apply the connection-local policy without changing shared pager state.
+    /// Like SQLite's PRAGMA, this setting is not undone by a savepoint rollback.
+    fn set_secure_delete_mode(&mut self, _mode: SecureDeleteMode) {}
+
+    /// Remember that a freed page's contents were already cleared by its
+    /// B-tree owner. FAST preserves that clearing if the page becomes a
+    /// freelist trunk, without writing it when it remains a freelist leaf.
+    fn note_freed_page_zeroed(&mut self, _page_no: PageNumber) {}
+
     /// Read a page, resolving through the MVCC version chain.
     ///
     /// Resolution order: local write-set → version chain → on-disk.
@@ -1204,6 +1317,31 @@ pub trait TransactionHandle: sealed::Sealed + Send {
         cx: &'a Cx,
         page_no: PageNumber,
     ) -> impl Future<Output = Result<PageData>> + 'a;
+
+    /// The answer [`Self::get_page`] gives for `page_no` when it needs no
+    /// shared state and no storage read: the transaction's own staged image,
+    /// an image it already read in this transaction, a rolled-back
+    /// allocation's zeros, or the error `get_page` raises from that same state
+    /// (bd-w4pr1.13.18). `None` means only a read of shared state can answer.
+    /// It is synchronous, so a caller holding a resident page skips the read
+    /// future.
+    ///
+    /// The default answers `None` for every page.
+    fn get_resident_page(&self, _cx: &Cx, _page_no: PageNumber) -> Option<Result<PageData>> {
+        None
+    }
+
+    /// [`Self::get_page`] for a caller that [`Self::get_resident_page`] has
+    /// just answered `None` for the same page, with nothing run on this handle
+    /// in between: an implementation may skip the checks that answer already
+    /// made. The default is `get_page` itself.
+    fn get_nonresident_page<'a>(
+        &'a self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = Result<PageData>> + 'a {
+        self.get_page(cx, page_no)
+    }
 
     /// Hint that `page_no` is likely to be read soon.
     ///
@@ -1359,12 +1497,35 @@ pub trait TransactionHandle: sealed::Sealed + Send {
     /// writes, even if the transaction had previously upgraded to writer mode.
     fn has_pending_writes(&self) -> bool;
 
+    /// A reader of this transaction's committed snapshot that other threads
+    /// can share while the transaction lives (bd-w4pr1.13.11).
+    ///
+    /// Offered only for a read-only transaction that has written nothing and
+    /// whose every page read resolves through one immutable committed
+    /// snapshot; `None`, the default, otherwise. Every thread using the reader
+    /// must be joined before the transaction ends.
+    fn snapshot_page_reader(&self) -> Option<crate::snapshot_reader::SnapshotPageReader> {
+        None
+    }
+
     /// Visible commit sequence bound to this transaction's current snapshot.
     ///
     /// Pager-backed transactions can expose this so upper layers reuse the
     /// transaction's own visibility boundary instead of re-binding against the
     /// global published plane mid-transaction.
     fn published_visible_commit_seq_hint(&self) -> Option<fsqlite_types::CommitSeq> {
+        None
+    }
+
+    /// The commit sequence the pager assigned to this handle's own commit,
+    /// once that commit is durable (bd-i0tn6).
+    ///
+    /// This is the commit's identity, not the published visibility horizon:
+    /// a group-commit certificate publishes every member at its high-water
+    /// sequence, and later commits can publish on top before the caller
+    /// reads it. `None` until the commit is durable, and for handles that do
+    /// not number their own commits.
+    fn committed_commit_seq(&self) -> Option<fsqlite_types::CommitSeq> {
         None
     }
 
@@ -1472,6 +1633,80 @@ pub trait TransactionHandle: sealed::Sealed + Send {
         Ok(true)
     }
 
+    /// Effective `PRAGMA auto_vacuum` mode active for this transaction (bd-1q134).
+    fn auto_vacuum_mode(&self) -> fsqlite_types::AutoVacuumMode {
+        fsqlite_types::AutoVacuumMode::None
+    }
+
+    /// Current `largest_root_page` header value for this transaction (0 when
+    /// `auto_vacuum = NONE`).
+    fn largest_root_page(&self) -> u32 {
+        0
+    }
+
+    /// Returns `Some((usable_size, full_page_size))` when pointer-map maintenance
+    /// is active for this transaction, or `None` when `auto_vacuum = NONE`.
+    fn pointer_map_page_sizes(&self) -> Option<(u32, u32)> {
+        None
+    }
+
+    /// Update transaction-local auto-vacuum mode and `largest_root_page`
+    /// (e.g. when initializing an empty database, toggling `FULL <-> INCREMENTAL`,
+    /// or packing/compacting root pages).
+    fn set_auto_vacuum_state(
+        &mut self,
+        _mode: fsqlite_types::AutoVacuumMode,
+        _largest_root_page: u32,
+    ) {
+    }
+
+    /// Read the 5-byte pointer-map entry for `child_page` when pointer maps are enabled.
+    fn read_ptrmap_entry<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        _child_page: PageNumber,
+    ) -> impl Future<Output = Result<fsqlite_types::PtrMapEntry>> + 'a {
+        async { Err(FrankenError::Unsupported) }
+    }
+
+    /// Write the 5-byte pointer-map entry for `child_page` when pointer maps are enabled.
+    fn write_ptrmap_entry<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        _child_page: PageNumber,
+        _entry: fsqlite_types::PtrMapEntry,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async { Ok(()) }
+    }
+
+    /// Ensure `ptrmap_page` is allocated and zero-initialized if not yet present.
+    fn ensure_ptrmap_page_initialized<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        _ptrmap_page: PageNumber,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async { Ok(()) }
+    }
+
+    /// Claim a specific free page number (from transaction-local `freed_pages`
+    /// or the pager freelist) without allocating an arbitrary page. Returns
+    /// `Ok(true)` if `page_no` was free and claimed, `Ok(false)` otherwise.
+    fn claim_specific_free_page(&mut self, _page_no: PageNumber) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Record an explicit auto-vacuum / incremental-vacuum truncation to
+    /// `new_db_size` pages with the exact surviving freelist and relocated
+    /// source pages (added to MVCC conflict tracking).
+    fn apply_auto_vacuum_truncation(
+        &mut self,
+        _new_db_size: u32,
+        _remaining_freelist: Vec<PageNumber>,
+        _relocated_src_pages: &[PageNumber],
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Roll back this transaction, discarding the write-set.
     ///
     /// Rollback is infallible in the MVCC model (we simply discard the
@@ -1555,6 +1790,38 @@ pub trait CheckpointPageWriter: sealed::Sealed + Send {
         Box::pin(async { Ok(None) })
     }
 
+    /// Read `buf.len() / page_size` consecutive database pages starting at
+    /// `first_page` for the same verification, which reads back a run of
+    /// pages at once (bd-w4pr1.13.20, lever N2). Returns the bytes read,
+    /// which end at the first short page, or `None` when the writer cannot
+    /// read back. The default reads page by page through
+    /// [`Self::read_page_if_supported`].
+    fn read_pages_if_supported<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        first_page: PageNumber,
+        page_size: usize,
+        buf: &'a mut [u8],
+    ) -> WalFuture<'a, Option<usize>> {
+        Box::pin(async move {
+            let mut read = 0;
+            for (page, chunk) in (first_page.get()..).zip(buf.chunks_mut(page_size)) {
+                let page_no = PageNumber::new(page).ok_or_else(|| FrankenError::OutOfRange {
+                    what: "checkpoint read-back page number".to_owned(),
+                    value: page.to_string(),
+                })?;
+                let Some(n) = self.read_page_if_supported(cx, page_no, chunk).await? else {
+                    return Ok(None);
+                };
+                read += n;
+                if n != chunk.len() {
+                    break;
+                }
+            }
+            Ok(Some(read))
+        })
+    }
+
     /// GH#399: take the cross-process gate that excludes every WAL reader
     /// pinned to the current generation while it is replaced by a
     /// RESTART/TRUNCATE reset. `Ok(false)` means a peer reader still pins the
@@ -1593,6 +1860,7 @@ impl MvccPager for MockMvccPager {
                 committed: false,
                 next_page: 2,
                 savepoint_names: Vec::new(),
+                secure_delete_mode: SecureDeleteMode::Off,
             })
         }
     }
@@ -1628,11 +1896,20 @@ pub struct MockTransaction {
     committed: bool,
     next_page: u32,
     savepoint_names: Vec<String>,
+    secure_delete_mode: SecureDeleteMode,
 }
 
 impl sealed::Sealed for MockTransaction {}
 
 impl TransactionHandle for MockTransaction {
+    fn secure_delete_mode(&self) -> SecureDeleteMode {
+        self.secure_delete_mode
+    }
+
+    fn set_secure_delete_mode(&mut self, mode: SecureDeleteMode) {
+        self.secure_delete_mode = mode;
+    }
+
     fn get_page<'a>(
         &'a self,
         _cx: &'a Cx,
@@ -1757,6 +2034,7 @@ impl MvccPager for MemoryMockMvccPager {
                 next_page: 2,
                 pages: HashMap::new(),
                 savepoints: Vec::new(),
+                secure_delete_mode: SecureDeleteMode::Off,
             })
         }
     }
@@ -1801,11 +2079,20 @@ pub struct MemoryMockTransaction {
     next_page: u32,
     pages: HashMap<PageNumber, PageData>,
     savepoints: Vec<MemoryMockSavepoint>,
+    secure_delete_mode: SecureDeleteMode,
 }
 
 impl sealed::Sealed for MemoryMockTransaction {}
 
 impl TransactionHandle for MemoryMockTransaction {
+    fn secure_delete_mode(&self) -> SecureDeleteMode {
+        self.secure_delete_mode
+    }
+
+    fn set_secure_delete_mode(&mut self, mode: SecureDeleteMode) {
+        self.secure_delete_mode = mode;
+    }
+
     fn get_page<'a>(
         &'a self,
         _cx: &'a Cx,
@@ -2200,6 +2487,18 @@ impl From<MemoryMockTransaction> for TransactionKind {
 impl sealed::Sealed for TransactionKind {}
 
 impl TransactionHandle for TransactionKind {
+    fn secure_delete_mode(&self) -> SecureDeleteMode {
+        dispatch_transaction_kind!(self, txn => txn.secure_delete_mode())
+    }
+
+    fn set_secure_delete_mode(&mut self, mode: SecureDeleteMode) {
+        dispatch_transaction_kind!(self, txn => txn.set_secure_delete_mode(mode));
+    }
+
+    fn note_freed_page_zeroed(&mut self, page_no: PageNumber) {
+        dispatch_transaction_kind!(self, txn => txn.note_freed_page_zeroed(page_no));
+    }
+
     // These TransactionKind dispatch sites show up in self-time profiles.
     // Routing them through `with_handle` / `with_handle_mut` coerces the
     // concrete `&SimpleTransaction<V>` into `&dyn TransactionHandle` inside the
@@ -2213,6 +2512,20 @@ impl TransactionHandle for TransactionKind {
         page_no: PageNumber,
     ) -> impl Future<Output = Result<PageData>> + 'a {
         async move { dispatch_transaction_kind!(self, txn => txn.get_page(cx, page_no).await) }
+    }
+
+    fn get_resident_page(&self, cx: &Cx, page_no: PageNumber) -> Option<Result<PageData>> {
+        dispatch_transaction_kind!(self, txn => txn.get_resident_page(cx, page_no))
+    }
+
+    fn get_nonresident_page<'a>(
+        &'a self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = Result<PageData>> + 'a {
+        async move {
+            dispatch_transaction_kind!(self, txn => txn.get_nonresident_page(cx, page_no).await)
+        }
     }
 
     fn prefetch_page_hint(&self, cx: &Cx, page_no: PageNumber) {
@@ -2293,8 +2606,16 @@ impl TransactionHandle for TransactionKind {
         dispatch_transaction_kind!(self, txn => txn.has_pending_writes())
     }
 
+    fn snapshot_page_reader(&self) -> Option<crate::snapshot_reader::SnapshotPageReader> {
+        dispatch_transaction_kind!(self, txn => txn.snapshot_page_reader())
+    }
+
     fn published_visible_commit_seq_hint(&self) -> Option<fsqlite_types::CommitSeq> {
         dispatch_transaction_kind!(self, txn => txn.published_visible_commit_seq_hint())
+    }
+
+    fn committed_commit_seq(&self) -> Option<fsqlite_types::CommitSeq> {
+        dispatch_transaction_kind!(self, txn => txn.committed_commit_seq())
     }
 
     fn pending_commit_pages(&self) -> Result<Vec<PageNumber>> {
@@ -2355,6 +2676,71 @@ impl TransactionHandle for TransactionKind {
 
     fn rollback_to_savepoint(&mut self, cx: &Cx, name: &str) -> Result<()> {
         dispatch_transaction_kind!(self, txn => txn.rollback_to_savepoint(cx, name))
+    }
+
+    fn auto_vacuum_mode(&self) -> fsqlite_types::AutoVacuumMode {
+        dispatch_transaction_kind!(self, txn => txn.auto_vacuum_mode())
+    }
+
+    fn largest_root_page(&self) -> u32 {
+        dispatch_transaction_kind!(self, txn => txn.largest_root_page())
+    }
+
+    fn pointer_map_page_sizes(&self) -> Option<(u32, u32)> {
+        dispatch_transaction_kind!(self, txn => txn.pointer_map_page_sizes())
+    }
+
+    fn set_auto_vacuum_state(
+        &mut self,
+        mode: fsqlite_types::AutoVacuumMode,
+        largest_root_page: u32,
+    ) {
+        dispatch_transaction_kind!(self, txn => txn.set_auto_vacuum_state(mode, largest_root_page));
+    }
+
+    fn read_ptrmap_entry<'a>(
+        &'a self,
+        cx: &'a Cx,
+        child_page: PageNumber,
+    ) -> impl Future<Output = Result<fsqlite_types::PtrMapEntry>> + 'a {
+        async move { dispatch_transaction_kind!(self, txn => txn.read_ptrmap_entry(cx, child_page).await) }
+    }
+
+    fn write_ptrmap_entry<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        child_page: PageNumber,
+        entry: fsqlite_types::PtrMapEntry,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move {
+            dispatch_transaction_kind!(self, txn => txn.write_ptrmap_entry(cx, child_page, entry).await)
+        }
+    }
+
+    fn ensure_ptrmap_page_initialized<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        ptrmap_page: PageNumber,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move {
+            dispatch_transaction_kind!(self, txn => txn.ensure_ptrmap_page_initialized(cx, ptrmap_page).await)
+        }
+    }
+
+    fn claim_specific_free_page(&mut self, page_no: PageNumber) -> Result<bool> {
+        dispatch_transaction_kind!(self, txn => txn.claim_specific_free_page(page_no))
+    }
+
+    fn apply_auto_vacuum_truncation(
+        &mut self,
+        new_db_size: u32,
+        remaining_freelist: Vec<PageNumber>,
+        relocated_src_pages: &[PageNumber],
+    ) -> Result<()> {
+        dispatch_transaction_kind!(
+            self,
+            txn => txn.apply_auto_vacuum_truncation(new_db_size, remaining_freelist, relocated_src_pages)
+        )
     }
 }
 

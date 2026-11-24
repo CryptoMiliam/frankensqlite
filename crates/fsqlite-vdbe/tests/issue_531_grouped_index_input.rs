@@ -112,6 +112,14 @@ fn assert_indexed_input(program: &VdbeProgram, sql: &str, covering: bool) {
             && program.ops().iter().any(|op| op.opcode == Opcode::AggFinal),
         "indexed input must retain grouped aggregate finalization: {sql}"
     );
+    // A cursor the program reads before it opens it (in program order) makes
+    // the program need the MemDatabase, and the storage substrate then hands
+    // the statement to the in-memory evaluator: the plan above never runs.
+    assert_eq!(
+        program.attached_memdb_requirement_reason(),
+        None,
+        "indexed input must run on storage cursors alone: {sql}"
+    );
     if covering {
         assert_eq!(
             table_cursor(program),
@@ -191,15 +199,21 @@ fn in_twenty_grouped_count_uses_covering_index_input_and_original_slots() {
     let program = compile(sql, &schema);
     assert_indexed_input(&program, sql, true);
     assert_eq!(bind_slots(&program), (1..=20).collect());
+    // The probes run in ascending key order, each over its block, so the
+    // groups stream (bd-gazf2): the only sorter orders the bind-time probe
+    // keys.
     assert_eq!(
         program
             .ops()
             .iter()
             .filter(|op| op.opcode == Opcode::SorterOpen)
             .count(),
-        2,
-        "group rows and bind-time probe keys use separate sorters"
+        1,
+        "only the bind-time probe keys use a sorter"
     );
+    // One call into the row body, which all probe keys share; the body jumps
+    // into the group accumulation, which returns to the probe loop
+    // (bd-2mrip).
     assert_eq!(
         program
             .ops()

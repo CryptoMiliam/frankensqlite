@@ -688,13 +688,245 @@ fn compact_access_trace_without(
     write
 }
 
+/// The odd multiplier of [`ForgottenTracePages::home`] (MurmurHash3's
+/// `0x85EB_CA6B`), chosen apart from [`GOLDEN_RATIO_32`].
+const FORGOTTEN_TRACE_PAGE_HASH: u32 = 0x85EB_CA6B;
+
+/// Pages forgotten while an [`AccessTrace`] is sparse, waiting for its next
+/// compaction (bd-w4pr1.13.18, lever BF1).
+///
+/// Each waiting page keeps its cut: the trace's length when the page was last
+/// forgotten. The page's entries before the cut are dead; entries recorded
+/// after it (the page was read back in) are live. Open addressing with linear
+/// probing over page numbers, a 0 key marking an empty slot (page numbers are
+/// nonzero), never more than half full.
+#[derive(Debug, Clone)]
+struct ForgottenTracePages {
+    keys: Box<[u32]>,
+    cuts: Box<[u32]>,
+    /// `32 - log2(keys.len())`, for multiplicative hashing of the page number.
+    shift: u32,
+    len: usize,
+}
+
+impl ForgottenTracePages {
+    fn for_trace_bound(max_entries: usize) -> Self {
+        let slots = (max_entries / 4).next_power_of_two().max(16);
+        Self {
+            keys: vec![0; slots].into_boxed_slice(),
+            cuts: vec![0; slots].into_boxed_slice(),
+            shift: 32 - slots.trailing_zeros(),
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    fn is_half_full(&self) -> bool {
+        self.len.saturating_mul(2) >= self.keys.len()
+    }
+
+    /// The slot a page's probe starts at: the top bits of the page number
+    /// times [`FORGOTTEN_TRACE_PAGE_HASH`].
+    ///
+    /// bd-w4pr1.13.18 (lever CP1): the multiplier must not be the flat page
+    /// table's [`GOLDEN_RATIO_32`]. The clean-buffer eviction walks the flat
+    /// table in slot order, so the pages forgotten between two compactions
+    /// are ordered by that table's hash and cover only part of its range.
+    /// Under the same multiplier their homes here crowded into part of this
+    /// table, and a compaction's probes ran several slots long at half load.
+    #[inline]
+    fn home(&self, key: u32) -> usize {
+        usize::try_from(key.wrapping_mul(FORGOTTEN_TRACE_PAGE_HASH) >> self.shift).unwrap_or(0)
+    }
+
+    /// The page's cut, if it is waiting.
+    #[inline]
+    fn cut(&self, page_no: PageNumber) -> Option<usize> {
+        if self.len == 0 {
+            return None;
+        }
+        let key = page_no.get();
+        let mask = self.keys.len() - 1;
+        let mut slot = self.home(key);
+        loop {
+            match self.keys[slot] {
+                0 => return None,
+                found if found == key => {
+                    return Some(usize::try_from(self.cuts[slot]).unwrap_or(usize::MAX));
+                }
+                _ => slot = (slot + 1) & mask,
+            }
+        }
+    }
+
+    /// Whether the entry of `page_no` at `position` belongs to a forgotten
+    /// admission of the page.
+    #[inline]
+    fn kills(&self, page_no: PageNumber, position: usize) -> bool {
+        self.cut(page_no).is_some_and(|cut| position < cut)
+    }
+
+    /// Wait `page_no` with `cut`. A page forgotten again moves its cut forward,
+    /// which kills a superset of the entries the earlier cut did.
+    fn insert(&mut self, page_no: PageNumber, cut: usize) {
+        let key = page_no.get();
+        let cut = u32::try_from(cut).unwrap_or(u32::MAX);
+        let mask = self.keys.len() - 1;
+        let mut slot = self.home(key);
+        loop {
+            match self.keys[slot] {
+                0 => {
+                    self.keys[slot] = key;
+                    self.cuts[slot] = cut;
+                    self.len += 1;
+                    return;
+                }
+                found if found == key => {
+                    self.cuts[slot] = cut;
+                    return;
+                }
+                _ => slot = (slot + 1) & mask,
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        if self.len > 0 {
+            self.keys.fill(0);
+            self.len = 0;
+        }
+    }
+}
+
+/// The bounded access history an eviction tracker replays.
+///
+/// Its contents are those of the eager history it replaced, entry for entry:
+/// entries in recording order, the oldest dropped at the bound, and every
+/// entry of a page removed when the page is forgotten, unless the history is
+/// longer than [`S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS`].
+///
+/// bd-w4pr1.13.18 (lever BF1): every page-cache eviction forgets its page, and
+/// the eager removal searched and moved the whole history each time (about
+/// 1.5k instructions a miss on random rowid lookups). A forget on a sparse
+/// history now touches no entry: the page waits in `forgotten` with its cut,
+/// and one compaction pass drops the dead entries of every waiting page once
+/// the history reaches half its bound. Replays skip dead entries in between.
+/// A forget on a denser history (live entries at least 3/8 of the bound)
+/// removes the page at once, as before, so a history of mostly live entries
+/// never pays for repeated compactions. Positions stay stable while pages
+/// wait, because the front is popped only after a compaction.
+#[derive(Debug, Clone)]
+struct AccessTrace {
+    entries: VecDeque<PageNumber>,
+    max_entries: usize,
+    forgotten: ForgottenTracePages,
+}
+
+impl AccessTrace {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            entries: VecDeque::with_capacity(max_entries),
+            max_entries,
+            forgotten: ForgottenTracePages::for_trace_bound(max_entries),
+        }
+    }
+
+    #[inline]
+    fn record(&mut self, page_no: PageNumber) {
+        if self.entries.len() >= self.max_entries {
+            self.compact();
+            if self.entries.len() >= self.max_entries {
+                let _ = self.entries.pop_front();
+            }
+        }
+        self.entries.push_back(page_no);
+    }
+
+    fn forget(&mut self, page_no: PageNumber) {
+        if !self.forgotten.is_empty()
+            && (self.entries.len() >= self.max_entries / 2 || self.forgotten.is_half_full())
+        {
+            self.compact();
+        }
+        if self.entries.is_empty() {
+            return;
+        }
+        if self.forgotten.is_empty() {
+            // No page waits, so the length is the live length.
+            if self.entries.len() > S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS {
+                return;
+            }
+            if self.entries.len() >= self.max_entries.saturating_mul(3) / 8 {
+                // Keep the exact retained order, including when the deque
+                // wraps around: the runs between occurrences of the page move
+                // down as blocks, in ring order.
+                let (front, back) = self.entries.as_mut_slices();
+                let kept = compact_access_trace_without(front, back, page_no);
+                self.entries.truncate(kept);
+                return;
+            }
+        }
+        // Under half the bound (at most 4,096 entries), so the live length is
+        // too, and the forget applies.
+        self.forgotten.insert(page_no, self.entries.len());
+    }
+
+    /// Drop the entries of every waiting page, keeping the others in order.
+    fn compact(&mut self) {
+        if self.forgotten.is_empty() {
+            return;
+        }
+        let forgotten = &self.forgotten;
+        let entries = self.entries.make_contiguous();
+        let mut kept = 0;
+        for position in 0..entries.len() {
+            let page_no = entries[position];
+            if !forgotten.kills(page_no, position) {
+                entries[kept] = page_no;
+                kept += 1;
+            }
+        }
+        self.entries.truncate(kept);
+        self.forgotten.clear();
+    }
+
+    /// The live entries, oldest first.
+    fn iter(&self) -> impl Iterator<Item = PageNumber> + '_ {
+        let forgotten = &self.forgotten;
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(move |(position, page_no)| !forgotten.kills(**page_no, *position))
+            .map(|(_, page_no)| *page_no)
+    }
+
+    /// The number of live entries (tests and reconstruction diagnostics).
+    #[cfg(any(test, feature = "bench-internals"))]
+    fn len(&self) -> usize {
+        if self.forgotten.is_empty() {
+            self.entries.len()
+        } else {
+            self.iter().count()
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.forgotten.clear();
+    }
+}
+
 #[derive(Debug, Clone)]
 struct S3FifoEvictionTracker {
     config: S3FifoConfig,
     adaptation_interval: usize,
     adaptive_bounds: (usize, usize),
-    access_trace: VecDeque<PageNumber>,
-    max_trace_entries: usize,
+    access_trace: AccessTrace,
 }
 
 impl S3FifoEvictionTracker {
@@ -708,16 +940,12 @@ impl S3FifoEvictionTracker {
             config,
             adaptation_interval: probe.adaptation_interval(),
             adaptive_bounds: probe.adaptive_bounds(),
-            access_trace: VecDeque::with_capacity(max_trace_entries),
-            max_trace_entries,
+            access_trace: AccessTrace::new(max_trace_entries),
         }
     }
 
     fn record_access(&mut self, page_no: PageNumber) {
-        if self.access_trace.len() >= self.max_trace_entries {
-            let _ = self.access_trace.pop_front();
-        }
-        self.access_trace.push_back(page_no);
+        self.access_trace.record(page_no);
     }
 
     fn record_admit(&mut self, page_no: PageNumber) {
@@ -725,15 +953,7 @@ impl S3FifoEvictionTracker {
     }
 
     fn forget(&mut self, page_no: PageNumber) {
-        if self.access_trace.len() > S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS {
-            return;
-        }
-        // Keep the exact retained order, including when the deque wraps
-        // around: the runs between occurrences of the page move down as
-        // blocks, in ring order.
-        let (front, back) = self.access_trace.as_mut_slices();
-        let kept = compact_access_trace_without(front, back, page_no);
-        self.access_trace.truncate(kept);
+        self.access_trace.forget(page_no);
     }
 
     fn clear_history(&mut self) {
@@ -841,7 +1061,7 @@ impl S3FifoEvictionTracker {
 
         #[cfg(feature = "bench-internals")]
         let (mut replayed_accesses, mut replayed_insertions) = (0, 0);
-        for &page_no in &self.access_trace {
+        for page_no in self.access_trace.iter() {
             if !resident_set.contains(&page_no) {
                 continue;
             }
@@ -952,8 +1172,7 @@ impl S3FifoEvictionTracker {
 #[derive(Debug, Clone)]
 struct ArcEvictionTracker {
     config: ArcEvictionConfig,
-    access_trace: VecDeque<PageNumber>,
-    max_trace_entries: usize,
+    access_trace: AccessTrace,
 }
 
 impl ArcEvictionTracker {
@@ -964,16 +1183,12 @@ impl ArcEvictionTracker {
             .clamp(64, S3_FIFO_RECONSTRUCTED_EVICTION_MAX_TRACE_ENTRIES);
         Self {
             config,
-            access_trace: VecDeque::with_capacity(max_trace_entries),
-            max_trace_entries,
+            access_trace: AccessTrace::new(max_trace_entries),
         }
     }
 
     fn record_access(&mut self, page_no: PageNumber) {
-        if self.access_trace.len() >= self.max_trace_entries {
-            let _ = self.access_trace.pop_front();
-        }
-        self.access_trace.push_back(page_no);
+        self.access_trace.record(page_no);
     }
 
     fn record_admit(&mut self, page_no: PageNumber) {
@@ -981,10 +1196,7 @@ impl ArcEvictionTracker {
     }
 
     fn forget(&mut self, page_no: PageNumber) {
-        if self.access_trace.len() > S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS {
-            return;
-        }
-        self.access_trace.retain(|candidate| *candidate != page_no);
+        self.access_trace.forget(page_no);
     }
 
     fn clear_history(&mut self) {
@@ -1003,7 +1215,7 @@ impl ArcEvictionTracker {
         // Replay the recorded trace (resident pages only) to rebuild ARC's
         // recency (T1) / frequency (T2) split: pages touched 2+ times promote to
         // T2 and are protected; single-touch pages stay in the recency lane.
-        for &page_no in &self.access_trace {
+        for page_no in self.access_trace.iter() {
             if !resident_set.contains(&page_no) {
                 continue;
             }
@@ -3579,12 +3791,13 @@ impl InFlightReadLeader<'_> {
             return;
         }
 
+        // One probe: the page's entry goes only if it is still this flight.
         let mut in_flight = self.cache.in_flight_reads.lock();
-        if in_flight
-            .get(&self.page_no)
-            .is_some_and(|current| Arc::ptr_eq(current, &self.flight))
+        if let std::collections::hash_map::Entry::Occupied(current) =
+            in_flight.entry(self.page_no)
+            && Arc::ptr_eq(current.get(), &self.flight)
         {
-            in_flight.remove(&self.page_no);
+            current.remove();
         }
         drop(in_flight);
 
@@ -3620,6 +3833,14 @@ pub struct ShardedPageCache {
     /// skip the 128-shard mutex walk that previously fired on every
     /// `refresh_committed_state` from `Connection::open_with_env_and_pager`.
     shards_dirty: AtomicBool,
+    /// Counts full [`Self::clear`]s. The pager clears the whole cache only
+    /// when the committed image may have changed under it (another
+    /// connection's or process's commit, a WAL reset, a recovery or VACUUM),
+    /// so a change of this count tells a cache built over the image, such as
+    /// a connection's row mirror, that the image moved even when the commit
+    /// sequence did not (bd-2mpxx: a stock writer's commit after a WAL reset
+    /// can leave the WAL-derived sequence where it was).
+    image_epoch: AtomicU64,
     shard_mask: usize,
     shard_shift: u32,
     /// Per-cache round-robin start for clean overflow-buffer recovery.
@@ -3660,8 +3881,10 @@ pub struct ShardedPageCache {
     reconstructed_victim_scan_calls: AtomicU64,
     /// Per-page miss flights. The first task for a missing page owns the VFS
     /// read; later tasks await the same completion notification and retry the
-    /// cache instead of amplifying disk I/O.
-    in_flight_reads: Mutex<HashMap<PageNumber, Arc<InFlightPageRead>>>,
+    /// cache instead of amplifying disk I/O. Keyed with foldhash like the
+    /// shards: every page miss inserts and removes its flight (bd-w4pr1.13.18).
+    in_flight_reads:
+        Mutex<HashMap<PageNumber, Arc<InFlightPageRead>, foldhash::fast::FixedState>>,
     /// Bayesian-mixture e-value evictor (IMPL-19 / AAC-P5).
     ///
     /// Present only when the `evalue-eviction` cargo feature is enabled.
@@ -3798,6 +4021,7 @@ impl ShardedPageCache {
             flat_slots: FlatPageSlots::new(flat_capacity),
             shards,
             shards_dirty: AtomicBool::new(false),
+            image_epoch: AtomicU64::new(0),
             shard_mask,
             shard_shift,
             overflow_clean_probe_cursor: AtomicUsize::new(0),
@@ -3816,7 +4040,9 @@ impl ShardedPageCache {
             diagnostic_snapshot_calls: AtomicU64::new(0),
             #[cfg(test)]
             reconstructed_victim_scan_calls: AtomicU64::new(0),
-            in_flight_reads: Mutex::new(HashMap::new()),
+            in_flight_reads: Mutex::new(HashMap::with_hasher(
+                foldhash::fast::FixedState::default(),
+            )),
             #[cfg(feature = "evalue-eviction")]
             evalue_evictor: crate::evalue_eviction::EValueEvictor::new(),
             #[cfg(feature = "evalue-eviction")]
@@ -5127,8 +5353,10 @@ impl ShardedPageCache {
     ///
     /// Unlike fast-path mode transitions, `clear()` preserves the fast-array's
     /// backing allocation so callers can cheaply reuse the same sparse working
-    /// set after an explicit cache flush.
+    /// set after an explicit cache flush. Each clear advances
+    /// [`Self::image_epoch`].
     pub fn clear(&self) {
+        self.image_epoch.fetch_add(1, Ordering::AcqRel);
         if let Some(ref fast) = self.fast_array {
             fast.lock().clear();
         }
@@ -5144,6 +5372,13 @@ impl ShardedPageCache {
             }
         }
         self.clear_eviction_history();
+    }
+
+    /// How many full [`Self::clear`]s this cache has had: an epoch of the
+    /// committed image the cache was filled from (bd-2mpxx).
+    #[must_use]
+    pub fn image_epoch(&self) -> u64 {
+        self.image_epoch.load(Ordering::Acquire)
     }
 
     /// Capture cheap-to-compute cache counters, skipping per-slot iteration.
@@ -6479,7 +6714,15 @@ mod tests {
             "a spawned writeback must not inherit the parent OS-thread inline-I/O permission"
         );
         let observed_budget = file.native_budget();
-        assert_eq!(observed_budget.poll_quota, 97);
+        // bd-5lvnd: the child inherits the caller's quota of 97 exactly. The
+        // write is read during its first poll, and asupersync 0.6.2's
+        // production scheduler spends one poll of a finite quota before each
+        // poll of a task (CHANGELOG v0.6.2 "the production runtime enforces
+        // explicit poll quotas", asupersync-r017wv; `consume_budget_poll`,
+        // runtime/scheduler/three_lane.rs). So the writeback observes
+        // 97 - 1. A lost inheritance reads u32::MAX, and an extra poll before
+        // the write reads 95.
+        assert_eq!(observed_budget.poll_quota, 97 - 1);
         assert_eq!(observed_budget.cost_quota, Some(1_234));
         assert_eq!(observed_budget.priority, u8::MAX);
         assert_eq!(file.bytes(), vec![0xD7; page_size.as_usize()]);
@@ -7937,6 +8180,43 @@ mod tests {
         assert!(cache.in_flight_reads.lock().is_empty());
     }
 
+    /// bd-w4pr1.13.18: a finishing read leader removes the page's in-flight
+    /// entry only while it is its own flight. A newer flight registered for the
+    /// same page stays for its followers; removing the entry by page number
+    /// alone would strand them behind a second read.
+    #[test]
+    fn test_in_flight_finish_removes_only_its_own_flight() {
+        let cache = ShardedPageCache::new(PageSize::DEFAULT);
+        let page_no = PageNumber::new(7).unwrap();
+        let InFlightReadRole::Leader(mut leader) = cache.claim_in_flight_read(page_no) else {
+            panic!("the first claim of a page leads its read");
+        };
+        let newer = Arc::new(InFlightPageRead::new());
+        cache
+            .in_flight_reads
+            .lock()
+            .insert(page_no, Arc::clone(&newer));
+        leader.finish();
+        assert!(
+            cache
+                .in_flight_reads
+                .lock()
+                .get(&page_no)
+                .is_some_and(|current| Arc::ptr_eq(current, &newer)),
+            "the newer flight stays registered"
+        );
+        drop(leader);
+        assert_eq!(cache.in_flight_reads.lock().len(), 1);
+
+        let other = PageNumber::new(8).unwrap();
+        let InFlightReadRole::Leader(mut leader) = cache.claim_in_flight_read(other) else {
+            panic!("the first claim of a page leads its read");
+        };
+        leader.finish();
+        assert!(!cache.in_flight_reads.lock().contains_key(&other));
+        assert!(cache.in_flight_reads.lock().contains_key(&page_no));
+    }
+
     #[test]
     fn gh_197_late_miss_fill_preserves_dirty_resident_page() {
         run_async_test(|| async {
@@ -8476,36 +8756,46 @@ mod tests {
             for rotation in 0..64 {
                 for forgotten in &pages {
                     let mut tracker = S3FifoEvictionTracker::new(S3FifoConfig::new(8));
-                    let capacity = tracker.access_trace.capacity();
+                    let capacity = tracker.access_trace.entries.capacity();
                     // Move the deque head before populating it, exercising both
                     // contiguous and split physical layouts with the same oracle.
-                    tracker.access_trace.extend((0..capacity).map(|_| pages[0]));
+                    tracker
+                        .access_trace
+                        .entries
+                        .extend((0..capacity).map(|_| pages[0]));
                     for _ in 0..rotation {
-                        tracker.access_trace.pop_front();
-                        tracker.access_trace.push_back(pages[0]);
+                        tracker.access_trace.entries.pop_front();
+                        tracker.access_trace.entries.push_back(pages[0]);
                     }
-                    tracker.access_trace.truncate(len);
-                    for (i, page) in tracker.access_trace.iter_mut().enumerate() {
+                    tracker.access_trace.entries.truncate(len);
+                    for (i, page) in tracker.access_trace.entries.iter_mut().enumerate() {
                         *page = pages[i % 4];
                     }
-                    wrapped_cases += usize::from(!tracker.access_trace.as_slices().1.is_empty());
+                    wrapped_cases +=
+                        usize::from(!tracker.access_trace.entries.as_slices().1.is_empty());
                     let expected: Vec<_> = tracker
                         .access_trace
                         .iter()
-                        .copied()
                         .filter(|page| page != forgotten)
                         .collect();
                     tracker.forget(*forgotten);
-                    assert_eq!(
-                        tracker.access_trace.iter().copied().collect::<Vec<_>>(),
-                        expected
-                    );
-                    assert_eq!(tracker.access_trace.capacity(), capacity);
+                    assert_eq!(tracker.access_trace.iter().collect::<Vec<_>>(), expected);
+                    assert_eq!(tracker.access_trace.entries.capacity(), capacity);
                     tracker.forget(*forgotten);
+                    assert_eq!(tracker.access_trace.iter().collect::<Vec<_>>(), expected);
+                    // bd-w4pr1.13.18 (BF1): a forget on a sparse trace waits;
+                    // the compaction leaves exactly the filtered entries.
+                    tracker.access_trace.compact();
                     assert_eq!(
-                        tracker.access_trace.iter().copied().collect::<Vec<_>>(),
+                        tracker
+                            .access_trace
+                            .entries
+                            .iter()
+                            .copied()
+                            .collect::<Vec<_>>(),
                         expected
                     );
+                    assert_eq!(tracker.access_trace.entries.capacity(), capacity);
                 }
             }
         }
@@ -8515,7 +8805,10 @@ mod tests {
         );
         for len in [64, 4096, 4097] {
             let mut tracker = S3FifoEvictionTracker::new(S3FifoConfig::new(1024));
-            tracker.access_trace.extend((0..len).map(|_| pages[0]));
+            tracker
+                .access_trace
+                .entries
+                .extend((0..len).map(|_| pages[0]));
             tracker.forget(pages[0]);
             assert_eq!(
                 tracker.access_trace.len(),
@@ -8576,25 +8869,27 @@ mod tests {
 
             for rotation in 0..4 * block {
                 for occurrences in &occurrence_sets {
+                    let populate = |entries: &mut VecDeque<PageNumber>| {
+                        let capacity = entries.capacity();
+                        entries.extend((0..capacity).map(|_| forgotten));
+                        for _ in 0..rotation {
+                            entries.pop_front();
+                            entries.push_back(forgotten);
+                        }
+                        entries.truncate(len);
+                        for (i, page) in entries.iter_mut().enumerate() {
+                            *page = if occurrences.contains(&i) {
+                                forgotten
+                            } else {
+                                PageNumber::new(u32::try_from(i + 1).unwrap()).unwrap()
+                            };
+                        }
+                    };
                     let mut tracker = S3FifoEvictionTracker::new(S3FifoConfig::new(block / 2));
-                    let capacity = tracker.access_trace.capacity();
+                    let capacity = tracker.access_trace.entries.capacity();
                     assert!(capacity >= 4 * block);
-                    tracker
-                        .access_trace
-                        .extend((0..capacity).map(|_| forgotten));
-                    for _ in 0..rotation {
-                        tracker.access_trace.pop_front();
-                        tracker.access_trace.push_back(forgotten);
-                    }
-                    tracker.access_trace.truncate(len);
-                    for (i, page) in tracker.access_trace.iter_mut().enumerate() {
-                        *page = if occurrences.contains(&i) {
-                            forgotten
-                        } else {
-                            PageNumber::new(u32::try_from(i + 1).unwrap()).unwrap()
-                        };
-                    }
-                    let front_len = tracker.access_trace.as_slices().0.len();
+                    populate(&mut tracker.access_trace.entries);
+                    let front_len = tracker.access_trace.entries.as_slices().0.len();
                     wrapped_cases += usize::from(front_len < len);
                     cases_with_a_run_across_the_seam += usize::from(
                         occurrences
@@ -8604,18 +8899,31 @@ mod tests {
                     let expected: Vec<_> = tracker
                         .access_trace
                         .iter()
-                        .copied()
                         .filter(|page| *page != forgotten)
                         .collect();
+
+                    // The block search itself, on the same ring layout, for
+                    // every length (a forget on a sparse trace waits instead).
+                    let mut ring = VecDeque::with_capacity(tracker.access_trace.max_entries);
+                    populate(&mut ring);
+                    assert_eq!(ring.as_slices().0.len(), front_len, "same ring layout");
+                    let (front, back) = ring.as_mut_slices();
+                    let kept = compact_access_trace_without(front, back, forgotten);
+                    ring.truncate(kept);
+                    assert_eq!(
+                        ring.iter().copied().collect::<Vec<_>>(),
+                        expected,
+                        "block search: len {len}, rotation {rotation}, occurrences {occurrences:?}"
+                    );
 
                     tracker.forget(forgotten);
 
                     assert_eq!(
-                        tracker.access_trace.iter().copied().collect::<Vec<_>>(),
+                        tracker.access_trace.iter().collect::<Vec<_>>(),
                         expected,
                         "len {len}, rotation {rotation}, occurrences {occurrences:?}"
                     );
-                    assert_eq!(tracker.access_trace.capacity(), capacity);
+                    assert_eq!(tracker.access_trace.entries.capacity(), capacity);
                 }
             }
         }
@@ -8624,6 +8932,331 @@ mod tests {
             cases_with_a_run_across_the_seam > 0,
             "a kept run must cross from the back half into the front half"
         );
+    }
+
+    /// The eager access history the BF1 trace replaced (bd-w4pr1.13.18), kept
+    /// as the oracle: record drops the oldest entry at the bound, forget
+    /// removes every entry of the page unless the history is longer than
+    /// 4,096 entries, clear empties it.
+    struct EagerAccessHistory {
+        entries: VecDeque<PageNumber>,
+        max_entries: usize,
+    }
+
+    impl EagerAccessHistory {
+        fn new(max_entries: usize) -> Self {
+            Self {
+                entries: VecDeque::new(),
+                max_entries,
+            }
+        }
+
+        fn record(&mut self, page_no: PageNumber) {
+            if self.entries.len() >= self.max_entries {
+                let _ = self.entries.pop_front();
+            }
+            self.entries.push_back(page_no);
+        }
+
+        fn forget(&mut self, page_no: PageNumber) {
+            if self.entries.len() > S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS {
+                return;
+            }
+            self.entries.retain(|entry| *entry != page_no);
+        }
+
+        fn to_vec(&self) -> Vec<PageNumber> {
+            self.entries.iter().copied().collect()
+        }
+    }
+
+    /// xorshift64, so the generated histories repeat run to run.
+    fn bd_w4pr1_13_18_next(state: &mut u64, bound: u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state % bound
+    }
+
+    /// bd-w4pr1.13.18 (lever BF1): the access trace whose forgets wait for a
+    /// compaction keeps exactly the entries of the eager history, checked
+    /// after generated records, forgets and clears at four bounds (64, 128,
+    /// 4,000 = the default 500-page cache, 8,192). Phases alternate record-heavy,
+    /// balanced and forget-heavy mixes, so both the sparse (waiting) and the
+    /// dense (eager) forget run. Every case a naive waiting trace gets wrong
+    /// must occur, and is counted:
+    /// - a page recorded again while its forget waits: its new entries are live;
+    /// - a full trace recorded into while forgets wait: the oldest LIVE entry
+    ///   goes, not a dead one, and live entries under the bound stay;
+    /// - a forget while waiting forgets hold the physical trace above 4,096
+    ///   entries but the live one at or under it: the forget still applies;
+    /// - compactions from the half bound and from a half-full table;
+    /// - forgets skipped above 4,096 live entries, and eager forgets.
+    #[test]
+    fn test_bd_w4pr1_13_18_access_trace_forgets_like_the_eager_history() {
+        let mut rng = 0x2545_F491_4F6C_DD1D_u64;
+        let mut readmitted_while_waiting = 0_usize;
+        let mut full_while_waiting = 0_usize;
+        let mut above_4096_while_waiting = 0_usize;
+        let mut half_bound_compactions = 0_usize;
+        let mut table_compactions = 0_usize;
+        let mut waiting_forgets = 0_usize;
+        let mut eager_forgets = 0_usize;
+        let mut skipped_forgets = 0_usize;
+        for (max_entries, universe, phases) in [
+            (64_usize, 40_u64, 120_usize),
+            (128, 90, 120),
+            (4_000, 700, 40),
+            (8_192, 3_000, 30),
+        ] {
+            let mut trace = AccessTrace::new(max_entries);
+            let mut eager = EagerAccessHistory::new(max_entries);
+            let phase_len = max_entries.max(400);
+            for phase in 0..phases {
+                // Percent of steps that record; the rest forget, but for a
+                // rare clear.
+                let record_percent: u64 = match phase % 4 {
+                    0 | 2 => 97,
+                    1 => 50,
+                    _ => 15,
+                };
+                for step in 0..phase_len {
+                    let page_no = PageNumber::new(
+                        u32::try_from(bd_w4pr1_13_18_next(&mut rng, universe) + 1).unwrap(),
+                    )
+                    .unwrap();
+                    let roll = bd_w4pr1_13_18_next(&mut rng, 10_000);
+                    let waiting = !trace.forgotten.is_empty();
+                    let physical = trace.entries.len();
+                    let mut notable = false;
+                    if roll < 2 {
+                        trace.clear();
+                        eager.entries.clear();
+                        notable = true;
+                    } else if roll < record_percent * 100 {
+                        if trace.forgotten.cut(page_no).is_some() {
+                            readmitted_while_waiting += 1;
+                            notable = true;
+                        }
+                        if waiting && physical >= max_entries {
+                            full_while_waiting += 1;
+                            notable = true;
+                        }
+                        trace.record(page_no);
+                        eager.record(page_no);
+                    } else {
+                        let live = eager.entries.len();
+                        if waiting && physical > S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS {
+                            above_4096_while_waiting +=
+                                usize::from(live <= S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS);
+                            notable = true;
+                        }
+                        if waiting && physical >= max_entries / 2 {
+                            half_bound_compactions += 1;
+                            notable = true;
+                        } else if waiting && trace.forgotten.is_half_full() {
+                            table_compactions += 1;
+                            notable = true;
+                        }
+                        trace.forget(page_no);
+                        eager.forget(page_no);
+                        if live > S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS {
+                            skipped_forgets += 1;
+                        } else if trace.forgotten.cut(page_no) == Some(trace.entries.len()) {
+                            waiting_forgets += 1;
+                        } else if trace.forgotten.is_empty() && trace.entries.len() < physical {
+                            eager_forgets += 1;
+                        }
+                    }
+                    if notable || max_entries <= 128 || step.is_multiple_of(97) {
+                        assert_eq!(
+                            trace.iter().collect::<Vec<_>>(),
+                            eager.to_vec(),
+                            "bound {max_entries}, phase {phase}, step {step}"
+                        );
+                        assert_eq!(trace.len(), eager.entries.len());
+                    }
+                }
+            }
+            assert_eq!(trace.iter().collect::<Vec<_>>(), eager.to_vec());
+            trace.compact();
+            assert_eq!(
+                trace.entries.iter().copied().collect::<Vec<_>>(),
+                eager.to_vec(),
+                "a compaction leaves exactly the live entries"
+            );
+        }
+        for (name, count) in [
+            ("readmitted while waiting", readmitted_while_waiting),
+            ("recorded into a full trace while waiting", full_while_waiting),
+            ("forgot above 4,096 physical while waiting", above_4096_while_waiting),
+            ("half-bound compactions", half_bound_compactions),
+            ("half-full table compactions", table_compactions),
+            ("waiting forgets", waiting_forgets),
+            ("eager forgets", eager_forgets),
+            ("skipped forgets", skipped_forgets),
+        ] {
+            assert!(count > 0, "case never exercised: {name}");
+        }
+    }
+
+    /// bd-w4pr1.13.18 (lever BF1): with forgets waiting, the S3-FIFO and ARC
+    /// trackers choose the victims, and S3-FIFO reports the queue snapshot and
+    /// assignments, of trackers replaying the eager history. A small cache
+    /// model admits on a miss (an admission record and a read record, as the
+    /// page cache does) and evicts a resident at random when over capacity.
+    #[test]
+    fn test_bd_w4pr1_13_18_trackers_replay_the_eager_history_while_forgets_wait() {
+        let mut rng = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut checks_while_waiting = 0_usize;
+        for capacity in [8_usize, 64, 200] {
+            let s3_config = S3FifoConfig::new(capacity);
+            let arc_config = ArcEvictionConfig::new(capacity);
+            let mut s3 = S3FifoEvictionTracker::new(s3_config);
+            let mut arc = ArcEvictionTracker::new(arc_config);
+            let mut eager = EagerAccessHistory::new(s3.access_trace.max_entries);
+            assert_eq!(arc.access_trace.max_entries, eager.max_entries);
+            let mut residents: Vec<PageNumber> = Vec::new();
+            let universe = u64::try_from(capacity * 3).unwrap();
+            for step in 0_usize..6_000 {
+                let page_no = PageNumber::new(
+                    u32::try_from(bd_w4pr1_13_18_next(&mut rng, universe) + 1).unwrap(),
+                )
+                .unwrap();
+                if residents.contains(&page_no) {
+                    // A hit the page cache serves from a resident copy.
+                    if bd_w4pr1_13_18_next(&mut rng, 4) == 0 {
+                        s3.record_access(page_no);
+                        arc.record_access(page_no);
+                        eager.record(page_no);
+                    }
+                } else {
+                    residents.push(page_no);
+                    s3.record_admit(page_no);
+                    arc.record_admit(page_no);
+                    eager.record(page_no);
+                    s3.record_access(page_no);
+                    arc.record_access(page_no);
+                    eager.record(page_no);
+                    if residents.len() > capacity {
+                        let victim_index = usize::try_from(bd_w4pr1_13_18_next(
+                            &mut rng,
+                            u64::try_from(residents.len()).unwrap(),
+                        ))
+                        .unwrap();
+                        let victim = residents.swap_remove(victim_index);
+                        s3.forget(victim);
+                        arc.forget(victim);
+                        eager.forget(victim);
+                    }
+                }
+                if step.is_multiple_of(50) {
+                    checks_while_waiting += usize::from(!s3.access_trace.forgotten.is_empty());
+                    let mut s3_reference = S3FifoEvictionTracker::new(s3_config);
+                    s3_reference.access_trace.entries = eager.entries.clone();
+                    let mut arc_reference = ArcEvictionTracker::new(arc_config);
+                    arc_reference.access_trace.entries = eager.entries.clone();
+                    assert_eq!(
+                        s3.choose_victim(&residents),
+                        s3_reference.choose_victim(&residents),
+                        "S3-FIFO victim, capacity {capacity}, step {step}"
+                    );
+                    assert_eq!(
+                        s3.queue_snapshot(&residents),
+                        s3_reference.queue_snapshot(&residents),
+                        "S3-FIFO snapshot, capacity {capacity}, step {step}"
+                    );
+                    assert_eq!(
+                        s3.queue_assignments(&residents),
+                        s3_reference.queue_assignments(&residents),
+                        "S3-FIFO assignments, capacity {capacity}, step {step}"
+                    );
+                    assert_eq!(
+                        arc.choose_victim(&residents),
+                        arc_reference.choose_victim(&residents),
+                        "ARC victim, capacity {capacity}, step {step}"
+                    );
+                }
+            }
+        }
+        assert!(
+            checks_while_waiting > 0,
+            "victims must be compared while forgets wait"
+        );
+    }
+
+    /// bd-w4pr1.13.18 (lever CP1): the forgotten-page table stays short to
+    /// probe for the pages an eviction run actually forgets. The clean-buffer
+    /// eviction walks the flat table in slot order, so between two compactions
+    /// the forgotten pages come from a part of the flat table's hash range.
+    /// Here, at the default trace bound (4,000 entries, 1,024 slots), 500 pages
+    /// drawn from half of a 16,384-slot flat table's range must probe like
+    /// random keys at half load (about 1.5 slots waiting, 2.5 not), in each of
+    /// eight windows. Homing them by the flat table's own multiplier gave
+    /// about 5.6 and 16.5.
+    #[test]
+    fn test_bd_w4pr1_13_18_forgotten_pages_from_one_flat_sweep_probe_short() {
+        let flat = FlatPageSlots::new(16_384);
+        assert_eq!(flat.slots.len(), 16_384);
+        let universe: Vec<PageNumber> = (1..=8_300_u32)
+            .map(|page| PageNumber::new(page).unwrap())
+            .collect();
+        let mut rng = 0x51F1_5EED_0C0F_FEE1_u64;
+        for window in 0..8_usize {
+            let start = (window * 2_048 + 777) & flat.mask;
+            let mut pool: Vec<PageNumber> = universe
+                .iter()
+                .copied()
+                .filter(|page| (flat.hash_pgno(page.get()).wrapping_sub(start) & flat.mask) < 8_192)
+                .collect();
+            let mut waiting = Vec::new();
+            while waiting.len() < 500 {
+                let pick = usize::try_from(bd_w4pr1_13_18_next(
+                    &mut rng,
+                    u64::try_from(pool.len()).unwrap(),
+                ))
+                .unwrap();
+                waiting.push(pool.swap_remove(pick));
+            }
+            let mut table = ForgottenTracePages::for_trace_bound(4_000);
+            assert_eq!(table.keys.len(), 1_024);
+            for (cut, &page) in waiting.iter().enumerate() {
+                table.insert(page, cut + 1);
+            }
+            assert!(!table.is_half_full());
+            let probes = |page: PageNumber| {
+                let mask = table.keys.len() - 1;
+                let mut slot = table.home(page.get());
+                let mut probed = 1_usize;
+                while table.keys[slot] != 0 && table.keys[slot] != page.get() {
+                    slot = (slot + 1) & mask;
+                    probed += 1;
+                }
+                probed
+            };
+            for (cut, &page) in waiting.iter().enumerate() {
+                assert_eq!(table.cut(page), Some(cut + 1), "window {window}");
+            }
+            let others: Vec<PageNumber> = universe
+                .iter()
+                .copied()
+                .filter(|page| !waiting.contains(page))
+                .step_by(15)
+                .take(500)
+                .collect();
+            assert_eq!(others.len(), 500);
+            for &page in &others {
+                assert_eq!(table.cut(page), None, "window {window}");
+            }
+            let mean = |pages: &[PageNumber]| {
+                pages.iter().map(|&page| probes(page)).sum::<usize>() as f64 / pages.len() as f64
+            };
+            let (waiting_mean, other_mean) = (mean(&waiting), mean(&others));
+            assert!(
+                waiting_mean <= 2.0 && other_mean <= 3.0,
+                "window {window}: mean probe {waiting_mean:.2} waiting, {other_mean:.2} not waiting"
+            );
+        }
     }
 
     #[test]

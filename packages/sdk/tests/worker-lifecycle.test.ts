@@ -63,6 +63,7 @@ describe("worker client terminal lifecycle", () => {
     worker.crash("WASM trap");
     await drain();
     const cause = rejected(pending);
+    expect(worker.terminateCount).toBe(1);
     const after = observe(client.query("SELECT 2"));
     const close = observe(client.close());
     await drain();
@@ -71,6 +72,79 @@ describe("worker client terminal lifecycle", () => {
     expect((cause as Error).message).toContain("WASM trap");
     expect(worker.requests.map((r) => r.kind)).toEqual(["execute"]);
     expect(worker.terminateCount).toBe(1);
+  });
+
+  it("cleans up an idle unreadable channel and preserves cleanup errors for close", async () => {
+    const { worker, client } = fixture();
+    const cleanup = new Error("could not terminate worker");
+    worker.onTerminate = () => {
+      throw cleanup;
+    };
+    worker.messageError();
+    await drain();
+    expect(worker.terminateCount).toBe(1);
+    const failed = observe(client.query("SELECT 2"));
+    const close = client.close();
+    const closing = observe(close);
+    await drain();
+    const transport = rejected(failed);
+    const combined = rejected(closing) as AggregateError;
+    expect(combined).toBeInstanceOf(AggregateError);
+    expect(combined.cause).toBe(transport);
+    expect(combined.errors).toEqual([transport, cleanup]);
+    expect(client.close()).toBe(close);
+    expect(worker.requests).toEqual([]);
+  });
+
+  it("shares a public close with a worker adapter that closes again during postMessage", async () => {
+    const worker = new ControlledWorker();
+    const opening = FrankenDB.open({ worker });
+    worker.reply({ kind: "ready", requestId: 1, data: { path: ":memory:", persistence: "memory" } });
+    const db = await opening;
+    const pending = db.execute("INSERT INTO t VALUES (1)");
+    let nested: Promise<void> | undefined;
+    worker.onPost = (request) => {
+      if (request.kind === "close") {
+        worker.onPost = undefined;
+        nested = db.close();
+      }
+    };
+    const close = db.close();
+    expect(worker.requests.map((r) => r.kind)).toEqual(["init", "execute", "close"]);
+    expect(nested).toBe(close);
+    worker.reply({ kind: "execute-result", requestId: 2, changes: 1 });
+    worker.reply({ kind: "close-result", requestId: 3 });
+    expect(await pending).toBe(1);
+    await close;
+    expect(db.close()).toBe(close);
+    expect(worker.terminateCount).toBe(1);
+  });
+
+  it("preserves cleanup failure when the transport crashes during the close post", async () => {
+    const { worker, client } = fixture();
+    const cleanup = new Error("terminate failed");
+    worker.onTerminate = () => {
+      throw cleanup;
+    };
+    let nested: Promise<void> | undefined;
+    worker.onPost = (request) => {
+      if (request.kind === "close") {
+        worker.onPost = undefined;
+        nested = client.close();
+        void observe(nested);
+        worker.crash("close channel lost");
+      }
+    };
+    const close = client.close();
+    const error = await close.catch((failure: unknown) => failure);
+    expect(error).toBeInstanceOf(AggregateError);
+    const combined = error as AggregateError;
+    expect(nested).toBe(close);
+    expect(combined.cause).toBe(combined.errors[0]);
+    expect(combined.errors[1]).toBe(cleanup);
+    expect(client.close()).toBe(close);
+    expect(worker.terminateCount).toBe(1);
+    expect(worker.requests.map((r) => r.kind)).toEqual(["close"]);
   });
 
   it("coalesces close, drains accepted requests, and refuses new requests", async () => {
@@ -181,6 +255,59 @@ describe("worker client terminal lifecycle", () => {
     expect(aggregate.errors[0]).toBe(aggregate.cause);
     expect((aggregate.errors[0] as FrankenSQLiteError).code).toBe("SQLITE_NOTADB");
     expect(aggregate.errors[1]).toBe(cleanupError);
+  });
+
+  it("reports termination failure when the worker crashes during initialization", async () => {
+    const worker = new ControlledWorker();
+    const cleanup = new Error("terminate failed");
+    worker.onTerminate = () => {
+      throw cleanup;
+    };
+    const opening = FrankenDB.open({ worker });
+    worker.crash("failed before ready");
+    const failure = await opening.catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(AggregateError);
+    const combined = failure as AggregateError;
+    expect(combined.errors).toEqual([combined.cause, cleanup]);
+    expect((combined.cause as Error).message).toContain("failed before ready");
+    expect(worker.terminateCount).toBe(1);
+  });
+
+  it.each([false, true])("reports open cleanup errors once (close fails: %s)", async (failClose) => {
+    const worker = new ControlledWorker();
+    const cleanup = new Error("terminate failed");
+    worker.onTerminate = () => {
+      throw cleanup;
+    };
+    worker.onPost = (request) => {
+      if (request.kind !== "close") return;
+      const requestId = request.requestId;
+      worker.reply(
+        failClose
+          ? { kind: "error", requestId, error: { code: "SQLITE_IOERR", message: "host close failed" } }
+          : { kind: "close-result", requestId },
+      );
+    };
+    const opening = FrankenDB.open({ worker });
+    worker.reply({
+      kind: "worker-fatal",
+      error: { code: "ERR_FSQLITE_WORKER_TRANSPORT", message: "lost init response" },
+    });
+    const failure = (await opening.catch((error: unknown) => error)) as AggregateError;
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect(failure.cause).toMatchObject({ code: "ERR_FSQLITE_WORKER_TRANSPORT" });
+    expect(failure.errors).toHaveLength(2);
+    expect(failure.errors[0]).toBe(failure.cause);
+    if (failClose) {
+      expect(failure.errors[1]).toBeInstanceOf(AggregateError);
+      expect(failure.errors[1].errors).toEqual([
+        expect.objectContaining({ code: "SQLITE_IOERR" }),
+        cleanup,
+      ]);
+    } else {
+      expect(failure.errors[1]).toBe(cleanup);
+    }
+    expect(worker.terminateCount).toBe(1);
   });
 
   it("preserves both close and cleanup failures", async () => {

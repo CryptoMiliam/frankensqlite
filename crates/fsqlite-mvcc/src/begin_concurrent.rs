@@ -19,7 +19,9 @@
 //!    reverts write-set state but preserves page locks and the snapshot.
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque, hash_map};
+use std::hash::{BuildHasher, Hash};
 use std::sync::Arc;
 
 use fsqlite_types::{
@@ -100,6 +102,18 @@ static REGISTRY_COMMIT_LOCK_IO_NS_MAX: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static REGISTRY_COMMIT_LOCK_PUBLISH_NS_TOTAL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+// bd-i0tn6: validators that found a pending publication they must observe
+// released the guard and waited for it; these count those waits and their time.
+static REGISTRY_PUBLICATION_WAITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static REGISTRY_PUBLICATION_WAIT_NS_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+// bd-i0tn6: a commit whose physical write ran unlocked re-acquires the guard
+// to publish; these count those re-acquisitions and their wait.
+static REGISTRY_PUBLISH_REACQUIRES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static REGISTRY_PUBLISH_REACQUIRE_WAIT_NS_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 fn registry_metric_update_max(metric: &std::sync::atomic::AtomicU64, val: u64) {
     use std::sync::atomic::Ordering;
@@ -142,6 +156,18 @@ pub struct RegistryCommitLockMetrics {
     pub io_ns_max: u64,
     /// Total time spent in the under-lock publish phase.
     pub publish_ns_total: u64,
+    /// Validations that waited for a pending publication (bd-i0tn6).
+    pub publication_waits_total: u64,
+    /// Total nanoseconds those validations waited, guard released.
+    pub publication_wait_ns_total: u64,
+    /// Publication re-acquisitions after an unlocked physical write
+    /// (bd-i0tn6). These are also counted in `holds_total`; for such commits
+    /// the decomposition's `io` is the unlocked write, `validate` the first
+    /// hold and `publish` this second hold.
+    pub publish_reacquires_total: u64,
+    /// Total nanoseconds waited for those re-acquisitions (also included in
+    /// `wait_ns_total`).
+    pub publish_reacquire_wait_ns_total: u64,
 }
 
 /// Read the commit-path registry lock counters.
@@ -159,6 +185,11 @@ pub fn registry_commit_lock_metrics() -> RegistryCommitLockMetrics {
         io_ns_total: REGISTRY_COMMIT_LOCK_IO_NS_TOTAL.load(Ordering::Relaxed),
         io_ns_max: REGISTRY_COMMIT_LOCK_IO_NS_MAX.load(Ordering::Relaxed),
         publish_ns_total: REGISTRY_COMMIT_LOCK_PUBLISH_NS_TOTAL.load(Ordering::Relaxed),
+        publication_waits_total: REGISTRY_PUBLICATION_WAITS.load(Ordering::Relaxed),
+        publication_wait_ns_total: REGISTRY_PUBLICATION_WAIT_NS_TOTAL.load(Ordering::Relaxed),
+        publish_reacquires_total: REGISTRY_PUBLISH_REACQUIRES.load(Ordering::Relaxed),
+        publish_reacquire_wait_ns_total: REGISTRY_PUBLISH_REACQUIRE_WAIT_NS_TOTAL
+            .load(Ordering::Relaxed),
     }
 }
 
@@ -175,6 +206,26 @@ pub fn reset_registry_commit_lock_metrics() {
     REGISTRY_COMMIT_LOCK_IO_NS_TOTAL.store(0, Ordering::Relaxed);
     REGISTRY_COMMIT_LOCK_IO_NS_MAX.store(0, Ordering::Relaxed);
     REGISTRY_COMMIT_LOCK_PUBLISH_NS_TOTAL.store(0, Ordering::Relaxed);
+    REGISTRY_PUBLICATION_WAITS.store(0, Ordering::Relaxed);
+    REGISTRY_PUBLICATION_WAIT_NS_TOTAL.store(0, Ordering::Relaxed);
+    REGISTRY_PUBLISH_REACQUIRES.store(0, Ordering::Relaxed);
+    REGISTRY_PUBLISH_REACQUIRE_WAIT_NS_TOTAL.store(0, Ordering::Relaxed);
+}
+
+/// Record one publication re-acquisition of the registry guard after an
+/// unlocked physical write (bd-i0tn6), and how long it waited.
+pub fn record_registry_publish_reacquire_wait(wait_ns: u64) {
+    use std::sync::atomic::Ordering;
+    REGISTRY_PUBLISH_REACQUIRES.fetch_add(1, Ordering::Relaxed);
+    REGISTRY_PUBLISH_REACQUIRE_WAIT_NS_TOTAL.fetch_add(wait_ns, Ordering::Relaxed);
+}
+
+/// Record one validation that released the registry guard to wait for a
+/// pending publication (bd-i0tn6), and how long it waited.
+pub fn record_registry_publication_wait(wait_ns: u64) {
+    use std::sync::atomic::Ordering;
+    REGISTRY_PUBLICATION_WAITS.fetch_add(1, Ordering::Relaxed);
+    REGISTRY_PUBLICATION_WAIT_NS_TOTAL.fetch_add(wait_ns, Ordering::Relaxed);
 }
 
 /// Record one commit-path registry guard acquisition: how long the committer
@@ -228,6 +279,153 @@ fn witness_is_page(witness: &WitnessKey, page: PageNumber) -> bool {
 
 /// Stable shared handle for one active concurrent transaction.
 pub type SharedConcurrentHandle = Arc<Mutex<ConcurrentHandle>>;
+
+/// bd-i0tn6: owned receipt for a session marked publication-pending by
+/// [`ConcurrentRegistry::mark_publication_pending`].
+///
+/// Dropping it clears the mark unless the session has already published or
+/// aborted (`mark_committed` / `mark_aborted` clear it themselves), so a
+/// commit whose physical write fails, is retried after `Busy`, or whose future
+/// is dropped returns to an ordinary active transaction: exactly the state it
+/// had before the mark existed. The drop takes only the session handle's own
+/// lock, never the registry mutex, so it is safe on every path, including
+/// while the caller holds the registry guard (registry before handle is the
+/// lock order everywhere). The token is compared, so the lease can never
+/// clear a mark another transaction set on the same handle.
+#[must_use = "dropping the lease clears the publication-pending mark"]
+pub struct PublicationPendingLease {
+    handle: SharedConcurrentHandle,
+    txn_token: TxnToken,
+}
+
+impl std::fmt::Debug for PublicationPendingLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PublicationPendingLease")
+            .field("txn_token", &self.txn_token)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for PublicationPendingLease {
+    fn drop(&mut self) {
+        let cleared = {
+            let mut handle = self.handle.lock();
+            let owned =
+                handle.publication_pending && same_txn_identity(handle.txn_token(), self.txn_token);
+            if owned {
+                handle.publication_pending = false;
+            }
+            owned
+        };
+        if cleared {
+            advance_publication_epoch();
+        }
+    }
+}
+
+/// bd-i0tn6: a count of publication-pending marks withdrawn (published,
+/// aborted, or lease dropped), with a condvar, so a validator waiting for a
+/// peer's pending publication sleeps until one is withdrawn instead of
+/// polling the registry. A leaf lock: nothing else is acquired while it is
+/// held. Waiters capture the epoch before they test the registry, so a
+/// withdrawal after that test is never missed; spurious wakeups (another
+/// database, an unrelated session) only cost a re-check.
+///
+/// bd-w4pr1.7: the condvar is notified only while a waiter is registered.
+/// std's condvar makes a FUTEX_WAKE system call on every notify, waiter or
+/// not, and every concurrent commit withdraws one mark, so a commit nobody
+/// waits for (every commit at one writer) paid that call for nothing. A
+/// waiter registers under the mutex before it sleeps (the wait releases the
+/// mutex atomically) and unregisters after it wakes or times out, and the
+/// epoch moves under the same mutex, so a withdrawal either sees the waiter
+/// registered and notifies it, or comes before the waiter locked and is seen
+/// by the wait's predicate. No wakeup is lost.
+struct PublicationEpochCell {
+    state: std::sync::Mutex<PublicationEpochState>,
+    changed: std::sync::Condvar,
+}
+
+struct PublicationEpochState {
+    epoch: u64,
+    /// Threads inside [`PublicationEpochCell::wait_for_change`].
+    waiters: u32,
+}
+
+impl PublicationEpochCell {
+    const fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(PublicationEpochState {
+                epoch: 0,
+                waiters: 0,
+            }),
+            changed: std::sync::Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, PublicationEpochState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Move the epoch; wake the waiters if there are any. Returns whether it
+    /// notified.
+    fn advance(&self) -> bool {
+        let waiters = {
+            let mut state = self.lock();
+            state.epoch = state.epoch.wrapping_add(1);
+            state.waiters
+        };
+        let notify = waiters != 0;
+        if notify {
+            self.changed.notify_all();
+        }
+        notify
+    }
+
+    fn current(&self) -> u64 {
+        self.lock().epoch
+    }
+
+    fn wait_for_change(&self, observed: u64, timeout: std::time::Duration) -> bool {
+        let mut state = self.lock();
+        state.waiters = state.waiters.saturating_add(1);
+        let (mut state, _timed_out) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| state.epoch == observed)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.waiters = state.waiters.saturating_sub(1);
+        state.epoch != observed
+    }
+
+    #[cfg(test)]
+    fn waiters(&self) -> u32 {
+        self.lock().waiters
+    }
+}
+
+/// Process-wide: one validator may wait for a peer of any database.
+static PUBLICATION_EPOCH: PublicationEpochCell = PublicationEpochCell::new();
+
+fn advance_publication_epoch() {
+    PUBLICATION_EPOCH.advance();
+}
+
+/// bd-i0tn6: the current publication epoch; capture it before testing
+/// [`ConcurrentRegistry::pending_publication_blocks`] and pass it to
+/// [`wait_for_publication_epoch_change`].
+#[must_use]
+pub fn publication_epoch() -> u64 {
+    PUBLICATION_EPOCH.current()
+}
+
+/// bd-i0tn6: block the calling thread until some publication-pending mark is
+/// withdrawn after `observed` was captured, or `timeout` elapses. Returns
+/// whether the epoch moved. Callers hold no other lock.
+#[must_use]
+pub fn wait_for_publication_epoch_change(observed: u64, timeout: std::time::Duration) -> bool {
+    PUBLICATION_EPOCH.wait_for_change(observed, timeout)
+}
 
 /// Result of first-committer-wins validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,6 +498,27 @@ pub struct ConcurrentHandle {
     /// Pages whose `page_states` entry changed since the cache was built.
     /// Only maintained while a cache exists (a full rebuild ignores it).
     savepoint_snapshot_dirty: PageSet,
+    /// bd-i0tn6: this transaction passed commit validation and its physical
+    /// commit may run without the registry guard, so it is neither active
+    /// (its SSI decision is final) nor published (no `CommitIndex` /
+    /// committed-history entry yet). Later validators must not decide against
+    /// it until it publishes or aborts: see
+    /// [`ConcurrentRegistry::pending_publication_blocks`]. Cleared by
+    /// `mark_committed` / `mark_aborted` and on reuse.
+    publication_pending: bool,
+    /// bd-i0tn6: the witness-derived part of this handle's SSI view, built on
+    /// the first validation that needs it after a change and shared, by `Arc`,
+    /// with every later one until the next change. Every mutation that can
+    /// alter it (a read or write witness, a page-state transition, a savepoint
+    /// rollback, reuse) drops it through
+    /// [`ConcurrentHandle::invalidate_view_parts`].
+    view_parts_cache: Option<Arc<HandleViewParts>>,
+    /// bd-7dxmt / bd-29qkj: this transaction is an internal attempt that its
+    /// owner will report as part of one public outcome (a replayed COMMIT).
+    /// None of its conflict events reach the shared observer: neither commit
+    /// preparation's nor its statements' page-lock contention. Validation and
+    /// lock acquisition are unchanged. Cleared on reuse.
+    observation_quiet: bool,
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -450,7 +669,23 @@ impl ConcurrentHandle {
             marked_for_abort: Cell::new(false),
             savepoint_snapshot_cache: None,
             savepoint_snapshot_dirty: PageSet::default(),
+            publication_pending: false,
+            view_parts_cache: None,
+            observation_quiet: false,
         }
+    }
+
+    /// bd-7dxmt: mark this transaction as an internal attempt whose conflict
+    /// events stay out of the shared observer (see `observation_quiet`).
+    pub fn set_observation_quiet(&mut self, quiet: bool) {
+        self.observation_quiet = quiet;
+    }
+
+    /// Whether this transaction's conflict events stay out of the shared
+    /// observer (commit preparation and page-lock contention alike).
+    #[must_use]
+    pub const fn observation_quiet(&self) -> bool {
+        self.observation_quiet
     }
 
     /// Reset this handle for a new concurrent transaction while preserving
@@ -472,6 +707,7 @@ impl ConcurrentHandle {
         self.snapshot = snapshot;
         self.serializable = serializable;
         self.page_states.clear();
+        self.invalidate_view_parts();
         self.savepoint_snapshot_cache = None;
         self.savepoint_snapshot_dirty.clear();
         self.state = TransactionState::Active;
@@ -484,6 +720,8 @@ impl ConcurrentHandle {
         self.has_in_rw.set(false);
         self.has_out_rw.set(false);
         self.marked_for_abort.set(false);
+        self.publication_pending = false;
+        self.observation_quiet = false;
     }
 
     /// Returns the read snapshot for this concurrent transaction.
@@ -598,11 +836,26 @@ impl ConcurrentHandle {
     /// Mark the transaction as committed.
     pub fn mark_committed(&mut self) {
         self.state = TransactionState::Committed;
+        self.clear_publication_pending();
     }
 
     /// Mark the transaction as aborted.
     pub fn mark_aborted(&mut self) {
         self.state = TransactionState::Aborted;
+        self.clear_publication_pending();
+    }
+
+    fn clear_publication_pending(&mut self) {
+        if std::mem::take(&mut self.publication_pending) {
+            advance_publication_epoch();
+        }
+    }
+
+    /// Whether this transaction passed commit validation and awaits
+    /// publication (bd-i0tn6).
+    #[must_use]
+    pub const fn is_publication_pending(&self) -> bool {
+        self.publication_pending
     }
 
     /// Record a page read (for SSI rw-antidependency detection).
@@ -612,6 +865,7 @@ impl ConcurrentHandle {
                 .entry(page)
                 .or_default()
                 .push(WitnessKey::Page(page));
+            self.invalidate_view_parts();
         }
     }
 
@@ -642,6 +896,7 @@ impl ConcurrentHandle {
         } else {
             self.global_read_witnesses.push(key);
         }
+        self.invalidate_view_parts();
     }
 
     /// Record a granular write witness for fine-grained SSI.
@@ -650,6 +905,7 @@ impl ConcurrentHandle {
             let witnesses = self.write_index.entry(p).or_default();
             if !witnesses.iter().any(|existing| existing == &key) {
                 witnesses.push(key);
+                self.invalidate_view_parts();
             }
         } else if !self
             .global_write_witnesses
@@ -657,7 +913,26 @@ impl ConcurrentHandle {
             .any(|existing| existing == &key)
         {
             self.global_write_witnesses.push(key);
+            self.invalidate_view_parts();
         }
+    }
+
+    /// bd-i0tn6: drop the cached view parts; the next validation that views
+    /// this handle rebuilds them from the current witnesses and page states.
+    fn invalidate_view_parts(&mut self) {
+        self.view_parts_cache = None;
+    }
+
+    /// The witness-derived part of this handle's SSI view: the cached copy
+    /// when nothing changed since it was built, otherwise a fresh build that
+    /// later validations share.
+    fn view_parts(&mut self) -> Arc<HandleViewParts> {
+        if let Some(parts) = &self.view_parts_cache {
+            return Arc::clone(parts);
+        }
+        let parts = Arc::new(HandleViewParts::build(self));
+        self.view_parts_cache = Some(Arc::clone(&parts));
+        parts
     }
 
     /// Returns the set of pages that were read.
@@ -740,8 +1015,10 @@ impl ConcurrentHandle {
 
     fn ensure_page_state(&mut self, page: PageNumber) -> &mut PageTxnState {
         // The returned &mut is how every state transition happens, so the
-        // page must be assumed dirtied (bd-5310l savepoint snapshot cache).
+        // page must be assumed dirtied (bd-5310l savepoint snapshot cache)
+        // and the tracked write-conflict set in the view parts stale.
         self.note_savepoint_state_dirty(page);
+        self.invalidate_view_parts();
         self.page_states.entry(page).or_default()
     }
 
@@ -752,6 +1029,7 @@ impl ConcurrentHandle {
             .is_some_and(PageTxnState::is_empty)
         {
             self.note_savepoint_state_dirty(page);
+            self.invalidate_view_parts();
             self.page_states.remove(&page);
         }
     }
@@ -974,25 +1252,9 @@ pub struct ConcurrentRegistry {
     /// Refcounted index of registered session snapshot highs.
     gc_horizon_counts: BTreeMap<CommitSeq, usize>,
     /// Committed-reader history (RCRI-like) for SSI edge discovery.
-    committed_readers: Vec<CommittedReaderInfo>,
-    /// Page-local index into committed reader history (identity-hashed).
-    committed_readers_by_page: PageMap<Vec<usize>>,
-    /// Page witness-local index into committed reader history (identity-hashed).
-    committed_readers_by_page_witness: PageMap<Vec<usize>>,
-    /// Exact cell-local index into committed reader history.
-    committed_readers_by_exact_cell: HashMap<(PageNumber, u64), Vec<usize>>,
-    /// Committed reader entries that include at least one global witness.
-    committed_readers_with_global_keys: Vec<usize>,
+    committed_readers: CommittedHistory<CommittedReaderInfo>,
     /// Committed-writer history (commit-log-like) for SSI edge discovery.
-    committed_writers: Vec<CommittedWriterInfo>,
-    /// Page-local index into committed writer history (identity-hashed).
-    committed_writers_by_page: PageMap<Vec<usize>>,
-    /// Page witness-local index into committed writer history (identity-hashed).
-    committed_writers_by_page_witness: PageMap<Vec<usize>>,
-    /// Exact cell-local index into committed writer history.
-    committed_writers_by_exact_cell: HashMap<(PageNumber, u64), Vec<usize>>,
-    /// Committed writer entries that include at least one global witness.
-    committed_writers_with_global_keys: Vec<usize>,
+    committed_writers: CommittedHistory<CommittedWriterInfo>,
     /// Detached handles kept for reuse so hot autocommit loops do not hit the
     /// general allocator for a fresh handle every statement.
     recycled_handles: Vec<SharedConcurrentHandle>,
@@ -1006,6 +1268,11 @@ pub struct ConcurrentRegistry {
     owner_allocation_domain: Option<OwnerAllocationDomain>,
     /// Epoch counter for locally allocated transaction tokens.
     epoch_counter: u32,
+    /// bd-i0tn6: sessions marked by [`Self::mark_publication_pending`]. Entries
+    /// whose handle has since published, aborted or left the registry are
+    /// dropped lazily by [`Self::retain_pending_publications`], so the scan
+    /// is proportional to commits in flight, not to active sessions.
+    pending_publication_sessions: Vec<u64>,
 }
 
 impl ConcurrentRegistry {
@@ -1016,21 +1283,14 @@ impl ConcurrentRegistry {
             active: HashMap::new(),
             active_snapshot_highs: HashMap::new(),
             gc_horizon_counts: BTreeMap::new(),
-            committed_readers: Vec::new(),
-            committed_readers_by_page: PageMap::default(),
-            committed_readers_by_page_witness: PageMap::default(),
-            committed_readers_by_exact_cell: HashMap::new(),
-            committed_readers_with_global_keys: Vec::new(),
-            committed_writers: Vec::new(),
-            committed_writers_by_page: PageMap::default(),
-            committed_writers_by_page_witness: PageMap::default(),
-            committed_writers_by_exact_cell: HashMap::new(),
-            committed_writers_with_global_keys: Vec::new(),
+            committed_readers: CommittedHistory::new(),
+            committed_writers: CommittedHistory::new(),
             recycled_handles: Vec::new(),
             next_session_id: 1,
             last_owner_id: 0,
             owner_allocation_domain: None,
             epoch_counter: 0,
+            pending_publication_sessions: Vec::new(),
         }
     }
 
@@ -1268,14 +1528,7 @@ impl ConcurrentRegistry {
     fn can_use_uncontended_prepare_fast_path(&self, session_id: u64, begin_seq: CommitSeq) -> bool {
         self.active.len() == 1
             && self.active.contains_key(&session_id)
-            && self
-                .committed_readers
-                .last()
-                .is_none_or(|reader| reader.commit_seq <= begin_seq)
-            && self
-                .committed_writers
-                .last()
-                .is_none_or(|writer| writer.commit_seq <= begin_seq)
+            && self.committed_history_is_at_or_before(begin_seq)
     }
 
     fn can_use_uncontended_finalize_fast_path(
@@ -1285,35 +1538,159 @@ impl ConcurrentRegistry {
     ) -> bool {
         (self.active.is_empty()
             || (self.active.len() == 1 && self.active.contains_key(&session_id)))
-            && self
-                .committed_readers
-                .last()
-                .is_none_or(|reader| reader.commit_seq <= begin_seq)
+            && self.committed_history_is_at_or_before(begin_seq)
+    }
+
+    /// Whether every committed-history entry committed at or before
+    /// `begin_seq`.
+    ///
+    /// bd-i0tn6: history is appended in publication order. Once physical
+    /// commits run outside the registry guard, two commits can publish in the
+    /// opposite order of their commit sequences, so the last entry is not
+    /// necessarily the newest and every entry is checked. When this is asked
+    /// (one active session) pruning has already dropped everything at or
+    /// below the horizon, so the scan stops at the first retained entry.
+    fn committed_history_is_at_or_before(&self, begin_seq: CommitSeq) -> bool {
+        self.committed_readers
+            .iter()
+            .all(|reader| reader.commit_seq <= begin_seq)
             && self
                 .committed_writers
-                .last()
-                .is_none_or(|writer| writer.commit_seq <= begin_seq)
+                .iter()
+                .all(|writer| writer.commit_seq <= begin_seq)
+    }
+
+    /// bd-i0tn6: record that `session_id` passed commit validation and that
+    /// its physical commit may now run without the registry guard.
+    ///
+    /// Until the session publishes ([`finalize_prepared_concurrent_commit_with_ssi`])
+    /// or aborts, [`Self::pending_publication_blocks`] holds back any later
+    /// validator whose read or write set could form an SSI rw-antidependency
+    /// with it. Called under the registry guard right after a successful plan.
+    /// Session ids are never reused and owner ids strictly increase, so the
+    /// token check is an exact-identity receipt: a mismatch changes nothing.
+    /// The returned lease clears the mark when dropped (see
+    /// [`PublicationPendingLease`]); the caller drops it right before it
+    /// publishes, or on any path that does not publish.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidState` when the session is missing, no longer active, or owned
+    /// by a different transaction token.
+    pub fn mark_publication_pending(
+        &mut self,
+        session_id: u64,
+        txn_token: TxnToken,
+    ) -> Result<PublicationPendingLease, MvccError> {
+        let handle = self
+            .active
+            .get(&session_id)
+            .map(Arc::clone)
+            .ok_or(MvccError::InvalidState)?;
+        {
+            let mut guard = handle.lock();
+            if !guard.is_active() || !same_txn_identity(guard.txn_token(), txn_token) {
+                return Err(MvccError::InvalidState);
+            }
+            guard.publication_pending = true;
+        }
+        if !self.pending_publication_sessions.contains(&session_id) {
+            self.pending_publication_sessions.push(session_id);
+        }
+        Ok(PublicationPendingLease { handle, txn_token })
+    }
+
+    /// Drop pending-publication entries whose session has published, aborted
+    /// or left the registry.
+    fn retain_pending_publications(&mut self) {
+        if self.pending_publication_sessions.is_empty() {
+            return;
+        }
+        let active = &self.active;
+        self.pending_publication_sessions.retain(|session_id| {
+            active.get(session_id).is_some_and(|handle| {
+                let handle = handle.lock();
+                handle.is_active() && handle.is_publication_pending()
+            })
+        });
+    }
+
+    /// bd-i0tn6: whether any session other than `except` has passed commit
+    /// validation and not yet published or aborted.
+    ///
+    /// A schema change must not validate in that window: its snapshot can
+    /// miss rows the pending commit is about to publish.
+    pub fn has_pending_publication(&mut self, except: Option<u64>) -> bool {
+        self.retain_pending_publications();
+        self.pending_publication_sessions
+            .iter()
+            .any(|&session_id| Some(session_id) != except)
+    }
+
+    /// bd-i0tn6: whether `session_id` must wait for a pending publication
+    /// before it validates.
+    ///
+    /// A session whose commit is pending publication already made its SSI
+    /// decision; it can neither abort nor learn a new edge. A later validator
+    /// that could form an rw-antidependency with it (its writes against the
+    /// pending session's reads, or its reads against the pending session's
+    /// writes) must therefore wait until that session publishes, after which
+    /// the ordinary committed-history checks apply, exactly as when the
+    /// registry guard covered the physical commit. The test is the page-level
+    /// candidate relation SSI edge discovery itself starts from, with no
+    /// commit-sequence window, so it is a superset of every precise edge.
+    /// Write-write overlap cannot arise here: the pending session keeps its
+    /// page locks until it publishes.
+    #[must_use]
+    pub fn pending_publication_blocks(&mut self, session_id: u64) -> bool {
+        self.retain_pending_publications();
+        if self
+            .pending_publication_sessions
+            .iter()
+            .all(|&pending| pending == session_id)
+        {
+            return false;
+        }
+        let Some((token, read_summary, write_summary)) = self.get(session_id).map(|handle| {
+            (
+                handle.token(),
+                summarize_witness_keys(&handle.read_witness_keys()),
+                summarize_witness_keys(&handle.write_witness_keys()),
+            )
+        }) else {
+            return false;
+        };
+        // Each pending peer is tested under its own handle lock and the scan
+        // stops at the first candidate (bd-i0tn6 lever 4); no view vector and
+        // no candidate index.
+        let unbounded = CommitSeq::new(u64::MAX);
+        self.pending_publication_sessions
+            .iter()
+            .filter(|&&pending| pending != session_id)
+            .filter_map(|pending| self.active.get(pending))
+            .any(|handle| {
+                let mut guard = handle.lock();
+                let view = HandleView::new(&mut guard);
+                view.is_edge_peer_of(token, unbounded)
+                    && (view.may_have_read(&write_summary) || view.may_have_written(&read_summary))
+            })
     }
 
     /// Prune committed SSI history that cannot overlap any active transaction.
+    ///
+    /// Runs at every commit exit of finalize. The retained set is exactly the
+    /// entries committed after the retention horizon (the DRO pivot decision
+    /// reads its size); bd-i0tn6 made the index upkeep proportional to the
+    /// entries removed instead of rebuilding every index from every retained
+    /// entry.
     fn prune_committed_conflict_history(&mut self) {
         let Some(min_active_begin) = self.history_retention_horizon() else {
             self.committed_readers.clear();
-            self.committed_readers_by_page.clear();
-            self.committed_readers_by_page_witness.clear();
-            self.committed_readers_by_exact_cell.clear();
-            self.committed_readers_with_global_keys.clear();
             self.committed_writers.clear();
-            self.committed_writers_by_page.clear();
-            self.committed_writers_by_page_witness.clear();
-            self.committed_writers_by_exact_cell.clear();
-            self.committed_writers_with_global_keys.clear();
             return;
         };
-        self.committed_readers
-            .retain(|reader| reader.commit_seq > min_active_begin);
-        self.committed_writers
-            .retain(|writer| writer.commit_seq > min_active_begin);
+        self.committed_readers.prune_at_or_before(min_active_begin);
+        self.committed_writers.prune_at_or_before(min_active_begin);
 
         // C7 (bd-l9k8e.7): Safety bound for SSI history memory.
         // Reduced from 16384 to 4096 for tighter memory control.
@@ -1350,24 +1727,14 @@ impl ConcurrentRegistry {
                 let new_horizon = self
                     .history_retention_horizon()
                     .unwrap_or(CommitSeq::new(u64::MAX));
-                self.committed_readers
-                    .retain(|reader| reader.commit_seq > new_horizon);
-                self.committed_writers
-                    .retain(|writer| writer.commit_seq > new_horizon);
+                self.committed_readers.prune_at_or_before(new_horizon);
+                self.committed_writers.prune_at_or_before(new_horizon);
             } else {
                 // If we couldn't find an active transaction to abort (should be impossible if
                 // history is bounded by active transactions), just clear everything.
                 tracing::warn!("prune_committed_conflict_history: forced to clear SSI history");
                 self.committed_readers.clear();
-                self.committed_readers_by_page.clear();
-                self.committed_readers_by_page_witness.clear();
-                self.committed_readers_by_exact_cell.clear();
-                self.committed_readers_with_global_keys.clear();
                 self.committed_writers.clear();
-                self.committed_writers_by_page.clear();
-                self.committed_writers_by_page_witness.clear();
-                self.committed_writers_by_exact_cell.clear();
-                self.committed_writers_with_global_keys.clear();
                 break;
             }
         }
@@ -1383,68 +1750,6 @@ impl ConcurrentRegistry {
                 active_txns = self.active.len(),
                 "ssi_history_status"
             );
-        }
-
-        self.rebuild_committed_history_indexes();
-    }
-
-    fn rebuild_committed_history_indexes(&mut self) {
-        self.committed_readers_by_page.clear();
-        self.committed_readers_by_page_witness.clear();
-        self.committed_readers_by_exact_cell.clear();
-        self.committed_readers_with_global_keys.clear();
-        for (idx, reader) in self.committed_readers.iter().enumerate() {
-            let summary = summarize_witness_keys(&reader.keys);
-            if summary.has_global_keys {
-                self.committed_readers_with_global_keys.push(idx);
-            }
-            for page in summary.pages {
-                self.committed_readers_by_page
-                    .entry(page)
-                    .or_default()
-                    .push(idx);
-            }
-            for page in summary.page_witness_pages {
-                self.committed_readers_by_page_witness
-                    .entry(page)
-                    .or_default()
-                    .push(idx);
-            }
-            for cell in summary.cell_witnesses {
-                self.committed_readers_by_exact_cell
-                    .entry(cell.exact_key())
-                    .or_default()
-                    .push(idx);
-            }
-        }
-
-        self.committed_writers_by_page.clear();
-        self.committed_writers_by_page_witness.clear();
-        self.committed_writers_by_exact_cell.clear();
-        self.committed_writers_with_global_keys.clear();
-        for (idx, writer) in self.committed_writers.iter().enumerate() {
-            let summary = summarize_witness_keys(&writer.keys);
-            if summary.has_global_keys {
-                self.committed_writers_with_global_keys.push(idx);
-            }
-            for page in summary.pages {
-                self.committed_writers_by_page
-                    .entry(page)
-                    .or_default()
-                    .push(idx);
-            }
-            for page in summary.page_witness_pages {
-                self.committed_writers_by_page_witness
-                    .entry(page)
-                    .or_default()
-                    .push(idx);
-            }
-            for cell in summary.cell_witnesses {
-                self.committed_writers_by_exact_cell
-                    .entry(cell.exact_key())
-                    .or_default()
-                    .push(idx);
-            }
         }
     }
 
@@ -1472,62 +1777,6 @@ impl ConcurrentRegistry {
         }
     }
 
-    fn index_committed_reader(&mut self, entry_idx: usize) {
-        let Some(reader) = self.committed_readers.get(entry_idx) else {
-            return;
-        };
-        let summary = summarize_witness_keys(&reader.keys);
-        if summary.has_global_keys {
-            self.committed_readers_with_global_keys.push(entry_idx);
-        }
-        for page in summary.pages {
-            self.committed_readers_by_page
-                .entry(page)
-                .or_default()
-                .push(entry_idx);
-        }
-        for page in summary.page_witness_pages {
-            self.committed_readers_by_page_witness
-                .entry(page)
-                .or_default()
-                .push(entry_idx);
-        }
-        for cell in summary.cell_witnesses {
-            self.committed_readers_by_exact_cell
-                .entry(cell.exact_key())
-                .or_default()
-                .push(entry_idx);
-        }
-    }
-
-    fn index_committed_writer(&mut self, entry_idx: usize) {
-        let Some(writer) = self.committed_writers.get(entry_idx) else {
-            return;
-        };
-        let summary = summarize_witness_keys(&writer.keys);
-        if summary.has_global_keys {
-            self.committed_writers_with_global_keys.push(entry_idx);
-        }
-        for page in summary.pages {
-            self.committed_writers_by_page
-                .entry(page)
-                .or_default()
-                .push(entry_idx);
-        }
-        for page in summary.page_witness_pages {
-            self.committed_writers_by_page_witness
-                .entry(page)
-                .or_default()
-                .push(entry_idx);
-        }
-        for cell in summary.cell_witnesses {
-            self.committed_writers_by_exact_cell
-                .entry(cell.exact_key())
-                .or_default()
-                .push(entry_idx);
-        }
-    }
-
     fn committed_reader_candidates(
         &self,
         committing_txn: TxnToken,
@@ -1538,22 +1787,11 @@ impl ConcurrentRegistry {
         if self.committed_readers.is_empty() {
             return Vec::new();
         }
-        let candidate_indexes = if write_key_summary.has_global_keys {
-            (0..self.committed_readers.len()).collect::<Vec<_>>()
-        } else {
-            collect_precise_candidates(
-                &self.committed_readers_with_global_keys,
-                &self.committed_readers_by_page,
-                &self.committed_readers_by_page_witness,
-                &self.committed_readers_by_exact_cell,
-                write_key_summary,
-            )
-        };
         let committing_begin = committing_begin_seq.get();
         let committing_end = committing_commit_seq.get();
-        candidate_indexes
+        self.committed_readers
+            .candidates(write_key_summary)
             .into_iter()
-            .filter_map(|idx| self.committed_readers.get(idx))
             .filter(|reader| {
                 !same_txn_identity(reader.token, committing_txn)
                     && committing_begin < reader.commit_seq.get()
@@ -1573,21 +1811,10 @@ impl ConcurrentRegistry {
         if self.committed_writers.is_empty() {
             return Vec::new();
         }
-        let candidate_indexes = if read_key_summary.has_global_keys {
-            (0..self.committed_writers.len()).collect::<Vec<_>>()
-        } else {
-            collect_precise_candidates(
-                &self.committed_writers_with_global_keys,
-                &self.committed_writers_by_page,
-                &self.committed_writers_by_page_witness,
-                &self.committed_writers_by_exact_cell,
-                read_key_summary,
-            )
-        };
         let committing_begin = committing_begin_seq.get();
-        candidate_indexes
+        self.committed_writers
+            .candidates(read_key_summary)
             .into_iter()
-            .filter_map(|idx| self.committed_writers.get(idx))
             .filter(|writer| {
                 !same_txn_identity(writer.token, committing_txn)
                     && committing_begin < writer.commit_seq.get()
@@ -1693,7 +1920,11 @@ pub fn concurrent_prepare_write_page(
     let already_tracked = handle.tracks_write_conflict_page(page);
     if !holds_lock {
         let txn_id = handle.txn_token().id;
-        if lock_table.try_acquire(page, txn_id).is_err() {
+        // bd-29qkj: a replay attempt's contention is not public evidence.
+        if lock_table
+            .try_acquire_observed(page, txn_id, !handle.observation_quiet())
+            .is_err()
+        {
             handle.remove_page_state_if_empty(page);
             return Err(MvccError::Busy);
         }
@@ -1854,6 +2085,7 @@ pub fn concurrent_clear_page_state(
     }
 
     handle.note_savepoint_state_dirty(page);
+    handle.invalidate_view_parts();
     handle.page_states.remove(&page);
     Ok(())
 }
@@ -1888,7 +2120,10 @@ pub fn concurrent_track_write_conflict_page(
     }
 
     let txn_id = handle.txn_token().id;
-    if lock_table.try_acquire(page, txn_id).is_err() {
+    if lock_table
+        .try_acquire_observed(page, txn_id, !handle.observation_quiet())
+        .is_err()
+    {
         handle.remove_page_state_if_empty(page);
         return Err(MvccError::Busy);
     }
@@ -1943,7 +2178,10 @@ pub fn concurrent_free_page(
 
     let txn_id = handle.txn_token().id;
     let already_tracked = handle.tracks_write_conflict_page(page);
-    if lock_table.try_acquire(page, txn_id).is_err() {
+    if lock_table
+        .try_acquire_observed(page, txn_id, !handle.observation_quiet())
+        .is_err()
+    {
         handle.remove_page_state_if_empty(page);
         return Err(MvccError::Busy);
     }
@@ -2037,6 +2275,8 @@ pub fn concurrent_has_page_state(handle: &ConcurrentHandle) -> bool {
 /// - Structural B-tree metadata that can be merged safely
 pub fn concurrent_mark_metadata_exempt(handle: &mut ConcurrentHandle, page: PageNumber) {
     handle.note_savepoint_state_dirty(page);
+    // An exempt page leaves the tracked write-conflict set.
+    handle.invalidate_view_parts();
     if let Some(state) = handle.page_states.get_mut(&page) {
         state.metadata_exempt = true;
     }
@@ -2407,10 +2647,23 @@ impl ExactCellWitness {
     }
 }
 
+/// One validation's view of an active handle: identity, flags and rw bits read
+/// fresh, plus the witness-derived page sets shared through the handle's
+/// cache (bd-i0tn6). Field access goes through `Deref` to the parts.
 struct HandleView {
     token: TxnToken,
     begin_seq: CommitSeq,
     flags: HandleViewFlags,
+    parts: Arc<HandleViewParts>,
+    has_in_rw: Cell<bool>,
+    has_out_rw: Cell<bool>,
+}
+
+/// The witness-derived page sets of a [`HandleView`]: a pure function of the
+/// handle's read/write witnesses and tracked write-conflict pages, so one
+/// build serves every validation until one of those changes.
+#[derive(Debug, PartialEq, Eq)]
+struct HandleViewParts {
     // Sorted, dedup'd page sets queried via `binary_search`. Storing these
     // as `HashSet<PageNumber>` (default `RandomState` hasher) cost
     // SipHash13 on every insert + every overlap probe — `HandleView::new`
@@ -2424,12 +2677,161 @@ struct HandleView {
     write_pages: Vec<PageNumber>,
     write_page_witness_pages: Vec<PageNumber>,
     write_exact_cells: Vec<(PageNumber, u64)>,
-    has_in_rw: Cell<bool>,
-    has_out_rw: Cell<bool>,
+}
+
+impl std::ops::Deref for HandleView {
+    type Target = HandleViewParts;
+
+    fn deref(&self) -> &HandleViewParts {
+        &self.parts
+    }
 }
 
 impl HandleView {
-    fn new(handle: &ConcurrentHandle) -> Self {
+    /// The view validation and publication take of `handle`, sharing the
+    /// handle's cached parts when nothing changed since they were built.
+    fn new(handle: &mut ConcurrentHandle) -> Self {
+        Self {
+            token: handle.token(),
+            begin_seq: handle.begin_seq(),
+            flags: HandleViewFlags::from_handle(handle),
+            parts: handle.view_parts(),
+            has_in_rw: Cell::new(handle.has_in_rw()),
+            has_out_rw: Cell::new(handle.has_out_rw()),
+        }
+    }
+
+    const fn is_currently_active(&self) -> bool {
+        self.flags.is_active()
+    }
+
+    fn has_read_witnesses(&self) -> bool {
+        !self.read_pages.is_empty() || self.has_global_read_witnesses()
+    }
+
+    fn has_write_witnesses(&self) -> bool {
+        !self.write_pages.is_empty() || self.has_global_write_witnesses()
+    }
+
+    const fn has_global_read_witnesses(&self) -> bool {
+        self.flags.has_global_read_witnesses()
+    }
+
+    const fn has_global_write_witnesses(&self) -> bool {
+        self.flags.has_global_write_witnesses()
+    }
+
+    /// Whether this peer may have read something that a committer whose
+    /// writes `write_summary` describes wrote: an incoming rw-antidependency
+    /// candidate. The rules are the ones the per-commit candidate index
+    /// applied (bd-i0tn6 lever 4 replaced the index with this test): a global
+    /// key on either side, a committer page-witness page among the peer's
+    /// read pages, a committer cell whose root or leaf is one of the peer's
+    /// read page-witness pages, or the same exact cell.
+    fn may_have_read(&self, write_summary: &WitnessKeySummary) -> bool {
+        self.has_read_witnesses()
+            && (write_summary.has_global_keys
+                || self.has_global_read_witnesses()
+                || overlaps_pages_or_cells(
+                    write_summary,
+                    &self.read_pages,
+                    &self.read_page_witness_pages,
+                    &self.read_exact_cells,
+                ))
+    }
+
+    /// Whether this peer may have written something that a committer whose
+    /// reads `read_summary` describes read: an outgoing candidate, by the
+    /// same rules on the write side.
+    fn may_have_written(&self, read_summary: &WitnessKeySummary) -> bool {
+        self.has_write_witnesses()
+            && (read_summary.has_global_keys
+                || self.has_global_write_witnesses()
+                || overlaps_pages_or_cells(
+                    read_summary,
+                    &self.write_pages,
+                    &self.write_page_witness_pages,
+                    &self.write_exact_cells,
+                ))
+    }
+
+    /// Whether this peer can be the other end of an edge with the committer:
+    /// not the committer itself, still active, and begun before the
+    /// committer's commit sequence.
+    fn is_edge_peer_of(&self, committing_txn: TxnToken, committing_commit_seq: CommitSeq) -> bool {
+        !same_txn_identity(self.token, committing_txn)
+            && self.is_currently_active()
+            && self.begin_seq.get() < committing_commit_seq.get()
+    }
+}
+
+/// The page / cell part of the candidate rules: a page-witness page of
+/// `probe` among `pages`, a cell of `probe` whose root or leaf is among
+/// `page_witness_pages`, or a cell of `probe` among `exact_cells` by
+/// `(btree_root, tag)`. The three peer sets are sorted and deduplicated.
+fn overlaps_pages_or_cells(
+    probe: &WitnessKeySummary,
+    pages: &[PageNumber],
+    page_witness_pages: &[PageNumber],
+    exact_cells: &[(PageNumber, u64)],
+) -> bool {
+    probe
+        .page_witness_pages
+        .iter()
+        .any(|page| pages.binary_search(page).is_ok())
+        || probe.cell_witnesses.iter().any(|cell| {
+            page_witness_pages.binary_search(&cell.btree_root).is_ok()
+                || page_witness_pages.binary_search(&cell.leaf_page).is_ok()
+                || exact_cells.binary_search(&cell.exact_key()).is_ok()
+        })
+}
+
+/// Active peers in `views` that may have read what the committer wrote and
+/// can be an edge's other end, in `views` order.
+///
+/// bd-i0tn6 lever 4: one pass over the views. Every prepare and finalize
+/// used to build a hash index of every peer's pages and cells
+/// (`ActiveEdgeDiscoveryIndex`, kept below as the test oracle) to answer
+/// this one question, which cost more than the question. The cheap peer test
+/// runs first, so the committer's own view and finished peers are never
+/// searched (lever 4 v2).
+fn active_incoming_candidates<'a>(
+    views: &'a [HandleView],
+    committing_txn: TxnToken,
+    committing_commit_seq: CommitSeq,
+    write_key_summary: &WitnessKeySummary,
+) -> Vec<&'a dyn ActiveTxnView> {
+    views
+        .iter()
+        .filter(|view| {
+            view.is_edge_peer_of(committing_txn, committing_commit_seq)
+                && view.may_have_read(write_key_summary)
+        })
+        .map(|view| view as &dyn ActiveTxnView)
+        .collect()
+}
+
+/// Active peers in `views` that may have written what the committer read and
+/// can be an edge's other end, in `views` order (see
+/// [`active_incoming_candidates`]).
+fn active_outgoing_candidates<'a>(
+    views: &'a [HandleView],
+    committing_txn: TxnToken,
+    committing_commit_seq: CommitSeq,
+    read_key_summary: &WitnessKeySummary,
+) -> Vec<&'a dyn ActiveTxnView> {
+    views
+        .iter()
+        .filter(|view| {
+            view.is_edge_peer_of(committing_txn, committing_commit_seq)
+                && view.may_have_written(read_key_summary)
+        })
+        .map(|view| view as &dyn ActiveTxnView)
+        .collect()
+}
+
+impl HandleViewParts {
+    fn build(handle: &ConcurrentHandle) -> Self {
         let read_summary = summarize_witness_keys(&handle.read_witness_keys());
         let write_summary = summarize_witness_keys(&handle.write_witness_keys());
 
@@ -2462,38 +2864,13 @@ impl HandleView {
         write_exact_cells.dedup();
 
         Self {
-            token: handle.token(),
-            begin_seq: handle.begin_seq(),
-            flags: HandleViewFlags::from_handle(handle),
             read_pages: read_summary.pages,
             read_page_witness_pages: read_summary.page_witness_pages,
             read_exact_cells,
             write_pages,
             write_page_witness_pages: write_summary.page_witness_pages,
             write_exact_cells,
-            has_in_rw: Cell::new(handle.has_in_rw()),
-            has_out_rw: Cell::new(handle.has_out_rw()),
         }
-    }
-
-    const fn is_currently_active(&self) -> bool {
-        self.flags.is_active()
-    }
-
-    fn has_read_witnesses(&self) -> bool {
-        !self.read_pages.is_empty() || self.has_global_read_witnesses()
-    }
-
-    fn has_write_witnesses(&self) -> bool {
-        !self.write_pages.is_empty() || self.has_global_write_witnesses()
-    }
-
-    const fn has_global_read_witnesses(&self) -> bool {
-        self.flags.has_global_read_witnesses()
-    }
-
-    const fn has_global_write_witnesses(&self) -> bool {
-        self.flags.has_global_write_witnesses()
     }
 }
 
@@ -2573,45 +2950,345 @@ fn hydrate_finalize_witness_state(
     Some((read_keys, read_key_summary, write_keys, write_key_summary))
 }
 
-fn collect_precise_candidates(
-    global_indexes: &[usize],
-    indexes_by_page: &PageMap<Vec<usize>>,
-    indexes_by_page_witness: &PageMap<Vec<usize>>,
-    indexes_by_exact_cell: &HashMap<(PageNumber, u64), Vec<usize>>,
-    summary: &WitnessKeySummary,
-) -> Vec<usize> {
-    // Short-circuit: when every committed-history index is empty there is
-    // nothing to probe per summary page/cell. This is the hot shape when
-    // no committed SSI history exists yet — every commit otherwise walks
-    // `summary.page_witness_pages` doing wasted HashMap probes.
-    if global_indexes.is_empty()
-        && indexes_by_page.is_empty()
-        && indexes_by_page_witness.is_empty()
-        && indexes_by_exact_cell.is_empty()
-    {
-        return Vec::new();
-    }
-    let mut candidate_indexes = global_indexes.to_vec();
-    for &page in &summary.page_witness_pages {
-        if let Some(indexes) = indexes_by_page.get(&page) {
-            candidate_indexes.extend(indexes.iter().copied());
-        }
-    }
-    for cell in &summary.cell_witnesses {
-        for page in [cell.btree_root, cell.leaf_page] {
-            if let Some(indexes) = indexes_by_page_witness.get(&page) {
-                candidate_indexes.extend(indexes.iter().copied());
-            }
-        }
-        if let Some(indexes) = indexes_by_exact_cell.get(&cell.exact_key()) {
-            candidate_indexes.extend(indexes.iter().copied());
-        }
-    }
-    candidate_indexes.sort_unstable();
-    candidate_indexes.dedup();
-    candidate_indexes
+/// A committed-history record as `CommittedHistory` stores it.
+trait CommittedHistoryInfo {
+    fn commit_seq(&self) -> CommitSeq;
+    fn keys(&self) -> &[WitnessKey];
 }
 
+impl CommittedHistoryInfo for CommittedReaderInfo {
+    fn commit_seq(&self) -> CommitSeq {
+        self.commit_seq
+    }
+
+    fn keys(&self) -> &[WitnessKey] {
+        &self.keys
+    }
+}
+
+impl CommittedHistoryInfo for CommittedWriterInfo {
+    fn commit_seq(&self) -> CommitSeq {
+        self.commit_seq
+    }
+
+    fn keys(&self) -> &[WitnessKey] {
+        &self.keys
+    }
+}
+
+/// One retained committed-history record and the witness summary its index
+/// entries were made from, kept so removal can find them again.
+#[derive(Debug)]
+struct CommittedHistoryEntry<E> {
+    info: E,
+    summary: WitnessKeySummary,
+}
+
+/// Committed SSI history (readers or writers) with indexes that are kept
+/// up to date entry by entry (bd-i0tn6).
+///
+/// Every record gets an id in publication order and the index lists hold
+/// ids, so pruning a record touches only the lists of its own pages; the
+/// earlier layout held vector positions and rebuilt every index from every
+/// retained record at each commit. `slots[i]` holds record `first_id + i`.
+/// A record pruned while an older one is retained (publication order can
+/// differ from commit order) leaves an empty slot until every older record
+/// is gone, so `len`, iteration and candidate order are those of a vector
+/// in publication order with the same records removed.
+#[derive(Debug)]
+struct CommittedHistory<E> {
+    slots: VecDeque<Option<CommittedHistoryEntry<E>>>,
+    /// Id of `slots[0]`.
+    first_id: u64,
+    /// Id the next pushed record gets; `first_id + slots.len()`.
+    next_id: u64,
+    /// Number of occupied slots.
+    live: usize,
+    /// `(commit_seq, id)` of every retained record, least first, so a prune
+    /// finds each record at or below its horizon without scanning the rest.
+    by_commit_seq: BinaryHeap<Reverse<(CommitSeq, u64)>>,
+    /// Records with a page in their summary's `pages` (identity-hashed).
+    by_page: PageMap<VecDeque<u64>>,
+    /// Records with a page in their summary's `page_witness_pages`.
+    by_page_witness: PageMap<VecDeque<u64>>,
+    /// Records with an exact cell witness, by `(btree_root, tag)`.
+    by_exact_cell: HashMap<(PageNumber, u64), VecDeque<u64>>,
+    /// Records with at least one global witness.
+    with_global_keys: VecDeque<u64>,
+}
+
+impl<E: CommittedHistoryInfo> CommittedHistory<E> {
+    fn new() -> Self {
+        Self {
+            slots: VecDeque::new(),
+            first_id: 0,
+            next_id: 0,
+            live: 0,
+            by_commit_seq: BinaryHeap::new(),
+            by_page: PageMap::default(),
+            by_page_witness: PageMap::default(),
+            by_exact_cell: HashMap::new(),
+            with_global_keys: VecDeque::new(),
+        }
+    }
+
+    /// Number of retained records.
+    const fn len(&self) -> usize {
+        self.live
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.live == 0
+    }
+
+    /// Retained records in publication order.
+    fn iter(&self) -> impl Iterator<Item = &E> {
+        self.slots.iter().flatten().map(|entry| &entry.info)
+    }
+
+    fn get(&self, id: u64) -> Option<&E> {
+        let offset = usize::try_from(id.checked_sub(self.first_id)?).ok()?;
+        self.slots.get(offset)?.as_ref().map(|entry| &entry.info)
+    }
+
+    /// Append a record and index it under its pages, page witnesses, exact
+    /// cells and global keys.
+    fn push(&mut self, info: E) {
+        let summary = summarize_witness_keys(info.keys());
+        let id = self.next_id;
+        self.next_id += 1;
+        if summary.has_global_keys {
+            self.with_global_keys.push_back(id);
+        }
+        for &page in &summary.pages {
+            self.by_page.entry(page).or_default().push_back(id);
+        }
+        for &page in &summary.page_witness_pages {
+            self.by_page_witness.entry(page).or_default().push_back(id);
+        }
+        for cell in &summary.cell_witnesses {
+            // Two cells of one record can share `(btree_root, tag)`; list the
+            // record once.
+            let ids = self.by_exact_cell.entry(cell.exact_key()).or_default();
+            if ids.back() != Some(&id) {
+                ids.push_back(id);
+            }
+        }
+        self.by_commit_seq.push(Reverse((info.commit_seq(), id)));
+        self.slots
+            .push_back(Some(CommittedHistoryEntry { info, summary }));
+        self.live += 1;
+    }
+
+    /// Drop every record with `commit_seq <= horizon`, wherever it sits.
+    fn prune_at_or_before(&mut self, horizon: CommitSeq) {
+        while let Some(&Reverse((commit_seq, id))) = self.by_commit_seq.peek() {
+            if commit_seq > horizon {
+                break;
+            }
+            self.by_commit_seq.pop();
+            self.remove(id);
+        }
+        while matches!(self.slots.front(), Some(None)) {
+            self.slots.pop_front();
+            self.first_id += 1;
+        }
+    }
+
+    fn remove(&mut self, id: u64) {
+        let Some(entry) = id
+            .checked_sub(self.first_id)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .and_then(|offset| self.slots.get_mut(offset))
+            .and_then(Option::take)
+        else {
+            debug_assert!(false, "committed-history id {id} has no retained record");
+            return;
+        };
+        self.live -= 1;
+        let summary = entry.summary;
+        if summary.has_global_keys {
+            remove_history_id(&mut self.with_global_keys, id);
+        }
+        for page in summary.pages {
+            remove_indexed_history_id(&mut self.by_page, page, id);
+        }
+        for page in summary.page_witness_pages {
+            remove_indexed_history_id(&mut self.by_page_witness, page, id);
+        }
+        for cell in summary.cell_witnesses {
+            remove_indexed_history_id(&mut self.by_exact_cell, cell.exact_key(), id);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.slots.clear();
+        self.first_id = self.next_id;
+        self.live = 0;
+        self.by_commit_seq.clear();
+        self.by_page.clear();
+        self.by_page_witness.clear();
+        self.by_exact_cell.clear();
+        self.with_global_keys.clear();
+    }
+
+    /// Records that may overlap a transaction whose witnesses `summary`
+    /// describes, in publication order: every record if the summary has a
+    /// global key, else the records with a global key, a page among the
+    /// summary's page witnesses, a page witness on a cell's root or leaf, or
+    /// the same exact cell.
+    fn candidates(&self, summary: &WitnessKeySummary) -> Vec<&E> {
+        if summary.has_global_keys {
+            return self.iter().collect();
+        }
+        // Short-circuit: when every index is empty there is nothing to probe
+        // per summary page/cell. This is the hot shape when no committed SSI
+        // history exists yet; every commit otherwise walks
+        // `summary.page_witness_pages` doing wasted HashMap probes.
+        if self.with_global_keys.is_empty()
+            && self.by_page.is_empty()
+            && self.by_page_witness.is_empty()
+            && self.by_exact_cell.is_empty()
+        {
+            return Vec::new();
+        }
+        let mut ids: Vec<u64> = self.with_global_keys.iter().copied().collect();
+        for page in &summary.page_witness_pages {
+            if let Some(page_ids) = self.by_page.get(page) {
+                ids.extend(page_ids.iter().copied());
+            }
+        }
+        for cell in &summary.cell_witnesses {
+            for page in [cell.btree_root, cell.leaf_page] {
+                if let Some(page_ids) = self.by_page_witness.get(&page) {
+                    ids.extend(page_ids.iter().copied());
+                }
+            }
+            if let Some(cell_ids) = self.by_exact_cell.get(&cell.exact_key()) {
+                ids.extend(cell_ids.iter().copied());
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        ids.into_iter().filter_map(|id| self.get(id)).collect()
+    }
+
+    /// Test check: the incrementally kept state equals what a full rebuild
+    /// from the retained records produces.
+    #[cfg(test)]
+    fn assert_matches_rebuild(&self) {
+        let mut by_page: HashMap<PageNumber, Vec<u64>> = HashMap::new();
+        let mut by_page_witness: HashMap<PageNumber, Vec<u64>> = HashMap::new();
+        let mut by_exact_cell: HashMap<(PageNumber, u64), Vec<u64>> = HashMap::new();
+        let mut with_global_keys = Vec::new();
+        let mut by_commit_seq = Vec::new();
+        let mut live = 0;
+        for (offset, slot) in self.slots.iter().enumerate() {
+            let Some(entry) = slot else {
+                continue;
+            };
+            let id = self.first_id + u64::try_from(offset).expect("slot offset fits u64");
+            live += 1;
+            let summary = summarize_witness_keys(entry.info.keys());
+            assert_eq!(
+                summary.pages, entry.summary.pages,
+                "stored summary of id {id}"
+            );
+            assert_eq!(
+                summary.page_witness_pages, entry.summary.page_witness_pages,
+                "stored summary of id {id}"
+            );
+            assert_eq!(
+                summary.cell_witnesses, entry.summary.cell_witnesses,
+                "stored summary of id {id}"
+            );
+            if summary.has_global_keys {
+                with_global_keys.push(id);
+            }
+            for page in summary.pages {
+                by_page.entry(page).or_default().push(id);
+            }
+            for page in summary.page_witness_pages {
+                by_page_witness.entry(page).or_default().push(id);
+            }
+            for cell in summary.cell_witnesses {
+                let ids = by_exact_cell.entry(cell.exact_key()).or_default();
+                if ids.last() != Some(&id) {
+                    ids.push(id);
+                }
+            }
+            by_commit_seq.push((entry.info.commit_seq(), id));
+        }
+        assert_eq!(self.live, live, "live count");
+        assert!(
+            !matches!(self.slots.front(), Some(None)),
+            "a leading empty slot is popped"
+        );
+        assert_eq!(
+            self.next_id,
+            self.first_id + u64::try_from(self.slots.len()).expect("slot count fits u64"),
+            "ids are contiguous over the slots"
+        );
+        let mut heap: Vec<(CommitSeq, u64)> =
+            self.by_commit_seq.iter().map(|Reverse(key)| *key).collect();
+        heap.sort_unstable();
+        by_commit_seq.sort_unstable();
+        assert_eq!(heap, by_commit_seq, "commit-sequence heap");
+        let as_vecs = |index: &PageMap<VecDeque<u64>>| -> HashMap<PageNumber, Vec<u64>> {
+            index
+                .iter()
+                .map(|(&page, ids)| (page, ids.iter().copied().collect()))
+                .collect()
+        };
+        assert_eq!(as_vecs(&self.by_page), by_page, "page index");
+        assert_eq!(
+            as_vecs(&self.by_page_witness),
+            by_page_witness,
+            "page-witness index"
+        );
+        let exact_cells: HashMap<(PageNumber, u64), Vec<u64>> = self
+            .by_exact_cell
+            .iter()
+            .map(|(&key, ids)| (key, ids.iter().copied().collect()))
+            .collect();
+        assert_eq!(exact_cells, by_exact_cell, "exact-cell index");
+        assert_eq!(
+            self.with_global_keys.iter().copied().collect::<Vec<_>>(),
+            with_global_keys,
+            "global-key list"
+        );
+    }
+}
+
+/// Remove `id` from an ascending id list.
+fn remove_history_id(ids: &mut VecDeque<u64>, id: u64) {
+    if ids.front() == Some(&id) {
+        ids.pop_front();
+    } else if let Ok(position) = ids.binary_search(&id) {
+        ids.remove(position);
+    }
+}
+
+/// Remove `id` from the list under `key`, dropping the key once its list is
+/// empty so an index never keeps a page no retained record has.
+fn remove_indexed_history_id<K: Eq + Hash, S: BuildHasher>(
+    index: &mut HashMap<K, VecDeque<u64>, S>,
+    key: K,
+    id: u64,
+) {
+    if let hash_map::Entry::Occupied(mut ids) = index.entry(key) {
+        remove_history_id(ids.get_mut(), id);
+        if ids.get().is_empty() {
+            ids.remove();
+        }
+    }
+}
+
+/// The per-commit candidate index that prepare, finalize and the pending
+/// check built before bd-i0tn6 lever 4. Kept only as the oracle that
+/// `test_active_candidate_scan_matches_the_candidate_index` compares
+/// [`active_incoming_candidates`] / [`active_outgoing_candidates`] against.
+#[cfg(test)]
 #[derive(Debug, Default)]
 struct ActiveEdgeDiscoveryIndex {
     all_readers: Vec<usize>,
@@ -2631,6 +3308,7 @@ struct ActiveEdgeDiscoveryIndex {
     writers_by_exact_cell: HashMap<(PageNumber, u64), Vec<usize>>,
 }
 
+#[cfg(test)]
 impl ActiveEdgeDiscoveryIndex {
     fn build(views: &[HandleView]) -> Self {
         // Pre-size the PageNumber-keyed maps to avoid the reserve_rehash
@@ -3120,8 +3798,9 @@ fn record_prepare_fcw_conflicts(
     commit_index: &CommitIndex,
     lock_table: &InProcessPageLockTable,
     txn: TxnId,
+    quiet: bool,
 ) {
-    if lock_table.observer().is_none() {
+    if quiet || lock_table.observer().is_none() {
         return;
     }
     if let FcwResult::Conflict {
@@ -3155,17 +3834,24 @@ pub fn prepare_concurrent_commit_with_ssi(
     session_id: u64,
     planned_commit_seq: CommitSeq,
 ) -> Result<PreparedConcurrentCommit, (MvccError, FcwResult)> {
-    let (txn_id, commit_view) = {
+    let (txn_id, commit_view, quiet) = {
         let handle = registry
             .get(session_id)
             .ok_or((MvccError::InvalidState, FcwResult::Clean))?;
         if !handle.is_active() {
             return Err((MvccError::InvalidState, FcwResult::Clean));
         }
+        let quiet = handle.observation_quiet();
 
         // Step 1: First-committer-wins validation.
         let fcw_result = validate_first_committer_wins(&handle, commit_index);
-        record_prepare_fcw_conflicts(&fcw_result, commit_index, lock_table, handle.token().id);
+        record_prepare_fcw_conflicts(
+            &fcw_result,
+            commit_index,
+            lock_table,
+            handle.token().id,
+            quiet,
+        );
         let view = if !matches!(fcw_result, FcwResult::Clean) {
             Err(fcw_result)
         } else {
@@ -3177,7 +3863,7 @@ pub fn prepare_concurrent_commit_with_ssi(
                 handle.is_marked_for_abort(),
             ))
         };
-        (handle.txn_token().id, view)
+        (handle.txn_token().id, view, quiet)
     };
     let (txn, begin_seq, write_set_pages, held_lock_pages, marked_for_abort) = match commit_view {
         Ok(view) => view,
@@ -3194,7 +3880,7 @@ pub fn prepare_concurrent_commit_with_ssi(
 
     if marked_for_abort {
         // The rejection is real, but this early exit did not discover edges.
-        if lock_table.observer().is_some() {
+        if !quiet && lock_table.observer().is_some() {
             emit_ssi_abort(
                 lock_table.observer(),
                 txn,
@@ -3310,18 +3996,12 @@ pub fn prepare_concurrent_commit_with_ssi(
         let views = registry
             .iter_active()
             .filter_map(|(_, handle)| {
-                let guard = handle.lock();
-                guard.is_active().then_some(HandleView::new(&guard))
+                let mut guard = handle.lock();
+                guard.is_active().then(|| HandleView::new(&mut guard))
             })
             .collect::<Vec<_>>();
-        let active_index = ActiveEdgeDiscoveryIndex::build(&views);
-        let active_reader_candidates = active_index.incoming_candidate_refs(
-            &views,
-            txn,
-            begin_seq,
-            planned_commit_seq,
-            &write_key_summary,
-        );
+        let active_reader_candidates =
+            active_incoming_candidates(&views, txn, planned_commit_seq, &write_key_summary);
         let committed_reader_candidates = registry.committed_reader_candidates(
             txn,
             begin_seq,
@@ -3377,7 +4057,7 @@ pub fn prepare_concurrent_commit_with_ssi(
             .iter()
             .any(|edge| !edge.source_is_active && edge.source_has_in_rw)
         {
-            if lock_table.observer().is_some() {
+            if !quiet && lock_table.observer().is_some() {
                 emit_ssi_abort(
                     lock_table.observer(),
                     txn,
@@ -3425,25 +4105,14 @@ pub fn prepare_concurrent_commit_with_ssi(
     let views = registry
         .iter_active()
         .filter_map(|(_, handle)| {
-            let guard = handle.lock();
-            guard.is_active().then_some(HandleView::new(&guard))
+            let mut guard = handle.lock();
+            guard.is_active().then(|| HandleView::new(&mut guard))
         })
         .collect::<Vec<_>>();
-    let active_index = ActiveEdgeDiscoveryIndex::build(&views);
-    let active_reader_candidates = active_index.incoming_candidate_refs(
-        &views,
-        txn,
-        begin_seq,
-        planned_commit_seq,
-        &write_key_summary,
-    );
-    let active_writer_candidates = active_index.outgoing_candidate_refs(
-        &views,
-        txn,
-        begin_seq,
-        planned_commit_seq,
-        &read_key_summary,
-    );
+    let active_reader_candidates =
+        active_incoming_candidates(&views, txn, planned_commit_seq, &write_key_summary);
+    let active_writer_candidates =
+        active_outgoing_candidates(&views, txn, planned_commit_seq, &read_key_summary);
     let committed_reader_candidates = registry.committed_reader_candidates(
         txn,
         begin_seq,
@@ -3535,7 +4204,7 @@ pub fn prepare_concurrent_commit_with_ssi(
                 fsqlite_observability::SsiAbortCategory::MarkedForAbort
             }
         };
-        if lock_table.observer().is_some() {
+        if !quiet && lock_table.observer().is_some() {
             emit_ssi_abort(
                 lock_table.observer(),
                 txn,
@@ -3605,17 +4274,24 @@ pub fn prepare_concurrent_commit_fcw_only(
     session_id: u64,
     planned_commit_seq: CommitSeq,
 ) -> Result<PreparedConcurrentCommit, (MvccError, FcwResult)> {
-    let (txn_id, commit_view) = {
+    let (txn_id, commit_view, quiet) = {
         let handle = registry
             .get(session_id)
             .ok_or((MvccError::InvalidState, FcwResult::Clean))?;
         if !handle.is_active() {
             return Err((MvccError::InvalidState, FcwResult::Clean));
         }
+        let quiet = handle.observation_quiet();
 
         // FCW (Step 1) — mandatory for MVCC write-write invariants.
         let fcw_result = validate_first_committer_wins(&handle, commit_index);
-        record_prepare_fcw_conflicts(&fcw_result, commit_index, lock_table, handle.token().id);
+        record_prepare_fcw_conflicts(
+            &fcw_result,
+            commit_index,
+            lock_table,
+            handle.token().id,
+            quiet,
+        );
         let view = if !matches!(fcw_result, FcwResult::Clean) {
             Err(fcw_result)
         } else {
@@ -3627,7 +4303,7 @@ pub fn prepare_concurrent_commit_fcw_only(
                 handle.is_marked_for_abort(),
             ))
         };
-        (handle.txn_token().id, view)
+        (handle.txn_token().id, view, quiet)
     };
     let (txn, begin_seq, write_set_pages, held_lock_pages, marked_for_abort) = match commit_view {
         Ok(view) => view,
@@ -3645,7 +4321,7 @@ pub fn prepare_concurrent_commit_fcw_only(
     if marked_for_abort {
         // FCW-only preparation still honors an existing abort mark. No SSI
         // edge discovery ran here, so report the counts as unmeasured.
-        if lock_table.observer().is_some() {
+        if !quiet && lock_table.observer().is_some() {
             emit_ssi_abort(
                 lock_table.observer(),
                 txn,
@@ -3793,15 +4469,13 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
             .active
             .values()
             .map(|handle| {
-                let guard = handle.lock();
-                HandleView::new(&guard)
+                let mut guard = handle.lock();
+                HandleView::new(&mut guard)
             })
             .collect();
-        let active_index = ActiveEdgeDiscoveryIndex::build(&active_views);
-        let active_reader_candidates = active_index.incoming_candidate_refs(
+        let active_reader_candidates = active_incoming_candidates(
             &active_views,
             prepared.txn_token,
-            prepared.begin_seq,
             committed_seq,
             write_key_summary,
         );
@@ -3828,7 +4502,6 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
                     had_out_rw: false,
                     keys: write_keys.to_vec(),
                 });
-                registry.index_committed_writer(registry.committed_writers.len() - 1);
             }
             registry.prune_committed_conflict_history();
             return;
@@ -3842,22 +4515,19 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         .active
         .values()
         .map(|handle| {
-            let guard = handle.lock();
-            HandleView::new(&guard)
+            let mut guard = handle.lock();
+            HandleView::new(&mut guard)
         })
         .collect();
-    let active_index = ActiveEdgeDiscoveryIndex::build(&active_views);
-    let active_reader_candidates = active_index.incoming_candidate_refs(
+    let active_reader_candidates = active_incoming_candidates(
         &active_views,
         prepared.txn_token,
-        prepared.begin_seq,
         committed_seq,
         write_key_summary,
     );
-    let active_writer_candidates = active_index.outgoing_candidate_refs(
+    let active_writer_candidates = active_outgoing_candidates(
         &active_views,
         prepared.txn_token,
-        prepared.begin_seq,
         committed_seq,
         read_key_summary,
     );
@@ -3897,7 +4567,6 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
                 had_in_rw: false,
                 keys: read_keys.to_vec(),
             });
-            registry.index_committed_reader(registry.committed_readers.len() - 1);
         }
         if !write_keys.is_empty() {
             registry.committed_writers.push(CommittedWriterInfo {
@@ -3906,7 +4575,6 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
                 had_out_rw: false,
                 keys: write_keys.to_vec(),
             });
-            registry.index_committed_writer(registry.committed_writers.len() - 1);
         }
         registry.prune_committed_conflict_history();
         return;
@@ -4038,7 +4706,6 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
             had_in_rw: has_in_rw,
             keys: read_keys.to_vec(),
         });
-        registry.index_committed_reader(registry.committed_readers.len() - 1);
     }
     if !write_keys.is_empty() {
         registry.committed_writers.push(CommittedWriterInfo {
@@ -4047,7 +4714,6 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
             had_out_rw: has_out_rw,
             keys: write_keys.to_vec(),
         });
-        registry.index_committed_writer(registry.committed_writers.len() - 1);
     }
     registry.prune_committed_conflict_history();
 }
@@ -4150,9 +4816,13 @@ pub fn concurrent_rollback_to_savepoint(
     }
     let txn_id = handle.txn_token().id;
     let mut reacquired_pages = Vec::new();
+    let observe = !handle.observation_quiet();
     for &page in savepoint.page_states_snapshot.keys() {
         if !handle.page_state(page).is_some_and(|state| state.held_lock) {
-            if lock_table.try_acquire(page, txn_id).is_err() {
+            if lock_table
+                .try_acquire_observed(page, txn_id, observe)
+                .is_err()
+            {
                 for reacquired in reacquired_pages {
                     lock_table.release(reacquired, txn_id);
                 }
@@ -4197,6 +4867,8 @@ pub fn concurrent_rollback_to_savepoint(
     // Wholesale replacement above invalidates the incremental savepoint
     // snapshot cache; the next savepoint rebuilds it in full (bd-5310l).
     handle.invalidate_savepoint_snapshot_cache();
+    // ...and the tracked write-conflict pages of the SSI view parts.
+    handle.invalidate_view_parts();
     Ok(())
 }
 
@@ -4232,11 +4904,13 @@ mod tests {
     use crate::ssi_validation::{ActiveTxnView, SsiAbortReason};
 
     use super::{
-        ActiveEdgeDiscoveryIndex, CommittedReaderInfo, CommittedWriterInfo, ConcurrentHandle,
-        ConcurrentRegistry, FcwResult, HandleView, MAX_CONCURRENT_WRITERS, OwnerAllocationDomain,
-        concurrent_abort, concurrent_clear_page_state, concurrent_commit,
-        concurrent_commit_read_only, concurrent_commit_with_ssi, concurrent_free_page,
-        concurrent_is_metadata_exempt, concurrent_mark_metadata_exempt, concurrent_page_is_freed,
+        ActiveEdgeDiscoveryIndex, CommittedHistory, CommittedReaderInfo, CommittedWriterInfo,
+        ConcurrentHandle, ConcurrentRegistry, FcwResult, HandleView, HandleViewFlags,
+        HandleViewParts, MAX_CONCURRENT_WRITERS, OwnerAllocationDomain, WitnessKeySummary,
+        active_incoming_candidates, active_outgoing_candidates, concurrent_abort,
+        concurrent_clear_page_state, concurrent_commit, concurrent_commit_read_only,
+        concurrent_commit_with_ssi, concurrent_free_page, concurrent_is_metadata_exempt,
+        concurrent_mark_metadata_exempt, concurrent_page_is_freed,
         concurrent_page_is_synthetic_conflict_only, concurrent_page_read_status,
         concurrent_page_state, concurrent_prepare_write_page, concurrent_read_page,
         concurrent_restore_page_state, concurrent_rollback_to_savepoint, concurrent_savepoint,
@@ -6701,6 +7375,333 @@ mod tests {
         );
     }
 
+    /// bd-i0tn6: once physical commits run outside the registry guard, history
+    /// can be appended out of commit-sequence order. The fast-path predicates
+    /// must not read the last entry as the newest one.
+    #[test]
+    fn test_uncontended_fast_paths_check_every_history_entry_not_only_the_last() {
+        let mut registry = ConcurrentRegistry::new();
+        let session_id = registry
+            .begin_concurrent(test_snapshot(10))
+            .expect("session");
+        let token = registry.get(session_id).expect("handle").txn_token();
+        assert!(registry.can_use_uncontended_prepare_fast_path(session_id, CommitSeq::new(10)));
+
+        // Published out of order: the newer commit (12) first, the older (9) last.
+        for seq in [12, 9] {
+            registry
+                .committed_writers
+                .push(crate::ssi_validation::CommittedWriterInfo {
+                    token,
+                    commit_seq: CommitSeq::new(seq),
+                    had_out_rw: false,
+                    keys: vec![WitnessKey::Page(test_page(7))],
+                });
+        }
+        assert!(
+            !registry.can_use_uncontended_prepare_fast_path(session_id, CommitSeq::new(10)),
+            "a writer committed at 12 > begin 10 must disable the prepare fast path even when \
+             an older entry was appended after it"
+        );
+        assert!(
+            !registry.can_use_uncontended_finalize_fast_path(session_id, CommitSeq::new(10)),
+            "the finalize fast path must apply the same check"
+        );
+        assert!(
+            registry.can_use_uncontended_prepare_fast_path(session_id, CommitSeq::new(12)),
+            "with every entry at or below the begin sequence the fast path is allowed"
+        );
+
+        registry.committed_writers.clear();
+        for seq in [13, 8] {
+            registry
+                .committed_readers
+                .push(crate::ssi_validation::CommittedReaderInfo {
+                    token,
+                    begin_seq: CommitSeq::new(1),
+                    commit_seq: CommitSeq::new(seq),
+                    had_in_rw: false,
+                    keys: vec![WitnessKey::Page(test_page(5))],
+                });
+        }
+        assert!(
+            !registry.can_use_uncontended_prepare_fast_path(session_id, CommitSeq::new(10)),
+            "committed reader history gets the same every-entry check"
+        );
+    }
+
+    #[test]
+    fn test_mark_publication_pending_requires_exact_token_and_lease_drop_clears() {
+        let mut registry = ConcurrentRegistry::new();
+        let session_id = registry
+            .begin_concurrent(test_snapshot(10))
+            .expect("session");
+        let token = registry.get(session_id).expect("handle").txn_token();
+        let other = registry
+            .begin_concurrent(test_snapshot(10))
+            .expect("other session");
+        let other_token = registry.get(other).expect("other handle").txn_token();
+
+        assert_eq!(
+            registry
+                .mark_publication_pending(session_id, other_token)
+                .map(|_| ())
+                .unwrap_err(),
+            MvccError::InvalidState,
+            "a token that does not own the session must be refused"
+        );
+        assert!(!registry.get(session_id).unwrap().is_publication_pending());
+        assert!(!registry.has_pending_publication(None));
+        assert_eq!(
+            registry
+                .mark_publication_pending(9_999, token)
+                .map(|_| ())
+                .unwrap_err(),
+            MvccError::InvalidState
+        );
+
+        let lease = registry
+            .mark_publication_pending(session_id, token)
+            .expect("owner may mark its own session");
+        assert!(registry.get(session_id).unwrap().is_publication_pending());
+        assert!(registry.has_pending_publication(None));
+        assert!(registry.has_pending_publication(Some(other)));
+        assert!(
+            !registry.has_pending_publication(Some(session_id)),
+            "a session never waits for its own publication"
+        );
+
+        drop(lease);
+        assert!(!registry.get(session_id).unwrap().is_publication_pending());
+        assert!(
+            !registry.has_pending_publication(None),
+            "dropping the lease withdraws the mark and the registry forgets it"
+        );
+
+        let lease = registry
+            .mark_publication_pending(session_id, token)
+            .unwrap();
+        registry.get_mut(session_id).unwrap().mark_committed();
+        assert!(!registry.has_pending_publication(None));
+        drop(lease);
+
+        let aborted = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let aborted_token = registry.get(aborted).unwrap().txn_token();
+        let lease = registry
+            .mark_publication_pending(aborted, aborted_token)
+            .unwrap();
+        registry.get_mut(aborted).unwrap().mark_aborted();
+        assert!(!registry.has_pending_publication(None));
+        assert!(
+            registry
+                .mark_publication_pending(aborted, aborted_token)
+                .is_err(),
+            "an aborted session cannot be marked"
+        );
+        drop(lease);
+    }
+
+    /// bd-w4pr1.7: the publication epoch notifies only while a waiter is
+    /// registered, and loses no wakeup. On a private cell, so no other test's
+    /// commits move it. An advance with nobody waiting must not notify (a
+    /// cell that always notifies fails); a registered waiter must be woken
+    /// well inside its timeout (a cell that never notifies fails); and every
+    /// wait, woken or timed out, must unregister (a cell that forgets on the
+    /// timeout path would notify forever after).
+    #[test]
+    fn test_publication_epoch_notifies_only_registered_waiters() {
+        static CELL: super::PublicationEpochCell = super::PublicationEpochCell::new();
+
+        let before = CELL.current();
+        assert!(!CELL.advance(), "an advance with no waiter must not notify");
+        assert_ne!(CELL.current(), before);
+
+        let observed = CELL.current();
+        assert!(
+            !CELL.wait_for_change(observed, std::time::Duration::from_millis(20)),
+            "nothing advanced, so the wait must time out"
+        );
+        assert_eq!(CELL.waiters(), 0, "a timed-out wait must unregister");
+
+        let observed = CELL.current();
+        let waiter = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let moved = CELL.wait_for_change(observed, std::time::Duration::from_secs(30));
+            (moved, started.elapsed())
+        });
+        let registered_by = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while CELL.waiters() == 0 && std::time::Instant::now() < registered_by {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            CELL.waiters(),
+            1,
+            "the waiter must register before it sleeps"
+        );
+        assert!(CELL.advance(), "an advance with a waiter must notify");
+        let (moved, waited) = waiter.join().unwrap();
+        assert!(moved);
+        assert!(
+            waited < std::time::Duration::from_secs(10),
+            "the waiter must be woken, not time out ({waited:?})"
+        );
+        assert_eq!(CELL.waiters(), 0, "a woken wait must unregister");
+        assert!(!CELL.advance(), "with the waiter gone, no notify again");
+    }
+
+    #[test]
+    fn test_withdrawn_publication_wakes_a_waiter_and_an_unrelated_one_does_not() {
+        let mut registry = ConcurrentRegistry::new();
+        let session_id = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let token = registry.get(session_id).unwrap().txn_token();
+        let lease = registry
+            .mark_publication_pending(session_id, token)
+            .unwrap();
+        // The epoch is process-wide and other tests may move it; the check
+        // that matters is that this lease's drop wakes a waiter promptly (a
+        // drop that does not notify leaves it asleep for the full timeout).
+        let observed = super::publication_epoch();
+        let waiter = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let moved = super::wait_for_publication_epoch_change(
+                observed,
+                std::time::Duration::from_secs(30),
+            );
+            (moved, started.elapsed())
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(lease);
+        let (moved, waited) = waiter.join().unwrap();
+        assert!(
+            moved,
+            "dropping the lease must advance the publication epoch"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(10),
+            "the waiter must be woken, not time out ({waited:?})"
+        );
+        let after_drop = super::publication_epoch();
+        // A session committed while pending (finalize without the lease)
+        // advances the epoch too.
+        let other = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let other_token = registry.get(other).unwrap().txn_token();
+        let other_lease = registry
+            .mark_publication_pending(other, other_token)
+            .unwrap();
+        registry.get_mut(other).unwrap().mark_committed();
+        assert_ne!(super::publication_epoch(), after_drop);
+        drop(other_lease);
+    }
+
+    #[test]
+    fn test_publication_lease_drop_never_clears_another_transactions_mark() {
+        let mut registry = ConcurrentRegistry::new();
+        let session_id = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let token = registry.get(session_id).unwrap().txn_token();
+        let lease = registry
+            .mark_publication_pending(session_id, token)
+            .unwrap();
+        let handle = registry.handle(session_id).unwrap();
+        {
+            // The handle object now belongs to a different transaction that
+            // has marked itself pending (what reuse would look like).
+            let mut guard = handle.lock();
+            guard.reset_for_new_transaction(test_snapshot(11), test_token(77));
+            guard.publication_pending = true;
+        }
+        drop(lease);
+        assert!(
+            handle.lock().is_publication_pending(),
+            "a stale lease must leave the new owner's mark in place"
+        );
+    }
+
+    #[test]
+    fn test_pending_publication_blocks_only_validators_that_could_share_an_rw_edge() {
+        let mut registry = ConcurrentRegistry::new();
+        let pending = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        {
+            let mut handle = registry.get_mut(pending).unwrap();
+            handle.record_read(test_page(5));
+            handle.record_write_witness(WitnessKey::Page(test_page(7)));
+        }
+        let reads_pending_write = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        registry
+            .get_mut(reads_pending_write)
+            .unwrap()
+            .record_read(test_page(7));
+        let writes_pending_read = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        registry
+            .get_mut(writes_pending_read)
+            .unwrap()
+            .record_write_witness(WitnessKey::Page(test_page(5)));
+        let read_read_only = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        {
+            let mut handle = registry.get_mut(read_read_only).unwrap();
+            handle.record_read(test_page(5));
+            handle.record_write_witness(WitnessKey::Page(test_page(9)));
+        }
+        let disjoint = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        {
+            let mut handle = registry.get_mut(disjoint).unwrap();
+            handle.record_read(test_page(11));
+            handle.record_write_witness(WitnessKey::Page(test_page(12)));
+        }
+
+        let validators = [
+            reads_pending_write,
+            writes_pending_read,
+            read_read_only,
+            disjoint,
+        ];
+        for session in validators {
+            assert!(
+                !registry.pending_publication_blocks(session),
+                "nothing is pending yet"
+            );
+        }
+
+        let token = registry.get(pending).unwrap().txn_token();
+        let lease = registry.mark_publication_pending(pending, token).unwrap();
+        assert!(
+            registry.pending_publication_blocks(reads_pending_write),
+            "reading a page the pending session wrote can form an rw-edge into it"
+        );
+        assert!(
+            registry.pending_publication_blocks(writes_pending_read),
+            "writing a page the pending session read can form an rw-edge out of it"
+        );
+        assert!(
+            !registry.pending_publication_blocks(read_read_only),
+            "a shared read is not an rw-antidependency; must not wait"
+        );
+        assert!(
+            !registry.pending_publication_blocks(disjoint),
+            "a disjoint validator must not wait"
+        );
+        assert!(
+            !registry.pending_publication_blocks(pending),
+            "the pending session never waits for itself"
+        );
+
+        drop(lease);
+        for session in validators {
+            assert!(
+                !registry.pending_publication_blocks(session),
+                "after the mark is withdrawn nobody waits"
+            );
+        }
+
+        let lease = registry.mark_publication_pending(pending, token).unwrap();
+        assert!(registry.pending_publication_blocks(reads_pending_write));
+        registry.get_mut(pending).unwrap().mark_committed();
+        assert!(
+            !registry.pending_publication_blocks(reads_pending_write),
+            "a published session is ordinary committed history"
+        );
+        drop(lease);
+    }
+
     #[test]
     fn test_begin_concurrent_reuses_recycled_handle_and_clears_state() {
         let mut registry = ConcurrentRegistry::new();
@@ -7109,7 +8110,6 @@ mod tests {
             had_in_rw: false,
             keys: vec![WitnessKey::Page(test_page(99))],
         });
-        registry.index_committed_reader(0);
         registry.committed_readers.push(CommittedReaderInfo {
             token: relevant,
             begin_seq: CommitSeq::new(5),
@@ -7117,7 +8117,6 @@ mod tests {
             had_in_rw: false,
             keys: vec![WitnessKey::Page(test_page(7))],
         });
-        registry.index_committed_reader(1);
         registry.committed_readers.push(CommittedReaderInfo {
             token: global,
             begin_seq: CommitSeq::new(5),
@@ -7128,7 +8127,6 @@ mod tests {
                 bytes: b"global-reader".to_vec(),
             }],
         });
-        registry.index_committed_reader(2);
 
         let summary = summarize_witness_keys(&[WitnessKey::Page(test_page(7))]);
         let mut candidates = registry
@@ -7159,14 +8157,12 @@ mod tests {
             had_out_rw: false,
             keys: vec![WitnessKey::Page(test_page(88))],
         });
-        registry.index_committed_writer(0);
         registry.committed_writers.push(CommittedWriterInfo {
             token: relevant,
             commit_seq: CommitSeq::new(12),
             had_out_rw: false,
             keys: vec![WitnessKey::Page(test_page(9))],
         });
-        registry.index_committed_writer(1);
         registry.committed_writers.push(CommittedWriterInfo {
             token: global,
             commit_seq: CommitSeq::new(12),
@@ -7176,7 +8172,6 @@ mod tests {
                 bytes: b"global-writer".to_vec(),
             }],
         });
-        registry.index_committed_writer(2);
 
         let summary = summarize_witness_keys(&[WitnessKey::Page(test_page(9))]);
         let mut candidates = registry
@@ -7210,7 +8205,6 @@ mod tests {
                 b"key-b",
             )],
         });
-        registry.index_committed_reader(0);
         registry.committed_readers.push(CommittedReaderInfo {
             token: global,
             begin_seq: CommitSeq::new(5),
@@ -7221,7 +8215,6 @@ mod tests {
                 bytes: b"global-reader".to_vec(),
             }],
         });
-        registry.index_committed_reader(1);
 
         let (write_cell, write_page) =
             WitnessKey::for_point_write(test_page(70), b"key-a", test_page(700));
@@ -7254,7 +8247,6 @@ mod tests {
             had_out_rw: false,
             keys: vec![writer_cell, writer_page],
         });
-        registry.index_committed_writer(0);
         registry.committed_writers.push(CommittedWriterInfo {
             token: global,
             commit_seq: CommitSeq::new(12),
@@ -7264,7 +8256,6 @@ mod tests {
                 bytes: b"global-writer".to_vec(),
             }],
         });
-        registry.index_committed_writer(1);
 
         let read_cell = WitnessKey::for_cell_read(test_page(71), test_page(710), b"key-a");
         let mut candidates = registry
@@ -7293,7 +8284,7 @@ mod tests {
             namespace: 4,
             bytes: b"write-global".to_vec(),
         });
-        let view = HandleView::new(&handle);
+        let view = HandleView::new(&mut handle);
 
         assert!(view.check_read_overlap(&WitnessKey::Custom {
             namespace: 5,
@@ -7313,7 +8304,7 @@ mod tests {
 
         let mut handle = ConcurrentHandle::new(test_snapshot(10), test_token(3011));
         handle.record_read_witness(WitnessKey::for_cell_read(root, leaf_a, b"key-a"));
-        let view = HandleView::new(&handle);
+        let view = HandleView::new(&mut handle);
 
         assert!(view.check_read_overlap(&WitnessKey::for_cell_read(root, leaf_a, b"key-a")));
         assert!(
@@ -7337,7 +8328,7 @@ mod tests {
     }
 
     #[test]
-    fn test_active_edge_discovery_index_indexes_page_write_witnesses_without_page_state() {
+    fn test_active_candidate_scan_finds_page_write_witnesses_without_page_state() {
         let mut page_writer = ConcurrentHandle::new(test_snapshot(10), test_token(303));
         page_writer.record_write_witness(WitnessKey::Page(test_page(7)));
         assert!(
@@ -7355,31 +8346,24 @@ mod tests {
         unrelated_writer.record_write_witness(WitnessKey::Page(test_page(9)));
 
         let views = vec![
-            HandleView::new(&page_writer),
-            HandleView::new(&global_writer),
-            HandleView::new(&unrelated_writer),
+            HandleView::new(&mut page_writer),
+            HandleView::new(&mut global_writer),
+            HandleView::new(&mut unrelated_writer),
         ];
-        let index = ActiveEdgeDiscoveryIndex::build(&views);
         let read_summary = summarize_witness_keys(&[WitnessKey::Page(test_page(7))]);
 
-        let mut candidate_tokens = index
-            .outgoing_candidate_refs(
-                &views,
-                test_token(399),
-                CommitSeq::new(10),
-                CommitSeq::new(20),
-                &read_summary,
-            )
-            .into_iter()
-            .map(|candidate| candidate.token())
-            .collect::<Vec<_>>();
+        let mut candidate_tokens =
+            active_outgoing_candidates(&views, test_token(399), CommitSeq::new(20), &read_summary)
+                .into_iter()
+                .map(|candidate| candidate.token())
+                .collect::<Vec<_>>();
         candidate_tokens.sort_by_key(|token| token.id.get());
 
         assert_eq!(candidate_tokens, vec![test_token(303), test_token(304)]);
     }
 
     #[test]
-    fn test_active_edge_discovery_index_keeps_tracked_write_pages_without_write_index() {
+    fn test_active_candidate_scan_keeps_tracked_write_pages_without_write_index() {
         let mut tracked_writer = ConcurrentHandle::new(test_snapshot(10), test_token(306));
         tracked_writer
             .ensure_page_state(test_page(11))
@@ -7387,27 +8371,20 @@ mod tests {
         assert!(tracked_writer.tracks_write_conflict_page(test_page(11)));
         assert!(tracked_writer.write_index.is_empty());
 
-        let views = vec![HandleView::new(&tracked_writer)];
-        let index = ActiveEdgeDiscoveryIndex::build(&views);
+        let views = vec![HandleView::new(&mut tracked_writer)];
         let read_summary = summarize_witness_keys(&[WitnessKey::Page(test_page(11))]);
 
-        let candidate_tokens = index
-            .outgoing_candidate_refs(
-                &views,
-                test_token(399),
-                CommitSeq::new(10),
-                CommitSeq::new(20),
-                &read_summary,
-            )
-            .into_iter()
-            .map(|candidate| candidate.token())
-            .collect::<Vec<_>>();
+        let candidate_tokens =
+            active_outgoing_candidates(&views, test_token(399), CommitSeq::new(20), &read_summary)
+                .into_iter()
+                .map(|candidate| candidate.token())
+                .collect::<Vec<_>>();
 
         assert_eq!(candidate_tokens, vec![test_token(306)]);
     }
 
     #[test]
-    fn test_active_edge_discovery_index_skips_disjoint_point_keys_on_same_root() {
+    fn test_active_candidate_scan_skips_disjoint_point_keys_on_same_root() {
         let root = test_page(51);
         let leaf_a = test_page(510);
         let leaf_b = test_page(511);
@@ -7420,41 +8397,28 @@ mod tests {
         writer.record_write_witness(write_cell.clone());
         writer.record_write_witness(write_page.clone());
 
-        let views = vec![HandleView::new(&reader), HandleView::new(&writer)];
-        let index = ActiveEdgeDiscoveryIndex::build(&views);
+        let views = vec![HandleView::new(&mut reader), HandleView::new(&mut writer)];
         let write_summary = summarize_witness_keys(&[write_cell.clone(), write_page.clone()]);
         let read_summary =
             summarize_witness_keys(&[WitnessKey::for_cell_read(root, leaf_a, b"key-a")]);
 
-        let incoming = index
-            .incoming_candidate_refs(
-                &views,
-                test_token(399),
-                CommitSeq::new(10),
-                CommitSeq::new(20),
-                &write_summary,
-            )
-            .into_iter()
-            .map(|candidate| candidate.token())
-            .collect::<Vec<_>>();
-        let outgoing = index
-            .outgoing_candidate_refs(
-                &views,
-                test_token(399),
-                CommitSeq::new(10),
-                CommitSeq::new(20),
-                &read_summary,
-            )
-            .into_iter()
-            .map(|candidate| candidate.token())
-            .collect::<Vec<_>>();
+        let incoming =
+            active_incoming_candidates(&views, test_token(399), CommitSeq::new(20), &write_summary)
+                .into_iter()
+                .map(|candidate| candidate.token())
+                .collect::<Vec<_>>();
+        let outgoing =
+            active_outgoing_candidates(&views, test_token(399), CommitSeq::new(20), &read_summary)
+                .into_iter()
+                .map(|candidate| candidate.token())
+                .collect::<Vec<_>>();
 
         assert!(incoming.is_empty());
         assert!(outgoing.is_empty());
     }
 
     #[test]
-    fn test_active_edge_discovery_index_uses_presence_flags_without_materialized_keys() {
+    fn test_active_candidate_scan_uses_presence_flags_without_materialized_keys() {
         let mut page_reader = ConcurrentHandle::new(test_snapshot(10), test_token(311));
         page_reader.record_read(test_page(7));
 
@@ -7468,27 +8432,230 @@ mod tests {
         unrelated_reader.record_read(test_page(9));
 
         let views = vec![
-            HandleView::new(&page_reader),
-            HandleView::new(&global_reader),
-            HandleView::new(&unrelated_reader),
+            HandleView::new(&mut page_reader),
+            HandleView::new(&mut global_reader),
+            HandleView::new(&mut unrelated_reader),
         ];
-        let index = ActiveEdgeDiscoveryIndex::build(&views);
         let write_summary = summarize_witness_keys(&[WitnessKey::Page(test_page(7))]);
 
-        let mut candidate_tokens = index
-            .incoming_candidate_refs(
-                &views,
-                test_token(399),
-                CommitSeq::new(10),
-                CommitSeq::new(20),
-                &write_summary,
-            )
-            .into_iter()
-            .map(|candidate| candidate.token())
-            .collect::<Vec<_>>();
+        let mut candidate_tokens =
+            active_incoming_candidates(&views, test_token(399), CommitSeq::new(20), &write_summary)
+                .into_iter()
+                .map(|candidate| candidate.token())
+                .collect::<Vec<_>>();
         candidate_tokens.sort_by_key(|token| token.id.get());
 
         assert_eq!(candidate_tokens, vec![test_token(311), test_token(312)]);
+    }
+
+    /// bd-i0tn6 lever 4: the candidate scan returns exactly what the
+    /// per-commit candidate index returned, the same peers in the same order,
+    /// for random peer views and committer summaries: page, page-witness and
+    /// exact-cell overlaps, global keys on either side, inactive peers, the
+    /// committer's own view, and peers that began at or after the commit
+    /// sequence.
+    #[test]
+    fn test_active_candidate_scan_matches_the_candidate_index() {
+        struct XorShift(u64);
+
+        impl XorShift {
+            fn below(&mut self, bound: u64) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0 % bound
+            }
+
+            fn page(&mut self) -> PageNumber {
+                test_page(1 + u32::try_from(self.below(10)).expect("page fits u32"))
+            }
+
+            fn pages(&mut self) -> Vec<PageNumber> {
+                let mut pages: Vec<PageNumber> = (0..self.below(4)).map(|_| self.page()).collect();
+                pages.sort_unstable();
+                pages.dedup();
+                pages
+            }
+
+            fn cells(&mut self) -> Vec<(PageNumber, u64)> {
+                let mut cells: Vec<(PageNumber, u64)> = (0..self.below(3))
+                    .map(|_| {
+                        (
+                            test_page(1 + u32::try_from(self.below(3)).expect("root fits u32")),
+                            self.below(4),
+                        )
+                    })
+                    .collect();
+                cells.sort_unstable();
+                cells.dedup();
+                cells
+            }
+
+            fn keys(&mut self) -> Vec<WitnessKey> {
+                (0..=self.below(3))
+                    .map(|_| match self.below(8) {
+                        0..=2 => WitnessKey::Page(self.page()),
+                        3..=5 => WitnessKey::Cell {
+                            btree_root: test_page(
+                                1 + u32::try_from(self.below(3)).expect("root fits u32"),
+                            ),
+                            leaf_page: self.page(),
+                            tag: self.below(4),
+                        },
+                        6 => WitnessKey::KeyRange {
+                            btree_root: test_page(
+                                1 + u32::try_from(self.below(3)).expect("root fits u32"),
+                            ),
+                            lo: Vec::new(),
+                            hi: vec![1],
+                        },
+                        _ => {
+                            if self.below(6) == 0 {
+                                WitnessKey::Custom {
+                                    namespace: 1,
+                                    bytes: vec![1],
+                                }
+                            } else {
+                                WitnessKey::Page(self.page())
+                            }
+                        }
+                    })
+                    .collect()
+            }
+        }
+
+        let tokens = |candidates: Vec<&dyn ActiveTxnView>| {
+            candidates
+                .into_iter()
+                .map(|candidate| candidate.token())
+                .collect::<Vec<_>>()
+        };
+        let mut rng = XorShift(0x2545_f491_4f6c_dd1d);
+        let committer = test_token(100_000);
+        let (mut incoming_hits, mut outgoing_hits) = (0_usize, 0_usize);
+        for case in 0..2_000_u64 {
+            let peers = rng.below(8);
+            let views: Vec<HandleView> = (0..peers)
+                .map(|peer| {
+                    let mut bits = 0;
+                    if rng.below(5) != 0 {
+                        bits |= HandleViewFlags::ACTIVE;
+                    }
+                    if rng.below(8) == 0 {
+                        bits |= HandleViewFlags::GLOBAL_READ_WITNESSES;
+                    }
+                    if rng.below(8) == 0 {
+                        bits |= HandleViewFlags::GLOBAL_WRITE_WITNESSES;
+                    }
+                    HandleView {
+                        token: if rng.below(10) == 0 {
+                            committer
+                        } else {
+                            test_token(case * 16 + peer + 1)
+                        },
+                        begin_seq: CommitSeq::new(5 + rng.below(10)),
+                        flags: HandleViewFlags(bits),
+                        parts: std::sync::Arc::new(HandleViewParts {
+                            read_pages: rng.pages(),
+                            read_page_witness_pages: rng.pages(),
+                            read_exact_cells: rng.cells(),
+                            write_pages: rng.pages(),
+                            write_page_witness_pages: rng.pages(),
+                            write_exact_cells: rng.cells(),
+                        }),
+                        has_in_rw: std::cell::Cell::new(false),
+                        has_out_rw: std::cell::Cell::new(false),
+                    }
+                })
+                .collect();
+            let index = ActiveEdgeDiscoveryIndex::build(&views);
+            let commit_seq = CommitSeq::new(5 + rng.below(12));
+            let write_summary = summarize_witness_keys(&rng.keys());
+            let read_summary = summarize_witness_keys(&rng.keys());
+
+            let expected_incoming = tokens(index.incoming_candidate_refs(
+                &views,
+                committer,
+                CommitSeq::new(1),
+                commit_seq,
+                &write_summary,
+            ));
+            let expected_outgoing = tokens(index.outgoing_candidate_refs(
+                &views,
+                committer,
+                CommitSeq::new(1),
+                commit_seq,
+                &read_summary,
+            ));
+            assert_eq!(
+                tokens(active_incoming_candidates(
+                    &views,
+                    committer,
+                    commit_seq,
+                    &write_summary
+                )),
+                expected_incoming,
+                "case {case}: incoming candidates for {write_summary:?}"
+            );
+            assert_eq!(
+                tokens(active_outgoing_candidates(
+                    &views,
+                    committer,
+                    commit_seq,
+                    &read_summary
+                )),
+                expected_outgoing,
+                "case {case}: outgoing candidates for {read_summary:?}"
+            );
+            incoming_hits += expected_incoming.len();
+            outgoing_hits += expected_outgoing.len();
+        }
+        assert!(
+            incoming_hits >= 200 && outgoing_hits >= 200,
+            "the schedule must produce candidates on both sides (incoming {incoming_hits}, \
+             outgoing {outgoing_hits})"
+        );
+    }
+
+    /// bd-i0tn6 lever 4: the pending-publication check applies the full
+    /// candidate rules to each pending peer. A validator that reads the same
+    /// key as the pending session wrote, through another leaf (an exact-cell
+    /// overlap and nothing else), must wait; one that reads another key on
+    /// the same root must not.
+    #[test]
+    fn test_pending_publication_blocks_on_an_exact_cell_overlap_alone() {
+        let root = test_page(61);
+        let mut registry = ConcurrentRegistry::new();
+        let pending = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        {
+            let mut handle = registry.get_mut(pending).unwrap();
+            let (cell, page) = WitnessKey::for_point_write(root, b"key-k", test_page(610));
+            handle.record_write_witness(cell);
+            handle.record_write_witness(page);
+        }
+        let same_key = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        registry
+            .get_mut(same_key)
+            .unwrap()
+            .record_read_witness(WitnessKey::for_cell_read(root, test_page(611), b"key-k"));
+        let other_key = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        registry
+            .get_mut(other_key)
+            .unwrap()
+            .record_read_witness(WitnessKey::for_cell_read(root, test_page(612), b"key-z"));
+
+        let token = registry.get(pending).unwrap().txn_token();
+        let lease = registry.mark_publication_pending(pending, token).unwrap();
+        assert!(
+            registry.pending_publication_blocks(same_key),
+            "the same key through another leaf can form an rw-edge into the pending session"
+        );
+        assert!(
+            !registry.pending_publication_blocks(other_key),
+            "another key on the same root is disjoint"
+        );
+        drop(lease);
+        assert!(!registry.pending_publication_blocks(same_key));
     }
 
     #[test]
@@ -7662,7 +8829,6 @@ mod tests {
             had_in_rw: false,
             keys: vec![WitnessKey::for_cell_read(root, leaf_b, b"key-b")],
         });
-        registry.index_committed_reader(0);
         let (writer_cell, writer_page) = WitnessKey::for_point_write(root, b"key-b", leaf_b);
         registry.committed_writers.push(CommittedWriterInfo {
             token: test_token(632),
@@ -7670,7 +8836,6 @@ mod tests {
             had_out_rw: false,
             keys: vec![writer_cell, writer_page],
         });
-        registry.index_committed_writer(0);
 
         let session_id = registry.begin_concurrent(test_snapshot(10)).unwrap();
         {
@@ -8014,6 +9179,484 @@ mod tests {
         );
     }
 
+    /// bd-i0tn6: the committed-history lengths are population inputs of the
+    /// DRO active-pivot decision (`evaluate_prepare_t3_dro`), so every commit
+    /// must prune exactly. A long-running session pins the history of 16
+    /// commits, and its own commit moves the retention horizon past all of
+    /// them. The pivot decision that follows sees 3 readers and 3 writers,
+    /// where the DRO lets the active pivot continue. A prune that lags (keeps
+    /// those 16 records) reads 19 / 19, which the default matrix aborts.
+    #[test]
+    fn test_dro_pivot_decision_reads_the_exactly_pruned_history() {
+        use crate::ssi_abort_policy::{DroLiveController, DroLiveControllerConfig};
+
+        let default_matrix =
+            DroLiveController::new(DroLiveControllerConfig::default()).current_matrix();
+        assert!(
+            !default_matrix.evaluate(3, 3).should_abort(),
+            "precondition: the default DRO matrix lets a pivot at 3 / 3 continue"
+        );
+        assert!(
+            default_matrix.evaluate(19, 19).should_abort(),
+            "precondition: the default DRO matrix aborts a pivot at 19 / 19, so a lagging \
+             prune changes the decision"
+        );
+
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        let long_running = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        {
+            let mut handle = registry.get_mut(long_running).unwrap();
+            handle.record_read(test_page(900));
+            concurrent_write_page(&mut handle, &lock_table, test_page(901), test_data()).unwrap();
+        }
+        for i in 0..16_u32 {
+            let session = registry
+                .begin_concurrent(test_snapshot(10 + u64::from(i)))
+                .unwrap();
+            {
+                let mut handle = registry.get_mut(session).unwrap();
+                handle.record_read(test_page(100 + i));
+                concurrent_write_page(&mut handle, &lock_table, test_page(200 + i), test_data())
+                    .unwrap();
+            }
+            concurrent_commit_with_ssi(
+                &mut registry,
+                &commit_index,
+                &lock_table,
+                session,
+                CommitSeq::new(11 + u64::from(i)),
+            )
+            .expect("a disjoint transaction commits");
+            registry
+                .remove(session)
+                .expect("the committed session leaves the registry");
+        }
+        assert_eq!(
+            (
+                registry.committed_readers.len(),
+                registry.committed_writers.len()
+            ),
+            (16, 16),
+            "the long-running session (snapshot 10) pins every later commit"
+        );
+
+        // The pivot reads 300 and writes 301. `in_source` reads 301, so its
+        // commit gives the pivot an incoming edge; `out_target` writes 300,
+        // so its commit gives the pivot the outgoing edge.
+        let pivot = registry.begin_concurrent(test_snapshot(26)).unwrap();
+        let in_source = registry.begin_concurrent(test_snapshot(26)).unwrap();
+        let out_target = registry.begin_concurrent(test_snapshot(26)).unwrap();
+        {
+            let mut handle = registry.get_mut(pivot).unwrap();
+            handle.record_read(test_page(300));
+            concurrent_write_page(&mut handle, &lock_table, test_page(301), test_data()).unwrap();
+        }
+        {
+            let mut handle = registry.get_mut(in_source).unwrap();
+            handle.record_read(test_page(301));
+            concurrent_write_page(&mut handle, &lock_table, test_page(302), test_data()).unwrap();
+        }
+        {
+            let mut handle = registry.get_mut(out_target).unwrap();
+            handle.record_read(test_page(303));
+            concurrent_write_page(&mut handle, &lock_table, test_page(300), test_data()).unwrap();
+        }
+
+        concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            long_running,
+            CommitSeq::new(27),
+        )
+        .expect("the long-running session commits");
+        registry
+            .remove(long_running)
+            .expect("the long-running session leaves the registry");
+        assert_eq!(
+            (
+                registry.committed_readers.len(),
+                registry.committed_writers.len()
+            ),
+            (1, 1),
+            "its commit prunes the 16 records at or below the new horizon 26"
+        );
+
+        concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            in_source,
+            CommitSeq::new(28),
+        )
+        .expect("the incoming-edge source commits");
+        registry
+            .remove(in_source)
+            .expect("the incoming-edge source leaves the registry");
+        {
+            let handle = registry.get(pivot).unwrap();
+            assert!(handle.has_in_rw(), "in_source read what the pivot writes");
+            assert!(!handle.has_out_rw());
+            assert!(!handle.is_marked_for_abort());
+        }
+        assert_eq!(
+            (
+                registry.committed_readers.len(),
+                registry.committed_writers.len()
+            ),
+            (2, 2)
+        );
+
+        let live_matrix = DroLiveController::global().current_matrix();
+        let expected_mark = live_matrix.evaluate(3, 3).should_abort();
+        let prepared = prepare_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            out_target,
+            CommitSeq::new(29),
+        )
+        .expect("the outgoing-edge target prepares");
+        finalize_prepared_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            &prepared,
+            CommitSeq::new(29),
+        );
+
+        {
+            let handle = registry.get(pivot).unwrap();
+            assert!(
+                handle.has_in_rw() && handle.has_out_rw(),
+                "the pivot carries both rw flags"
+            );
+            assert_eq!(
+                handle.is_marked_for_abort(),
+                expected_mark,
+                "the active pivot is marked exactly when the DRO decision at the pruned \
+                 populations (3 readers, 3 writers) aborts"
+            );
+        }
+        let decision = prepared
+            .dro_t3_decision()
+            .expect("an edgeful prepare materializes a DRO decision");
+        assert_eq!(
+            (decision.active_readers, decision.active_writers),
+            (3, 3),
+            "the DRO populations count 1 other active session plus 2 retained records each side"
+        );
+    }
+
+    /// bd-i0tn6: physical commits run outside the registry guard, so history
+    /// can be published out of commit order. A prune drops every record at or
+    /// below the horizon wherever it sits, and its pages stop yielding it as a
+    /// candidate; a prune that only pops from the front keeps it.
+    #[test]
+    fn test_prune_drops_history_published_out_of_commit_order() {
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        let pin = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let later_horizon = registry.begin_concurrent(test_snapshot(20)).unwrap();
+        let older = registry.begin_concurrent(test_snapshot(18)).unwrap();
+        let newer = registry.begin_concurrent(test_snapshot(18)).unwrap();
+        for (session, page) in [(pin, 600), (later_horizon, 610), (older, 620), (newer, 630)] {
+            let mut handle = registry.get_mut(session).unwrap();
+            handle.record_read(test_page(page));
+            concurrent_write_page(&mut handle, &lock_table, test_page(page + 1), test_data())
+                .unwrap();
+        }
+        let newer_token = registry.get(newer).unwrap().txn_token();
+
+        let older_prepared = prepare_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            older,
+            CommitSeq::new(19),
+        )
+        .expect("older prepares");
+        let newer_prepared = prepare_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            newer,
+            CommitSeq::new(21),
+        )
+        .expect("newer prepares");
+        // The later commit publishes first.
+        finalize_prepared_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            &newer_prepared,
+            CommitSeq::new(21),
+        );
+        finalize_prepared_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            &older_prepared,
+            CommitSeq::new(19),
+        );
+        registry.remove(older).expect("older leaves the registry");
+        registry.remove(newer).expect("newer leaves the registry");
+
+        let commit_seqs = |registry: &ConcurrentRegistry| {
+            (
+                registry
+                    .committed_readers
+                    .iter()
+                    .map(|reader| reader.commit_seq.get())
+                    .collect::<Vec<_>>(),
+                registry
+                    .committed_writers
+                    .iter()
+                    .map(|writer| writer.commit_seq.get())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            commit_seqs(&registry),
+            (vec![21, 19], vec![21, 19]),
+            "published out of commit order and pinned by the snapshot-10 session"
+        );
+
+        concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            pin,
+            CommitSeq::new(22),
+        )
+        .expect("the pinning session commits");
+        registry.remove(pin).expect("pin leaves the registry");
+        assert_eq!(
+            commit_seqs(&registry),
+            (vec![21, 22], vec![21, 22]),
+            "with the horizon at 20 the record committed at 19 goes although a retained \
+             record precedes it"
+        );
+        registry.committed_readers.assert_matches_rebuild();
+        registry.committed_writers.assert_matches_rebuild();
+
+        let probe = |page: u32| summarize_witness_keys(&[WitnessKey::Page(test_page(page))]);
+        let reader_hits = |page: u32| {
+            registry
+                .committed_reader_candidates(
+                    test_token(999),
+                    CommitSeq::new(0),
+                    CommitSeq::new(100),
+                    &probe(page),
+                )
+                .into_iter()
+                .map(|reader| reader.token)
+                .collect::<Vec<_>>()
+        };
+        let writer_hits = |page: u32| {
+            registry
+                .committed_writer_candidates(
+                    test_token(999),
+                    CommitSeq::new(0),
+                    CommitSeq::new(100),
+                    &probe(page),
+                )
+                .into_iter()
+                .map(|writer| writer.token)
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            reader_hits(620).is_empty(),
+            "the pruned reader is unindexed"
+        );
+        assert!(
+            writer_hits(621).is_empty(),
+            "the pruned writer is unindexed"
+        );
+        assert_eq!(reader_hits(630), vec![newer_token]);
+        assert_eq!(writer_hits(631), vec![newer_token]);
+
+        concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            later_horizon,
+            CommitSeq::new(23),
+        )
+        .expect("the last session commits");
+        assert!(registry.committed_readers.is_empty());
+        assert!(registry.committed_writers.is_empty());
+        registry.committed_readers.assert_matches_rebuild();
+        registry.committed_writers.assert_matches_rebuild();
+    }
+
+    /// bd-i0tn6: against the earlier layout (a vector in publication order,
+    /// `retain` on prune, indexes of positions rebuilt from every record), the
+    /// incremental history keeps the same records in the same order, returns
+    /// the same candidates in the same order, and its indexes equal a rebuild
+    /// after every step. Pushes arrive up to three commits out of order and
+    /// horizons move both ways.
+    #[test]
+    fn test_committed_history_matches_a_rebuilt_vector_under_out_of_order_pushes_and_prunes() {
+        struct XorShift(u64);
+
+        impl XorShift {
+            fn below(&mut self, bound: u64) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0 % bound
+            }
+
+            fn page(&mut self) -> PageNumber {
+                test_page(1 + u32::try_from(self.below(12)).expect("page fits u32"))
+            }
+
+            fn keys(&mut self) -> Vec<WitnessKey> {
+                let count = 1 + self.below(3);
+                (0..count)
+                    .map(|_| match self.below(9) {
+                        0..=3 => WitnessKey::Page(self.page()),
+                        4 | 5 => WitnessKey::Cell {
+                            btree_root: test_page(1 + u32::try_from(self.below(3)).unwrap()),
+                            leaf_page: self.page(),
+                            tag: self.below(4),
+                        },
+                        6 => WitnessKey::ByteRange {
+                            page: self.page(),
+                            start: 0,
+                            len: 8,
+                        },
+                        7 => WitnessKey::KeyRange {
+                            btree_root: test_page(1 + u32::try_from(self.below(3)).unwrap()),
+                            lo: Vec::new(),
+                            hi: vec![1],
+                        },
+                        _ => {
+                            if self.below(4) == 0 {
+                                WitnessKey::Custom {
+                                    namespace: 1,
+                                    bytes: vec![u8::try_from(self.below(3)).unwrap()],
+                                }
+                            } else {
+                                WitnessKey::Page(self.page())
+                            }
+                        }
+                    })
+                    .collect()
+            }
+        }
+
+        /// The earlier position-index lookup, written as a scan.
+        fn reference_candidates(
+            model: &[CommittedWriterInfo],
+            probe: &WitnessKeySummary,
+        ) -> Vec<TxnToken> {
+            model
+                .iter()
+                .filter(|entry| {
+                    if probe.has_global_keys {
+                        return true;
+                    }
+                    let own = summarize_witness_keys(&entry.keys);
+                    own.has_global_keys
+                        || probe
+                            .page_witness_pages
+                            .iter()
+                            .any(|page| own.pages.contains(page))
+                        || probe.cell_witnesses.iter().any(|cell| {
+                            own.page_witness_pages.contains(&cell.btree_root)
+                                || own.page_witness_pages.contains(&cell.leaf_page)
+                                || own
+                                    .cell_witnesses
+                                    .iter()
+                                    .any(|own_cell| own_cell.exact_key() == cell.exact_key())
+                        })
+                })
+                .map(|entry| entry.token)
+                .collect()
+        }
+
+        let mut rng = XorShift(0x9e37_79b9_7f4a_7c15);
+        let mut history: CommittedHistory<CommittedWriterInfo> = CommittedHistory::new();
+        let mut model: Vec<CommittedWriterInfo> = Vec::new();
+        let mut frontier = 100_u64;
+        let mut pruned_out_of_order = 0_usize;
+        for step in 1..=2_000_u64 {
+            match rng.below(100) {
+                0..=54 => {
+                    frontier += 1;
+                    let info = CommittedWriterInfo {
+                        token: test_token(step),
+                        commit_seq: CommitSeq::new(frontier - rng.below(4)),
+                        had_out_rw: false,
+                        keys: rng.keys(),
+                    };
+                    history.push(info.clone());
+                    model.push(info);
+                }
+                55..=89 => {
+                    let horizon = frontier.saturating_sub(rng.below(10));
+                    let first_kept = model
+                        .iter()
+                        .position(|entry| entry.commit_seq.get() > horizon);
+                    if let Some(first_kept) = first_kept
+                        && model[first_kept..]
+                            .iter()
+                            .any(|entry| entry.commit_seq.get() <= horizon)
+                    {
+                        pruned_out_of_order += 1;
+                    }
+                    history.prune_at_or_before(CommitSeq::new(horizon));
+                    model.retain(|entry| entry.commit_seq.get() > horizon);
+                }
+                90 => {
+                    history.clear();
+                    model.clear();
+                }
+                _ => {}
+            }
+
+            assert_eq!(history.len(), model.len(), "step {step}: length");
+            assert_eq!(history.is_empty(), model.is_empty(), "step {step}");
+            assert_eq!(
+                history
+                    .iter()
+                    .map(|entry| (entry.token, entry.commit_seq))
+                    .collect::<Vec<_>>(),
+                model
+                    .iter()
+                    .map(|entry| (entry.token, entry.commit_seq))
+                    .collect::<Vec<_>>(),
+                "step {step}: retained records in publication order"
+            );
+            history.assert_matches_rebuild();
+            for _ in 0..3 {
+                let probe = summarize_witness_keys(&rng.keys());
+                assert_eq!(
+                    history
+                        .candidates(&probe)
+                        .into_iter()
+                        .map(|entry| entry.token)
+                        .collect::<Vec<_>>(),
+                    reference_candidates(&model, &probe),
+                    "step {step}: candidates for {probe:?}"
+                );
+            }
+        }
+        // The fixed seed prunes behind a retained record 47 times in 2,000
+        // steps; the bound keeps the schedule from silently losing that case.
+        assert!(
+            pruned_out_of_order >= 25,
+            "the schedule prunes behind a retained record often ({pruned_out_of_order} times)"
+        );
+    }
+
     // Test 15: SSI - pivot detection aborts transaction with both in/out edges.
     #[test]
     fn test_ssi_pivot_abort() {
@@ -8078,6 +9721,143 @@ mod tests {
             CommitSeq::new(11),
         );
         assert!(result2.is_ok(), "T2 should commit after T1 aborted");
+    }
+
+    /// bd-i0tn6: the cached view parts equal a fresh build after every kind of
+    /// mutation that feeds them. Each check leaves the cache filled, so a
+    /// mutation point that forgets to drop it fails at that step.
+    #[test]
+    fn test_view_parts_cache_matches_a_fresh_build_after_every_mutation() {
+        let lock_table = InProcessPageLockTable::new();
+        let mut handle = ConcurrentHandle::new(test_snapshot(10), test_token(9101));
+        let check = |handle: &mut ConcurrentHandle, step: &str| {
+            let cached = handle.view_parts();
+            assert_eq!(
+                *cached,
+                HandleViewParts::build(handle),
+                "cached view parts are stale after {step}"
+            );
+        };
+        check(&mut handle, "creation");
+        handle.record_read(test_page(3));
+        check(&mut handle, "record_read");
+        handle.record_read_witness(WitnessKey::for_cell_read(
+            test_page(40),
+            test_page(41),
+            b"k",
+        ));
+        check(&mut handle, "record_read_witness");
+        handle.record_read_witness(WitnessKey::Custom {
+            namespace: 2,
+            bytes: b"global-read".to_vec(),
+        });
+        check(&mut handle, "a global read witness");
+        handle.record_write_witness(WitnessKey::Page(test_page(6)));
+        check(&mut handle, "record_write_witness");
+        concurrent_write_page(&mut handle, &lock_table, test_page(7), test_data()).unwrap();
+        check(&mut handle, "concurrent_write_page");
+        let savepoint = concurrent_savepoint(&mut handle, "sp").unwrap();
+        concurrent_track_write_conflict_page(&mut handle, &lock_table, test_page(8)).unwrap();
+        check(&mut handle, "concurrent_track_write_conflict_page");
+        concurrent_free_page(&mut handle, &lock_table, test_page(9)).unwrap();
+        check(&mut handle, "concurrent_free_page");
+        concurrent_mark_metadata_exempt(&mut handle, test_page(7));
+        check(&mut handle, "concurrent_mark_metadata_exempt");
+        concurrent_rollback_to_savepoint(&mut handle, &lock_table, &savepoint).unwrap();
+        check(&mut handle, "concurrent_rollback_to_savepoint");
+        concurrent_clear_page_state(&mut handle, &lock_table, test_page(7)).unwrap();
+        check(&mut handle, "concurrent_clear_page_state");
+        handle.reset_for_new_transaction(test_snapshot(20), test_token(9102));
+        check(&mut handle, "reset_for_new_transaction");
+        assert!(HandleViewParts::build(&handle).write_pages.is_empty());
+    }
+
+    /// bd-i0tn6: validations with no change in between share one build; the
+    /// next change makes the following view a new build. A handle without the
+    /// cache builds every time and fails the first assertion.
+    #[test]
+    fn test_view_parts_are_shared_until_the_handle_changes() {
+        let lock_table = InProcessPageLockTable::new();
+        let mut handle = ConcurrentHandle::new(test_snapshot(10), test_token(9103));
+        handle.record_read(test_page(4));
+        concurrent_write_page(&mut handle, &lock_table, test_page(5), test_data()).unwrap();
+        let first = HandleView::new(&mut handle);
+        let second = HandleView::new(&mut handle);
+        assert!(Arc::ptr_eq(&first.parts, &second.parts));
+        handle.record_read(test_page(12));
+        let third = HandleView::new(&mut handle);
+        assert!(!Arc::ptr_eq(&second.parts, &third.parts));
+        assert!(third.read_pages.binary_search(&test_page(12)).is_ok());
+        assert!(second.read_pages.binary_search(&test_page(12)).is_err());
+    }
+
+    /// bd-i0tn6: a classic write skew whose reads and writes happen after an
+    /// unrelated commit already viewed both peers (filling their view-parts
+    /// caches). As on the uncached path, the first committer is the pivot and
+    /// aborts, and the other then commits. A cache that is not dropped on new
+    /// witnesses or page writes lets T1 commit and aborts T2 instead.
+    #[test]
+    fn test_ssi_write_skew_after_peer_views_were_cached_still_aborts_the_pivot() {
+        use super::concurrent_commit_with_ssi;
+
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let s2 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let s3 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+
+        // An unrelated reader-writer commits first: its validation and
+        // publication view T1 and T2 while both are still empty.
+        {
+            let mut h3 = registry.get_mut(s3).unwrap();
+            h3.record_read(test_page(91));
+            concurrent_write_page(&mut h3, &lock_table, test_page(90), test_data()).unwrap();
+        }
+        concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s3,
+            CommitSeq::new(11),
+        )
+        .expect("the unrelated writer commits");
+        for session in [s1, s2] {
+            assert!(
+                registry.get(session).unwrap().view_parts_cache.is_some(),
+                "the unrelated commit cached the peer's view parts"
+            );
+        }
+
+        // T1 reads A (5) and writes B (10); T2 reads B and writes A.
+        {
+            let mut h1 = registry.get_mut(s1).unwrap();
+            h1.record_read(test_page(5));
+            concurrent_write_page(&mut h1, &lock_table, test_page(10), test_data()).unwrap();
+        }
+        {
+            let mut h2 = registry.get_mut(s2).unwrap();
+            h2.record_read(test_page(10));
+            concurrent_write_page(&mut h2, &lock_table, test_page(5), test_data()).unwrap();
+        }
+
+        let result1 = concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s1,
+            CommitSeq::new(12),
+        );
+        let (err, _) = result1.expect_err("T1 has both rw edges with active T2 and must abort");
+        assert_eq!(err, MvccError::BusySnapshot);
+        concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s2,
+            CommitSeq::new(12),
+        )
+        .expect("T2 commits once the pivot T1 has aborted");
     }
 
     // Test 16: SSI - transaction marked for abort fails.
@@ -8824,21 +10604,27 @@ mod tests {
         }
     }
 
-    /// Microbench for `ActiveEdgeDiscoveryIndex::build`. Constructs N handle
-    /// views with M disjoint read/write pages each and times the build loop.
-    /// Reports ns/build averaged over trials. Not a correctness test; ignored
-    /// by default.
+    /// Microbench for one validation's active-peer candidate lookup: the
+    /// per-commit `ActiveEdgeDiscoveryIndex` (build plus one incoming and one
+    /// outgoing query, the pre-bd-i0tn6-lever-4 path) against the two scans
+    /// that replaced it. Constructs N handle views with M disjoint read/write
+    /// pages each and a committer disjoint from all of them (the
+    /// separate-tables shape). Reports ns per lookup for each. Not a
+    /// correctness test; ignored by default.
     ///
     /// Run with:
     /// `cargo test -p fsqlite-mvcc --lib --profile release-perf -- \
-    ///    bench_active_edge_index_build --ignored --nocapture`
+    ///    bench_active_candidate_scan_against_the_index --ignored --nocapture`
     #[test]
     #[ignore = "microbench — run manually"]
-    fn bench_active_edge_index_build() {
+    fn bench_active_candidate_scan_against_the_index() {
         use std::cell::Cell;
         use std::time::Instant;
 
-        use super::{ActiveEdgeDiscoveryIndex, HandleView, HandleViewFlags};
+        use super::{
+            ActiveEdgeDiscoveryIndex, HandleView, HandleViewFlags, HandleViewParts,
+            active_incoming_candidates, active_outgoing_candidates, summarize_witness_keys,
+        };
 
         fn make_view(token_id: u64, page_base: u32, pages_per_view: u32) -> HandleView {
             let mut read_pages: Vec<PageNumber> = (0..pages_per_view)
@@ -8853,12 +10639,14 @@ mod tests {
                 token: test_token(token_id),
                 begin_seq: CommitSeq::new(1),
                 flags: HandleViewFlags(HandleViewFlags::ACTIVE),
-                read_pages: read_pages.clone(),
-                read_page_witness_pages: read_pages,
-                read_exact_cells: Vec::new(),
-                write_pages: write_pages.clone(),
-                write_page_witness_pages: write_pages,
-                write_exact_cells: Vec::new(),
+                parts: std::sync::Arc::new(HandleViewParts {
+                    read_pages: read_pages.clone(),
+                    read_page_witness_pages: read_pages,
+                    read_exact_cells: Vec::new(),
+                    write_pages: write_pages.clone(),
+                    write_page_witness_pages: write_pages,
+                    write_exact_cells: Vec::new(),
+                }),
                 has_in_rw: Cell::new(false),
                 has_out_rw: Cell::new(false),
             }
@@ -8880,30 +10668,73 @@ mod tests {
                 )
             })
             .collect();
+        // The committer touches pages above every view's range.
+        let committer = test_token(999);
+        let committer_begin = CommitSeq::new(1);
+        let committer_end = CommitSeq::new(2);
+        let first_free_page = (VIEWS as u32) * PAGES_PER_VIEW * 2 + 1;
+        let committer_keys = |offset: u32| -> Vec<WitnessKey> {
+            (0..PAGES_PER_VIEW)
+                .map(|i| WitnessKey::Page(test_page(first_free_page + offset + i)))
+                .collect()
+        };
+        let read_summary = summarize_witness_keys(&committer_keys(0));
+        let write_summary = summarize_witness_keys(&committer_keys(PAGES_PER_VIEW));
 
-        // Warm-up.
-        for _ in 0..BUILDS_PER_TRIAL {
-            std::hint::black_box(ActiveEdgeDiscoveryIndex::build(&views));
-        }
+        let index_lookup = || {
+            let index = ActiveEdgeDiscoveryIndex::build(&views);
+            let incoming = index.incoming_candidate_refs(
+                &views,
+                committer,
+                committer_begin,
+                committer_end,
+                &write_summary,
+            );
+            let outgoing = index.outgoing_candidate_refs(
+                &views,
+                committer,
+                committer_begin,
+                committer_end,
+                &read_summary,
+            );
+            std::hint::black_box((incoming.len(), outgoing.len()));
+        };
+        let scan_lookup = || {
+            let incoming =
+                active_incoming_candidates(&views, committer, committer_end, &write_summary);
+            let outgoing =
+                active_outgoing_candidates(&views, committer, committer_end, &read_summary);
+            std::hint::black_box((incoming.len(), outgoing.len()));
+        };
 
-        let mut samples = Vec::with_capacity(TRIALS);
-        for _ in 0..TRIALS {
-            let start = Instant::now();
+        for (label, lookup) in [
+            ("index", &index_lookup as &dyn Fn()),
+            ("scan", &scan_lookup as &dyn Fn()),
+        ] {
+            // Warm-up.
             for _ in 0..BUILDS_PER_TRIAL {
-                std::hint::black_box(ActiveEdgeDiscoveryIndex::build(&views));
+                lookup();
             }
-            let elapsed = start.elapsed();
-            let ns_per_build = elapsed.as_nanos() as f64 / f64::from(BUILDS_PER_TRIAL);
-            eprintln!("  trial: {ns_per_build:.0} ns/build ({elapsed:?} total)");
-            samples.push(ns_per_build);
+            let mut samples = Vec::with_capacity(TRIALS);
+            for _ in 0..TRIALS {
+                let start = Instant::now();
+                for _ in 0..BUILDS_PER_TRIAL {
+                    lookup();
+                }
+                let elapsed = start.elapsed();
+                let ns_per_lookup = elapsed.as_nanos() as f64 / f64::from(BUILDS_PER_TRIAL);
+                eprintln!("  {label} trial: {ns_per_lookup:.0} ns/lookup ({elapsed:?} total)");
+                samples.push(ns_per_lookup);
+            }
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let median = samples[TRIALS / 2];
+            let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+            eprintln!(
+                "bench_active_candidate_scan_against_the_index {label}: median={median:.0} \
+                 ns/lookup, mean={mean:.0} ns/lookup (n={TRIALS}, views={VIEWS}, \
+                 pages_per_view={PAGES_PER_VIEW})"
+            );
         }
-        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let median = samples[TRIALS / 2];
-        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
-        eprintln!(
-            "bench_active_edge_index_build: median={median:.0} ns/build, mean={mean:.0} \
-             ns/build (n={TRIALS}, views={VIEWS}, pages_per_view={PAGES_PER_VIEW})"
-        );
     }
 
     /// Microbench comparing the VDBE read hot-path's current double
@@ -8990,15 +10821,12 @@ mod tests {
         );
     }
 
-    /// Microbench for the new `all_readers.is_empty()` short-circuit in
-    /// `ActiveEdgeDiscoveryIndex::incoming_candidate_refs`. Builds an index
-    /// from write-only views (readers vec empty) and a committer's write
-    /// summary that covers N pages, then times repeated
-    /// `incoming_candidate_refs` calls. Without the short-circuit each
-    /// call clones `self.readers_with_global_keys`, probes
-    /// `readers_by_page` / `readers_by_page_witness` N times each, and
-    /// runs sort+dedup; with the short-circuit each call is a single
-    /// atomic-length check.
+    /// Microbench for the incoming-candidate scan over write-only views (no
+    /// peer has read anything) and a committer's write summary that covers N
+    /// pages. The scan rejects each view on `has_read_witnesses()` before any
+    /// page probe; this is the shape the index's `all_readers.is_empty()`
+    /// short-circuit was added for before bd-i0tn6 lever 4 replaced the
+    /// index.
     #[test]
     #[ignore = "microbench — run manually"]
     fn bench_incoming_candidate_refs_empty_readers() {
@@ -9006,7 +10834,8 @@ mod tests {
         use std::time::Instant;
 
         use super::{
-            ActiveEdgeDiscoveryIndex, HandleView, HandleViewFlags, summarize_witness_keys,
+            HandleView, HandleViewFlags, HandleViewParts, active_incoming_candidates,
+            summarize_witness_keys,
         };
 
         fn make_writer_view(token_id: u64, pages: &[u32]) -> HandleView {
@@ -9018,12 +10847,14 @@ mod tests {
                 flags: HandleViewFlags(HandleViewFlags::ACTIVE),
                 // Read side intentionally empty — all_readers stays empty
                 // so the short-circuit fires.
-                read_pages: Vec::new(),
-                read_page_witness_pages: Vec::new(),
-                read_exact_cells: Vec::new(),
-                write_pages: write_pages.clone(),
-                write_page_witness_pages: write_pages,
-                write_exact_cells: Vec::new(),
+                parts: std::sync::Arc::new(HandleViewParts {
+                    read_pages: Vec::new(),
+                    read_page_witness_pages: Vec::new(),
+                    read_exact_cells: Vec::new(),
+                    write_pages: write_pages.clone(),
+                    write_page_witness_pages: write_pages,
+                    write_exact_cells: Vec::new(),
+                }),
                 has_in_rw: Cell::new(false),
                 has_out_rw: Cell::new(false),
             }
@@ -9044,9 +10875,7 @@ mod tests {
             })
             .collect();
 
-        let index = ActiveEdgeDiscoveryIndex::build(&views);
         let committer_token = test_token(999);
-        let committer_begin = CommitSeq::new(1);
         let committer_end = CommitSeq::new(2);
         let committer_write_keys: Vec<WitnessKey> = (1..=PAGES_PER_VIEW)
             .map(|i| WitnessKey::Page(test_page(i)))
@@ -9055,10 +10884,9 @@ mod tests {
 
         // Warm-up.
         for _ in 0..CALLS_PER_TRIAL {
-            std::hint::black_box(index.incoming_candidate_refs(
+            std::hint::black_box(active_incoming_candidates(
                 &views,
                 committer_token,
-                committer_begin,
                 committer_end,
                 &write_summary,
             ));
@@ -9068,10 +10896,9 @@ mod tests {
         for _ in 0..TRIALS {
             let start = Instant::now();
             for _ in 0..CALLS_PER_TRIAL {
-                std::hint::black_box(index.incoming_candidate_refs(
+                std::hint::black_box(active_incoming_candidates(
                     &views,
                     committer_token,
-                    committer_begin,
                     committer_end,
                     &write_summary,
                 ));
@@ -9090,7 +10917,9 @@ mod tests {
         );
     }
 
-    /// Microbench for `HandleView::new` on the typical MT writer shape:
+    /// Microbench for the view-parts build (`HandleViewParts::build`, which
+    /// `HandleView::new` paid on every call until bd-i0tn6 cached it per
+    /// handle) on the typical MT writer shape:
     /// 10 read-witness pages + 10 staged write pages (which feed both the
     /// `tracked_write_conflict_pages_iter` chain and the write-witness
     /// summary). Six set-shaped fields are built per call; switching the
@@ -9107,7 +10936,7 @@ mod tests {
     fn bench_handle_view_new_typical() {
         use std::time::Instant;
 
-        use super::HandleView;
+        use super::HandleViewParts;
 
         const READ_PAGES: u32 = 10;
         const WRITE_PAGES: u32 = 10;
@@ -9137,14 +10966,14 @@ mod tests {
 
         // Warm-up.
         for _ in 0..BUILDS_PER_TRIAL {
-            std::hint::black_box(HandleView::new(&handle));
+            std::hint::black_box(HandleViewParts::build(&handle));
         }
 
         let mut samples = Vec::with_capacity(TRIALS);
         for _ in 0..TRIALS {
             let start = Instant::now();
             for _ in 0..BUILDS_PER_TRIAL {
-                std::hint::black_box(HandleView::new(&handle));
+                std::hint::black_box(HandleViewParts::build(&handle));
             }
             let elapsed = start.elapsed();
             let ns_per_build = elapsed.as_nanos() as f64 / f64::from(BUILDS_PER_TRIAL);

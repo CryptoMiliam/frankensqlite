@@ -11,10 +11,12 @@
 //! - `RESERVED_BYTE` = `0x4000_0001` (1 byte)
 //! - `SHARED_FIRST`  = `0x4000_0002` (510 bytes)
 //!
-//! **Key design:** POSIX fcntl locks are per-process, not per-fd. If one fd in
-//! a process holds a lock, closing *any* fd to the same file releases it. We
-//! handle this with a global inode table (`InodeTable`) that coalesces locks
-//! across all file handles in the same process.
+//! **Key design:** Linux and macOS use open-file-description (OFD) locks, so
+//! closing an unrelated descriptor cannot release a live database or SHM lock.
+//! A global inode table (`InodeTable`) coalesces logical owners onto one
+//! canonical descriptor per inode; siblings therefore share an OFD and only
+//! the last claim releases each lock. Other Unix platforms use classic POSIX
+//! locks and defer redundant descriptor closes while a claim survives.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -24,7 +26,7 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use advisory_lock::{AdvisoryFileLock, FileLockError, FileLockMode};
@@ -46,12 +48,35 @@ use crate::shm::{
     wal_read_lock_slot,
 };
 use crate::traits::{
-    FileIdentity, ForeignWalParticipation, SyncKind, Vfs, VfsFile, VfsWriteCompletion,
-    VfsWriteCompletionSource,
+    FileIdentity, ForeignWalParticipation, MAX_MMAP_SIZE, ReadOnlyMmapView, SyncKind, Vfs, VfsFile,
+    VfsMmapCounters, VfsMmapStatus, VfsWriteCompletion, VfsWriteCompletionSource,
 };
 
 fn checkpoint_or_abort(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FrankenError::Abort)
+}
+
+/// Whether a file sync issues `fdatasync` rather than `fsync`.
+///
+/// On Linux every file sync does, whatever it was asked for, as stock
+/// SQLite's `unixSync` does there: `full_fsync` calls `fdatasync` for every
+/// sync flag, with the reasoning that "as far as SQLite is concerned, an
+/// fdatasync() is always adequate". `fdatasync` writes a file's data and the
+/// metadata a later read needs, its size and block map included (fdatasync(2)
+/// names a size change as metadata it must flush). What it skips is
+/// timestamps, and no recovery path here reads one: file identity is device
+/// and inode. On a write inside the file, the common case once a checkpoint
+/// has restarted the WAL in place, it also skips the journal commit `fsync`
+/// makes for the mtime alone: 3.0-3.2 ms against 9.2-10.6 ms per commit on an
+/// ext4 NVMe volume (bd-w4pr1.7 lever S). Elsewhere only a data-only request
+/// uses it; macOS's full-durable sync is `F_FULLFSYNC` before this is asked.
+///
+/// Directory syncs stay `fsync`. Stock syncs a directory only after creating
+/// a journal or WAL, whose own sync already covers the new entry; fsqlite
+/// also syncs directories after renames, and a rename that leaves the
+/// directory's size unchanged is not metadata `fdatasync` must flush.
+const fn sync_writes_data_only(data_only_requested: bool) -> bool {
+    cfg!(target_os = "linux") || data_only_requested
 }
 
 /// Main-lock admission check for the points before any wait: `UnixFile::lock`
@@ -529,7 +554,7 @@ const DARWIN_F_OFD_GETLK: libc::c_int = 92;
 /// handle and refuse it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FileLockStyle {
-    /// Byte-range advisory lock: Linux `F_SETLK` or Darwin `F_OFD_SETLK`.
+    /// Byte-range advisory lock: Linux/Darwin OFD or other Unix classic fcntl.
     ByteRange,
     /// Coarse whole-file `flock(2)` fallback (C SQLite's flock locking style).
     WholeFileFlock,
@@ -537,23 +562,24 @@ enum FileLockStyle {
 
 /// Issue an `F_SETLK`-family request for `flock` on `file`.
 ///
-/// Linux keeps its proven classic per-process `F_SETLK` path (via `nix`), so
-/// its concurrency behavior is byte-for-byte unchanged. Darwin (>= 10.12) uses
-/// `F_OFD_SETLK` (open-file-description locks, fcntl cmd 90) so the lock is
-/// owned by the open file description rather than the whole process: it is not
-/// silently dropped when an unrelated descriptor for the same inode is closed —
-/// the per-process footgun the classic path must otherwise work around. All
-/// locking here funnels through the single shared canonical descriptor per
-/// inode, so one OFD is authoritative. Other Unix keep classic byte-range
-/// `F_SETLK`. Only when the filesystem itself rejects byte-range / OFD fcntl
-/// locks (EINVAL/ENOTSUP — e.g. AFP/SMB network mounts, pre-10.12 kernels) do
-/// we drop to coarse whole-file `flock(2)` (C SQLite's flock locking style):
-/// correct, but it collapses the per-byte SHARED/RESERVED/PENDING/EXCLUSIVE
-/// regions to one whole-file lock, forfeiting byte-range writer concurrency.
+/// Linux (>= 3.15, via `nix`) and Darwin (>= 10.12, fcntl cmd 90) use
+/// `F_OFD_SETLK`: the open file description owns the lock, so closing an
+/// unrelated descriptor for the same inode cannot silently release it. GH#540
+/// lost committed rows when such a close erased the main-file WAL lifetime
+/// claim and stock SQLite then unlinked the live WAL and SHM files.
+///
+/// All main-file and SHM locking uses the shared canonical descriptor for its
+/// inode. Lifetime claims and transaction locks must use the same primitive:
+/// an OFD claim would conflict with a classic lock even in this same process.
+/// Linux fails if OFD locking is unavailable; falling back to classic locks
+/// would restore the data-loss bug. Other Unix platforms keep classic
+/// byte-range `F_SETLK`. The non-Linux backend can fall back to whole-file
+/// `flock(2)` on EINVAL/ENOTSUP (e.g. AFP/SMB mounts or pre-10.12 Darwin),
+/// forfeiting byte-range writer concurrency.
 fn fcntl_setlk(file: &impl AsFd, flock: &libc::flock) -> nix::Result<FileLockStyle> {
     #[cfg(target_os = "linux")]
     {
-        nix::fcntl::fcntl(file.as_fd(), nix::fcntl::FcntlArg::F_SETLK(flock))
+        nix::fcntl::fcntl(file.as_fd(), nix::fcntl::FcntlArg::F_OFD_SETLK(flock))
             .map(|_| FileLockStyle::ByteRange)
     }
     #[cfg(not(target_os = "linux"))]
@@ -588,7 +614,7 @@ fn fcntl_setlk(file: &impl AsFd, flock: &libc::flock) -> nix::Result<FileLockSty
 fn fcntl_getlk(file: &impl AsFd, flock: &mut libc::flock) -> nix::Result<()> {
     #[cfg(target_os = "linux")]
     {
-        nix::fcntl::fcntl(file.as_fd(), nix::fcntl::FcntlArg::F_GETLK(flock)).map(|_| ())
+        nix::fcntl::fcntl(file.as_fd(), nix::fcntl::FcntlArg::F_OFD_GETLK(flock)).map(|_| ())
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -646,7 +672,7 @@ fn descriptor_is_read_only(file: &impl AsFd) -> bool {
 
 /// Attempt a non-blocking POSIX advisory lock via [`fcntl_setlk`].
 ///
-/// On Linux this is a safe `nix` `F_SETLK` wrapper; on Darwin/other Unix it
+/// On Linux this is a safe `nix` `F_OFD_SETLK` wrapper; on Darwin/other Unix it
 /// dispatches through [`fcntl_setlk`] (OFD locks, with a `flock(2)` fallback).
 ///
 /// Returns `Ok(true)` if the lock was acquired, `Ok(false)` if it would
@@ -747,7 +773,8 @@ fn posix_unlock(file: &impl AsFd, start: u64, len: u64) -> Result<()> {
 
 /// Query whether a lock would succeed without acquiring it.
 ///
-/// Uses `fcntl(F_GETLK)` and returns the kernel-filled `flock`.
+/// Uses the matching OFD/classic `fcntl` query and returns the kernel-filled
+/// `flock`. OFD queries also see classic locks held by this process.
 #[allow(clippy::cast_possible_wrap)]
 fn posix_getlk(
     file: &impl AsFd,
@@ -785,19 +812,19 @@ type InodeKey = FileIdentity;
 
 /// Per-inode lock state shared across all file handles in this process.
 ///
-/// Because POSIX fcntl locks are per-process (not per-fd), we must coalesce
-/// lock operations through a single canonical fd and track how many handles
-/// want each lock level. The OS-level lock is only released when the last
-/// handle drops its claim.
+/// Coalesce lock operations through a single canonical fd and track how many
+/// handles want each lock level. On OFD platforms, independent opens would
+/// otherwise conflict with each other. On classic POSIX platforms, sibling
+/// descriptors instead share process-wide locks. In both cases the OS-level
+/// lock is released only when the last logical owner drops its claim.
 #[derive(Debug)]
 struct InodeInfo {
     /// Canonical file descriptor for this inode.
     ///
-    /// POSIX fcntl locks are per-process, and closing *any* fd for the file can
-    /// release the process' locks. To avoid that, we keep exactly one canonical
-    /// fd per inode for I/O/locking and share it across handles via `Arc`.
-    /// Racing redundant opens remain inert in `deferred_close_files` until no
-    /// process lock claim survives.
+    /// Share one fd per inode for I/O/locking via `Arc`, so every logical owner
+    /// operates on the same open file description. Racing redundant opens
+    /// remain inert in `deferred_close_files` until no lock claim survives;
+    /// this also protects classic POSIX locks on platforms without OFD locks.
     file: Arc<File>,
     /// Total number of open file handles referencing this inode.
     n_ref: u32,
@@ -810,6 +837,13 @@ struct InodeInfo {
     /// Number of handles holding a RESERVED lock (at most 1 from the OS
     /// perspective, but tracked for reference-counting).
     n_reserved: u32,
+    /// bd-mc5pp: whether the RESERVED claim counted by `n_reserved` was
+    /// acquired inside an external append or maintenance attempt (held only
+    /// for that bounded window) rather than as a transaction-level lock
+    /// (`BEGIN IMMEDIATE`/`EXCLUSIVE`, an escalated or serialized writer),
+    /// which its owner keeps across statements. Cleared when `n_reserved`
+    /// returns to zero.
+    reserved_by_attempt: bool,
     /// Number of handles holding a PENDING lock.
     n_pending: u32,
     /// Number of interrupted SHARED acquisitions that still retain their
@@ -860,6 +894,7 @@ impl InodeInfo {
             n_shared: 0,
             n_wal_lifetime: 0,
             n_reserved: 0,
+            reserved_by_attempt: false,
             n_pending: 0,
             n_transient_shared_pending: 0,
             n_exclusive: 0,
@@ -878,10 +913,28 @@ impl InodeInfo {
     }
 
     /// Close redundant descriptors only while the inode mutex proves that no
-    /// thread can establish a new process-wide record lock concurrently.
+    /// thread can establish a new process-wide record lock concurrently, and
+    /// no other lock manager in this process holds a classic lock that the
+    /// close would release (bd-drufq).
     fn close_deferred_files_if_unlocked(&mut self) {
-        if !self.has_lock_claims() {
+        if !self.has_lock_claims()
+            && !self.deferred_close_files.is_empty()
+            && process_holds_classic_lock(&self.file) == Some(false)
+        {
             self.deferred_close_files.clear();
+        }
+    }
+
+    /// Dispose of a redundant descriptor while no claim of ours is live: close
+    /// it, or keep it with the deferred descriptors while another lock manager
+    /// in this process holds a classic lock its close would release
+    /// (bd-drufq). Later opens then reuse the canonical descriptor instead of
+    /// opening more ([`InodeTable::reuse_retained_file`]).
+    fn close_or_defer_redundant(&mut self, file: Arc<File>) {
+        if process_holds_classic_lock(&self.file) == Some(false) {
+            drop(file);
+        } else {
+            self.deferred_close_files.push(file);
         }
     }
 }
@@ -890,9 +943,9 @@ const INODE_TABLE_SHARDS: usize = 16;
 
 /// Global per-process table mapping (dev, ino) to shared lock state.
 ///
-/// This prevents the \"POSIX close drops all locks\" problem: we only issue
-/// OS-level lock/unlock calls through one canonical fd per inode, and track
-/// how many handles want each lock level.
+/// Issue OS-level lock/unlock calls through one canonical fd per inode and
+/// track how many handles want each lock level. This also lets classic POSIX
+/// platforms defer redundant closes without releasing live process locks.
 struct InodeTable {
     shards: [Mutex<HashMap<InodeKey, Arc<Mutex<InodeInfo>>>>; INODE_TABLE_SHARDS],
 }
@@ -1082,7 +1135,7 @@ impl InodeTable {
                     if info.has_lock_claims() {
                         info.deferred_close_files.push(opened);
                     } else {
-                        drop(opened);
+                        info.close_or_defer_redundant(opened);
                     }
                     return Err(FrankenError::internal(
                         "Unix inode-table open-reference count overflow",
@@ -1096,7 +1149,7 @@ impl InodeTable {
                     // Keep the inode mutex held while the redundant descriptor
                     // closes, so no thread can establish a record lock in the
                     // close-vs-lock window.
-                    drop(opened);
+                    info.close_or_defer_redundant(opened);
                 }
                 canonical
             };
@@ -1242,7 +1295,7 @@ impl InodeTable {
                 if current_guard.has_lock_claims() {
                     current_guard.deferred_close_files.push(file);
                 } else {
-                    drop(file);
+                    current_guard.close_or_defer_redundant(file);
                 }
                 drop(current_guard);
                 drop(inode_info);
@@ -1255,12 +1308,18 @@ impl InodeTable {
             if guard.n_ref == 0 {
                 guard.close_deferred_files_if_unlocked();
             }
+            // bd-drufq: retiring the generation closes its canonical
+            // descriptor. While another lock manager in this process (a stock
+            // SQLite library) holds classic locks on the inode, keep the idle
+            // generation registered instead; the next open reuses it, and the
+            // next final close here retires it once those locks are gone.
             let remove = guard.n_ref == 0
                 && !guard.has_lock_claims()
                 && guard.deferred_close_files.is_empty()
                 && Arc::ptr_eq(&guard.file, &file)
                 && Arc::strong_count(&file) == 2
-                && Arc::strong_count(&inode_info) == 2;
+                && Arc::strong_count(&inode_info) == 2
+                && process_holds_classic_lock(&guard.file) == Some(false);
             drop(guard);
 
             // The closing handle's descriptor must disappear before the table
@@ -1289,6 +1348,42 @@ fn global_inode_table() -> &'static InodeTable {
 // SHM table — per-process SHM region/lock coalescing
 // ---------------------------------------------------------------------------
 
+/// The open file description to map a `-shm` through: on Linux a second
+/// description of the same inode, so the one every lock is taken on is never
+/// mapped (GH#534, bd-reality-check-1022-llk6g.5).
+///
+/// Our WAL locks are OFD locks (04d6fd0c9), released only when the last
+/// reference to their description goes away, and a mapping is such a
+/// reference. A killed process's mapping can be torn down several ms after
+/// waitpid has returned; meanwhile its WRITE, reader-mark and DMS locks on a
+/// mapped description stayed visible, so the next opener took a dead writer
+/// for a live one (and stock took itself for a second connection, not a
+/// first attacher). A description that only descriptors reference is released
+/// when the dying process closes them, as stock's classic locks are.
+///
+/// Reopening `/proc/self/fd/N` yields a new description of the very inode the
+/// canonical descriptor names, with no path race. Anywhere that is not
+/// available, or names another inode, the canonical descriptor is mapped as
+/// before.
+fn shm_mapping_description(file: &Arc<File>) -> Arc<File> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd as _;
+        let reopened = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        if let Ok(reopened) = reopened
+            && let (Ok(mapped), Ok(canonical)) =
+                (inode_key_from_file(&reopened), inode_key_from_file(file))
+            && mapped == canonical
+        {
+            return Arc::new(reopened);
+        }
+    }
+    Arc::clone(file)
+}
+
 #[derive(Debug, Default)]
 struct ShmSlotState {
     shared_holders: HashMap<u64, u32>,
@@ -1297,7 +1392,10 @@ struct ShmSlotState {
 
 #[derive(Debug)]
 struct ShmInfo {
+    /// The canonical descriptor: every `-shm` lock is taken through it.
     file: Arc<File>,
+    /// The descriptor the `-shm` is mapped through ([`shm_mapping_description`]).
+    map_file: Arc<File>,
     regions: HashMap<u32, ShmRegion>,
     /// A short backing or failed allocation must be rechecked before a cached
     /// alias escapes. Failed allocation can extend EOF while leaving holes.
@@ -1317,8 +1415,10 @@ impl ShmInfo {
         // SQLite to coordinate first-opener truncation of `*-shm`.
         let slot_count =
             usize::try_from(WAL_TOTAL_LOCKS.saturating_add(1)).expect("WAL lock count fits usize");
+        let map_file = shm_mapping_description(&file);
         Self {
             file,
+            map_file,
             regions: HashMap::new(),
             backing_check_required: false,
             slots: std::iter::repeat_with(ShmSlotState::default)
@@ -1441,17 +1541,37 @@ impl ShmTable {
             .map
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let info = if let Some(existing) = map.get(&path) {
-            if existing
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .namespace_unlinked
-            {
-                // A failed post-unlink cleanup still owns this old inode.
-                // Never attach a new caller to its now-orphaned descriptor.
-                return Err(FrankenError::Busy);
+        let reusable = match map.get(&path) {
+            Some(existing) => {
+                let guard = existing
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if guard.namespace_unlinked {
+                    // A failed post-unlink cleanup still owns this old inode.
+                    // Never attach a new caller to its now-orphaned descriptor.
+                    return Err(FrankenError::Busy);
+                }
+                // bd-drufq: an idle entry (kept for a same-process classic
+                // owner, or by a surviving observer) may outlive the `-shm`
+                // it opened: a stock connection that was last to close
+                // unlinks it. Never attach a new owner to that orphan.
+                let orphaned = guard.owner_refs.is_empty()
+                    && guard.mapping_owners.is_empty()
+                    && !path_names_open_file(&path, &guard.file);
+                drop(guard);
+                if orphaned {
+                    if let Some(stale) = map.remove(&path) {
+                        retire_orphaned_shm_entry(stale);
+                    }
+                    None
+                } else {
+                    Some(Arc::clone(existing))
+                }
             }
-            Arc::clone(existing)
+            None => None,
+        };
+        let info = if let Some(existing) = reusable {
+            existing
         } else {
             use std::os::unix::fs::OpenOptionsExt as _;
 
@@ -1513,10 +1633,17 @@ impl ShmTable {
             // No old canonical fd may close after a new generation opens.
             // A surviving local observer keeps this canonical entry reusable;
             // it holds no fence after the last registered owner has drained.
+            // bd-drufq: so does a classic lock another lock manager in this
+            // process (a stock SQLite library) holds on the `-shm`: closing
+            // the canonical descriptor would release its dead-man-switch lock.
+            // An unlinked namespace retires regardless; we unlinked it under
+            // main-file EXCLUSIVE, which no live stock connection allows.
             let retire = info.owner_refs.is_empty()
                 && info.mapping_owners.is_empty()
                 && (info.namespace_unlinked
-                    || (Arc::strong_count(&expected) == 2 && Arc::strong_count(&info.file) == 1));
+                    || (Arc::strong_count(&expected) == 2
+                        && Arc::strong_count(&info.file) == 1
+                        && process_holds_classic_lock(&info.file) == Some(false)));
             drop(info);
             if retire {
                 let removed = map.remove(path);
@@ -1532,6 +1659,40 @@ impl ShmTable {
 fn global_shm_table() -> &'static ShmTable {
     static TABLE: OnceLock<ShmTable> = OnceLock::new();
     TABLE.get_or_init(ShmTable::new)
+}
+
+/// Whether `path` still names the inode `file` has open. Only a missing path
+/// or a different inode answers `false`; an unreadable path is not proof that
+/// the entry is orphaned.
+fn path_names_open_file(path: &Path, file: &File) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    match fs::metadata(path) {
+        Ok(named) => file.metadata().map_or(true, |open| {
+            named.dev() == open.dev() && named.ino() == open.ino()
+        }),
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Dispose of an idle `-shm` entry whose path no longer names its inode
+/// (bd-drufq): close its descriptor, or, while a classic lock this process
+/// holds on that inode would be released by the close, keep the entry for the
+/// life of the process. Nothing maps or locks through it any more.
+fn retire_orphaned_shm_entry(stale: Arc<Mutex<ShmInfo>>) {
+    static ORPHANED: OnceLock<Mutex<Vec<Arc<Mutex<ShmInfo>>>>> = OnceLock::new();
+    let keep = process_holds_classic_lock(
+        &stale
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .file,
+    ) != Some(false);
+    if keep {
+        ORPHANED
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(stale);
+    }
 }
 
 static SHM_OWNER_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -1630,6 +1791,70 @@ fn foreign_lock_on_range(file: &File, start: u64, len: u64) -> Option<bool> {
     Some(flock.l_type != unlocked)
 }
 
+/// bd-drufq: whether this process holds a classic (process-owned) POSIX
+/// record lock on the inode `file` names.
+///
+/// On Linux this VFS locks only through open-file-description locks, so such a
+/// lock belongs to another lock manager in this process, such as a stock
+/// SQLite library linked beside this one. Closing ANY descriptor of the inode
+/// releases every classic lock the process holds on it: retiring our
+/// canonical descriptor would strip a live stock connection's lifetime SHARED
+/// and dead-man-switch locks, after which a stock process elsewhere takes
+/// itself for the last connection and unlinks the live WAL and `-shm`.
+///
+/// `Some(false)` is proof: the OFD query from `file` reports no lock of any
+/// other owner. A reported lock owned by this pid proves one (OFD locks report
+/// pid -1). Any other reported lock can hide ours behind it, so the kernel
+/// lock table decides; `None` when it cannot be read. Callers keep the
+/// descriptor open unless the answer is `Some(false)`.
+#[cfg(target_os = "linux")]
+fn process_holds_classic_lock(file: &File) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+    let reported = posix_getlk(file, libc::F_WRLCK, 0, 0).ok()?;
+    #[allow(clippy::cast_possible_truncation)]
+    let unlocked = libc::F_UNLCK as libc::c_short;
+    if reported.l_type == unlocked {
+        return Some(false);
+    }
+    let pid = std::process::id();
+    if u32::try_from(reported.l_pid).ok() == Some(pid) {
+        return Some(true);
+    }
+    let inode = file.metadata().ok()?.ino();
+    let table = fs::read_to_string("/proc/locks").ok()?;
+    Some(lock_table_names_classic_lock(&table, pid, inode))
+}
+
+/// Classic locks have no owner this VFS can tell apart from its own on these
+/// platforms (other Unix), or are not probed (Darwin), so retirement proceeds
+/// exactly as before bd-drufq.
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::unnecessary_wraps)]
+fn process_holds_classic_lock(_file: &File) -> Option<bool> {
+    Some(false)
+}
+
+/// Whether the `/proc/locks` text `table` lists a held classic POSIX lock
+/// owned by `pid` on inode `inode`. Lines read
+/// `N: POSIX ADVISORY WRITE <pid> <maj>:<min>:<ino> <start> <end>`; a blocked
+/// request reads `N: -> POSIX ...` and holds nothing. The device is not
+/// compared: `/proc/locks` names the superblock device, which differs from
+/// `st_dev` on btrfs subvolumes, and a false match only keeps a descriptor
+/// open longer.
+#[cfg(target_os = "linux")]
+fn lock_table_names_classic_lock(table: &str, pid: u32, inode: u64) -> bool {
+    table.lines().any(|line| {
+        let mut fields = line.split_whitespace().skip(1);
+        fields.next() == Some("POSIX")
+            && fields.nth(2).and_then(|owner| owner.parse::<u32>().ok()) == Some(pid)
+            && fields
+                .next()
+                .and_then(|identity| identity.rsplit(':').next())
+                .and_then(|number| number.parse::<u64>().ok())
+                == Some(inode)
+    })
+}
+
 /// Whether `F_GETLK` on this file's filesystem reports other processes'
 /// locks. On Linux it does on every filesystem fsqlite locks with fcntl. On
 /// other Unixes a non-local mount (AFP, SMB, ...) may have downgraded peers to
@@ -1707,8 +1932,9 @@ fn with_retained_probe_descriptor<T>(
 impl InodeTable {
     /// Probe the main file at `path` through a retained read-only descriptor
     /// only while no descriptor for its inode is registered in this process.
-    /// A registered inode means this process already participates, and its
-    /// own locks are invisible to `F_GETLK`.
+    /// A registered inode means this VFS already participates: a probe through
+    /// an independent descriptor could report its own OFD locks as a peer,
+    /// while classic queries would miss its own process locks entirely.
     fn probe_unregistered_main_file(&self, path: &Path) -> PeerLockProbe {
         use std::os::unix::fs::MetadataExt;
         let Ok(meta) = fs::metadata(path) else {
@@ -1975,6 +2201,8 @@ impl Vfs for UnixVfs {
             external_shared_snapshot_attempt: None,
             external_maintenance_attempt: None,
             external_append_attempt: None,
+            main_lock_refused_by_local_transaction: false,
+            external_append_blocked_by_local_transaction: false,
             delete_on_close,
             closed: false,
             inode_key,
@@ -1983,7 +2211,9 @@ impl Vfs for UnixVfs {
             shm_path,
             shm_info: None,
             shm_dms_lifetime_claim: false,
+            private_reader_shm: None,
             busy_timeout_ms: 0,
+            mmap: UnixMmapController::new(),
         };
 
         Ok((unix_file, out_flags))
@@ -1993,27 +2223,18 @@ impl Vfs for UnixVfs {
         fs::remove_file(path).map_err(FrankenError::Io)?;
 
         if sync_dir {
-            let parent = path
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."));
             // A caller requesting a durable namespace deletion must learn if
             // the directory barrier failed. Silently swallowing this error
             // can leave a supposedly-removed rollback journal present after
             // a crash and turn a committed image into a rollback candidate.
-            File::open(parent)?.sync_all()?;
+            crate::host_fs::sync_parent_directory(path)?;
         }
 
         Ok(())
     }
 
     fn sync_parent_directory(&self, _cx: &Cx, path: &Path) -> Result<()> {
-        let parent = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        File::open(parent)?.sync_all()?;
-        Ok(())
+        crate::host_fs::sync_parent_directory(path)
     }
 
     fn access(&self, _cx: &Cx, path: &Path, flags: AccessFlags) -> Result<bool> {
@@ -2045,6 +2266,20 @@ impl Vfs for UnixVfs {
         path: &Path,
     ) -> Result<ForeignWalParticipation> {
         Ok(probe_foreign_wal_participation(path))
+    }
+
+    fn probe_foreign_shm_attachment(
+        &self,
+        _cx: &Cx,
+        path: &Path,
+    ) -> Result<ForeignWalParticipation> {
+        Ok(
+            match global_shm_table().probe_unregistered_dms(&sqlite_shm_path(path)) {
+                PeerLockProbe::Locked => ForeignWalParticipation::Participant,
+                PeerLockProbe::Unlocked => ForeignWalParticipation::NoParticipant,
+                PeerLockProbe::Unknown => ForeignWalParticipation::Unknown,
+            },
+        )
     }
 
     fn full_pathname(&self, _cx: &Cx, path: &Path) -> Result<PathBuf> {
@@ -2157,6 +2392,268 @@ enum WalLifetimeClaim {
     Held,
 }
 
+#[derive(Debug, Default)]
+struct UnixMmapInner {
+    view: Option<ReadOnlyMmapView>,
+    next_generation: u64,
+    mapping_failed: bool,
+}
+
+/// Ordinary database file read-mapping controller for [`UnixFile`] (`bd-dwjnq.3`).
+///
+/// Explicitly distinct from WAL `-shm` mappings. Maintains a bounded read-only
+/// `PROT_READ | MAP_SHARED` prefix up to `min(file_len, configured_limit_bytes)`
+/// and degrades cleanly to `pread` on growth failure, past-limit reads, or
+/// disabled mode (`configured_limit_bytes == 0`, which costs a single relaxed
+/// atomic load on the read hot path).
+#[derive(Debug)]
+struct UnixMmapController {
+    configured_limit_bytes: AtomicU64,
+    inject_failures: AtomicU64,
+    counters: Arc<VfsMmapCounters>,
+    inner: RwLock<UnixMmapInner>,
+}
+
+impl UnixMmapController {
+    fn new() -> Self {
+        Self {
+            configured_limit_bytes: AtomicU64::new(0),
+            inject_failures: AtomicU64::new(0),
+            counters: Arc::new(VfsMmapCounters::default()),
+            inner: RwLock::new(UnixMmapInner::default()),
+        }
+    }
+
+    #[inline]
+    fn configured_limit_bytes(&self) -> u64 {
+        self.configured_limit_bytes.load(Ordering::Acquire)
+    }
+
+    fn status_locked(&self, limit: u64, inner: &UnixMmapInner) -> VfsMmapStatus {
+        VfsMmapStatus {
+            supported: true,
+            configured_limit_bytes: limit,
+            mapped_bytes: inner.view.as_ref().map_or(0, |v| v.len() as u64),
+            mapping_generation: inner.view.as_ref().map_or(0, ReadOnlyMmapView::generation),
+            mmap_read_hits: self.counters.mmap_read_hits.load(Ordering::Relaxed),
+            pread_fallbacks: self.counters.pread_fallbacks.load(Ordering::Relaxed),
+            map_attempts: self.counters.map_attempts.load(Ordering::Relaxed),
+            map_failures: self.counters.map_failures.load(Ordering::Relaxed),
+            unmap_count: self.counters.unmap_count.load(Ordering::Relaxed),
+        }
+    }
+
+    fn status(&self) -> VfsMmapStatus {
+        let limit = self.configured_limit_bytes();
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.status_locked(limit, &inner)
+    }
+
+    fn read_only_view(&self) -> Option<ReadOnlyMmapView> {
+        if self.configured_limit_bytes() == 0 {
+            return None;
+        }
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .view
+            .clone()
+    }
+
+    fn inject_failure(&self, remaining_failures: u64) {
+        self.inject_failures
+            .store(remaining_failures, Ordering::Release);
+    }
+
+    fn consume_injected_failure(&self) -> bool {
+        self.inject_failures
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                cur.checked_sub(1)
+            })
+            .is_ok()
+    }
+
+    fn remap_locked(
+        &self,
+        file: &Arc<File>,
+        target_len: usize,
+        inner: &mut UnixMmapInner,
+        clear_existing_on_failure: bool,
+    ) {
+        if target_len == 0 {
+            let _ = inner.view.take();
+            return;
+        }
+        self.counters.map_attempts.fetch_add(1, Ordering::Relaxed);
+        if self.consume_injected_failure() {
+            self.counters.map_failures.fetch_add(1, Ordering::Relaxed);
+            inner.mapping_failed = true;
+            if clear_existing_on_failure {
+                let _ = inner.view.take();
+            }
+            return;
+        }
+        let generation = inner.next_generation.saturating_add(1);
+        // Drop any previous mapping before creating a replacement when explicitly
+        // resizing/shrinking so peak VMA residency remains tightly bounded.
+        if clear_existing_on_failure {
+            let _ = inner.view.take();
+        }
+        match ReadOnlyMmapView::map_unix_prefix(
+            Arc::clone(file),
+            target_len,
+            generation,
+            Arc::clone(&self.counters),
+        ) {
+            Ok(view) => {
+                inner.next_generation = generation;
+                inner.mapping_failed = false;
+                inner.view = Some(view);
+            }
+            Err(error) => {
+                warn!(
+                    target_len,
+                    %error,
+                    "database file mmap failed; falling back to pread"
+                );
+                self.counters.map_failures.fetch_add(1, Ordering::Relaxed);
+                inner.mapping_failed = true;
+                if clear_existing_on_failure {
+                    let _ = inner.view.take();
+                }
+            }
+        }
+    }
+
+    fn configure(&self, file: &Arc<File>, raw_limit_bytes: u64) -> VfsMmapStatus {
+        let limit = raw_limit_bytes.min(MAX_MMAP_SIZE);
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.configured_limit_bytes.store(limit, Ordering::Release);
+        inner.mapping_failed = false;
+        if limit == 0 {
+            let _ = inner.view.take();
+            return self.status_locked(0, &inner);
+        }
+        let file_len = file.metadata().map_or(0, |meta| meta.len());
+        let target_u64 = file_len.min(limit);
+        if target_u64 == 0 {
+            let _ = inner.view.take();
+            return self.status_locked(limit, &inner);
+        }
+        let Ok(target_len) = usize::try_from(target_u64) else {
+            self.counters.map_attempts.fetch_add(1, Ordering::Relaxed);
+            self.counters.map_failures.fetch_add(1, Ordering::Relaxed);
+            inner.mapping_failed = true;
+            let _ = inner.view.take();
+            return self.status_locked(limit, &inner);
+        };
+        if inner.view.as_ref().is_some_and(|v| v.len() == target_len) {
+            return self.status_locked(limit, &inner);
+        }
+        self.remap_locked(file, target_len, &mut inner, true);
+        self.status_locked(limit, &inner)
+    }
+
+    fn try_read(&self, file: &Arc<File>, buf: &mut [u8], offset: u64) -> Option<usize> {
+        let limit = self.configured_limit_bytes();
+        if limit == 0 || buf.is_empty() {
+            return None;
+        }
+        let (needs_growth_check, current_len) = {
+            let inner = self
+                .inner
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(view) = inner.view.as_ref() {
+                if view.read_exact_at(offset, buf) {
+                    return Some(buf.len());
+                }
+                (
+                    !inner.mapping_failed && (view.len() as u64) < limit,
+                    view.len() as u64,
+                )
+            } else {
+                (!inner.mapping_failed, 0)
+            }
+        };
+
+        if needs_growth_check {
+            let live_len = file.metadata().map_or(0, |meta| meta.len());
+            let target_u64 = live_len.min(limit);
+            if target_u64 > current_len {
+                let mut inner = self
+                    .inner
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let live_limit = self.configured_limit_bytes();
+                let refreshed_target = live_len.min(live_limit);
+                let locked_len = inner.view.as_ref().map_or(0, |v| v.len() as u64);
+                if live_limit > 0
+                    && !inner.mapping_failed
+                    && refreshed_target > locked_len
+                    && let Ok(target_len) = usize::try_from(refreshed_target)
+                {
+                    self.remap_locked(file, target_len, &mut inner, false);
+                }
+                if let Some(view) = inner.view.as_ref()
+                    && view.read_exact_at(offset, buf)
+                {
+                    return Some(buf.len());
+                }
+            }
+        }
+
+        self.counters
+            .pread_fallbacks
+            .fetch_add(1, Ordering::Relaxed);
+        None
+    }
+
+    fn prepare_for_truncate(&self) {
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = inner.view.take();
+    }
+
+    fn refresh_after_truncate(&self, file: &Arc<File>, new_size: u64) {
+        let limit = self.configured_limit_bytes();
+        if limit == 0 || new_size == 0 {
+            return;
+        }
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner.mapping_failed {
+            return;
+        }
+        let target_u64 = new_size.min(limit);
+        if let Ok(target_len) = usize::try_from(target_u64)
+            && target_len > 0
+        {
+            self.remap_locked(file, target_len, &mut inner, true);
+        }
+    }
+
+    fn unmap_all(&self) {
+        self.configured_limit_bytes.store(0, Ordering::Release);
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = inner.view.take();
+        inner.mapping_failed = false;
+    }
+}
+
 /// A file handle opened by [`UnixVfs`].
 #[derive(Debug)]
 #[allow(
@@ -2182,6 +2679,13 @@ pub struct UnixFile {
     external_shared_snapshot_attempt: Option<UnixExternalSharedSnapshotAttempt>,
     external_maintenance_attempt: Option<UnixExternalMaintenanceAttempt>,
     external_append_attempt: Option<UnixExternalAppendAttempt>,
+    /// Whether the last [`VfsFile::lock`] call returned `Busy` because another
+    /// handle of this process holds RESERVED as a transaction-level lock (see
+    /// `InodeInfo::reserved_by_attempt`).
+    main_lock_refused_by_local_transaction: bool,
+    /// bd-mc5pp: whether the last `lock_external_wal_append` was refused at
+    /// RESERVED by a transaction-level lock of another handle of this process.
+    external_append_blocked_by_local_transaction: bool,
     delete_on_close: bool,
     closed: bool,
     inode_key: InodeKey,
@@ -2192,13 +2696,98 @@ pub struct UnixFile {
     /// One DMS SHARED claim for this attachment, independent of compatibility
     /// helper nesting. Retained through failed unmap/close and deferred cleanup.
     shm_dms_lifetime_claim: bool,
+    /// bd-j2dtf item 2: the `O_RDONLY` `-shm` descriptor whose open file
+    /// description holds `WAL_READ_LOCK(0)` SHARED for a private-index
+    /// reader. Never registered in the shared SHM table; dropping it releases
+    /// the claim.
+    private_reader_shm: Option<File>,
     /// Busy timeout for cross-process lock contention (milliseconds).
     /// Native main-file refusals retry outside the inode mutex. Process-local
     /// ownership conflicts remain nonblocking so the owning task can run.
     busy_timeout_ms: u64,
+    /// Ordinary database read-only mapping controller (`PRAGMA mmap_size`, `bd-dwjnq.3`).
+    mmap: UnixMmapController,
 }
 
 impl UnixFile {
+    /// Synchronous positional read for callers such as the sorter that cannot suspend.
+    pub fn read_at_sync(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        if let Some(total) = self.try_read_via_mmap(cx, buf, offset)? {
+            return Ok(total);
+        }
+        checkpoint_or_abort(cx)?;
+        checked_io_range(offset, buf.len(), "read")?;
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| FrankenError::internal("unix file is closed"))?;
+        let total = read_full_at(|chunk, off| file.read_at(chunk, off), buf, offset, "read")?;
+        buf[total..].fill(0);
+        if buf.len() <= INLINE_IO_MAX_BYTES {
+            checkpoint_or_abort_if_cancel_published(cx)?;
+        } else {
+            checkpoint_or_abort(cx)?;
+        }
+        Ok(total)
+    }
+
+    /// Synchronous positional write that retries interrupted and partial writes.
+    pub fn write_at_sync(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        checked_io_range(offset, buf.len(), "write")?;
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| FrankenError::internal("unix file is closed"))?;
+        write_full_at(|chunk, off| file.write_at(chunk, off), buf, offset, "write")?;
+        checkpoint_or_abort(cx)
+    }
+
+    /// Attempt to satisfy a read directly from the active read-only database
+    /// memory mapping (`PRAGMA mmap_size`). Returns `Ok(None)` immediately when
+    /// mapping is disabled (`limit == 0`) or falls back cleanly when the range
+    /// lies outside the mapped prefix.
+    pub(crate) fn try_read_via_mmap(
+        &self,
+        cx: &Cx,
+        buf: &mut [u8],
+        offset: u64,
+    ) -> Result<Option<usize>> {
+        if self.mmap.configured_limit_bytes() == 0 {
+            return Ok(None);
+        }
+        checkpoint_or_abort(cx)?;
+        checked_io_range(offset, buf.len(), "read")?;
+        if self.closed {
+            return Err(FrankenError::internal("unix file is closed"));
+        }
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| FrankenError::internal("unix file is closed"))?;
+        if let Some(total) = self.mmap.try_read(file, buf, offset) {
+            checkpoint_or_abort_if_cancel_published(cx)?;
+            return Ok(Some(total));
+        }
+        Ok(None)
+    }
+
+    /// bd-j2dtf: an `immutable=1` open takes no locks at all, as stock's
+    /// immutable files do (opened like a temp file: `noLock`, no WAL).
+    fn takes_no_locks(&self) -> bool {
+        self.open_flags.contains(VfsOpenFlags::NO_LOCK)
+    }
+
+    /// A lock-free handle grants SHARED without touching the file. Anything
+    /// stronger would announce a writer, and an immutable file is never
+    /// written, so it is refused.
+    fn refuse_write_lock_without_locking(level: LockLevel) -> Result<()> {
+        if level > LockLevel::Shared {
+            return Err(FrankenError::ReadOnly);
+        }
+        Ok(())
+    }
+
     /// A never-mapped handle still shares POSIX ownership with sibling SHM
     /// users. Inspect an existing registration without creating or joining it.
     /// No SHM/table guard survives this method or overlaps the inode mutex.
@@ -2363,6 +2952,7 @@ impl UnixFile {
             }
             if info.n_reserved == 1 {
                 posix_unlock(&*info.file, RESERVED_BYTE, 1)?;
+                info.reserved_by_attempt = false;
             }
             info.n_reserved -= 1;
             *lock_level = LockLevel::Shared;
@@ -2900,7 +3490,10 @@ impl UnixFile {
         regions: &HashMap<u32, ShmRegion>,
         file: &File,
     ) {
-        warn!(
+        // bd-cdgfp: a Busy slot attempt is routine contention that its caller
+        // retries inside the busy budget, so this is a DEBUG event. At WARN,
+        // every retry of a contended COMMIT wrote a line.
+        tracing::debug!(
             slot,
             lock_byte = wal_lock_byte(slot),
             requested_mode,
@@ -3630,6 +4223,8 @@ impl UnixFile {
             external_shared_snapshot_attempt: None,
             external_maintenance_attempt: None,
             external_append_attempt: None,
+            main_lock_refused_by_local_transaction: false,
+            external_append_blocked_by_local_transaction: false,
             delete_on_close: false,
             closed: false,
             inode_key: self.inode_key,
@@ -3638,7 +4233,9 @@ impl UnixFile {
             shm_path: self.shm_path.clone(),
             shm_info: Some(Arc::clone(shm_info)),
             shm_dms_lifetime_claim: false,
+            private_reader_shm: None,
             busy_timeout_ms: self.busy_timeout_ms,
+            mmap: UnixMmapController::new(),
         };
         let acquire = {
             let mut info = shm_info
@@ -3677,6 +4274,9 @@ impl UnixFile {
             external_shared_snapshot_attempt: self.external_shared_snapshot_attempt.take(),
             external_maintenance_attempt: self.external_maintenance_attempt.take(),
             external_append_attempt: self.external_append_attempt.take(),
+            main_lock_refused_by_local_transaction: self.main_lock_refused_by_local_transaction,
+            external_append_blocked_by_local_transaction: self
+                .external_append_blocked_by_local_transaction,
             delete_on_close: self.delete_on_close,
             closed: false,
             inode_key: self.inode_key,
@@ -3685,7 +4285,9 @@ impl UnixFile {
             shm_path: std::mem::take(&mut self.shm_path),
             shm_info: self.shm_info.take(),
             shm_dms_lifetime_claim: self.shm_dms_lifetime_claim,
+            private_reader_shm: self.private_reader_shm.take(),
             busy_timeout_ms: self.busy_timeout_ms,
+            mmap: UnixMmapController::new(),
         };
 
         self.lock_level = LockLevel::None;
@@ -3720,6 +4322,8 @@ impl UnixFile {
             external_shared_snapshot_attempt: None,
             external_maintenance_attempt: None,
             external_append_attempt: None,
+            main_lock_refused_by_local_transaction: false,
+            external_append_blocked_by_local_transaction: false,
             delete_on_close: false,
             closed: false,
             inode_key: self.inode_key,
@@ -3728,7 +4332,9 @@ impl UnixFile {
             shm_path: self.shm_path.clone(),
             shm_info: None,
             shm_dms_lifetime_claim: false,
+            private_reader_shm: None,
             busy_timeout_ms: 0,
+            mmap: UnixMmapController::new(),
         })
     }
 }
@@ -3909,6 +4515,10 @@ impl VfsFile for UnixFile {
             info.n_ref = info.n_ref.saturating_sub(1);
         }
 
+        // Unmap any active ordinary database file mapping before closing so the
+        // OS VMA lifetime is strictly bounded by handle lifetime (bd-dwjnq.3).
+        self.mmap.unmap_all();
+
         if self.delete_on_close {
             drop(fs::remove_file(&self.path));
         }
@@ -3953,7 +4563,20 @@ impl VfsFile for UnixFile {
         Ok(Some(live))
     }
 
+    fn positional_reader(&self) -> Option<Arc<File>> {
+        if self.closed {
+            return None;
+        }
+        self.file.as_ref().map(Arc::clone)
+    }
+
     async fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        if buf.len() <= INLINE_IO_MAX_BYTES {
+            return self.read_at_sync(cx, buf, offset);
+        }
+        if let Some(total) = self.try_read_via_mmap(cx, buf, offset)? {
+            return Ok(total);
+        }
         checkpoint_or_abort(cx)?;
         checked_io_range(offset, buf.len(), "read")?;
         let file = Arc::clone(
@@ -3961,20 +4584,6 @@ impl VfsFile for UnixFile {
                 .as_ref()
                 .ok_or_else(|| FrankenError::internal("unix file is closed"))?,
         );
-        // A bounded pread directly into the caller's buffer costs ~1.5us
-        // where the blocking-pool round-trip costs ~14us. Semantics preserved
-        // exactly: EINTR retried in place, zero-filled tail on short read,
-        // actual total returned.
-        if buf.len() <= INLINE_IO_MAX_BYTES {
-            let total = read_full_at(|chunk, off| file.read_at(chunk, off), buf, offset, "read")?;
-            buf[total..].fill(0);
-            // bd-w4pr1.13.18: the full checkpoint above ran a pread ago, and
-            // nothing waited since. Only a cancellation published meanwhile
-            // can be new; a deadline or budget that ran out during the pread
-            // is seen at the caller's next checkpoint.
-            checkpoint_or_abort_if_cancel_published(cx)?;
-            return Ok(total);
-        }
         let requested = buf.len();
         let (data, total) = spawn_blocking_io(move || read_owned_at(file, requested, offset))
             .await
@@ -3985,6 +4594,9 @@ impl VfsFile for UnixFile {
     }
 
     async fn write(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+        if buf.len() <= INLINE_IO_MAX_BYTES {
+            return self.write_at_sync(cx, buf, offset);
+        }
         checkpoint_or_abort(cx)?;
         checked_io_range(offset, buf.len(), "write")?;
         let file = Arc::clone(
@@ -3992,10 +4604,6 @@ impl VfsFile for UnixFile {
                 .as_ref()
                 .ok_or_else(|| FrankenError::internal("unix file is closed"))?,
         );
-        if buf.len() <= INLINE_IO_MAX_BYTES {
-            write_full_at(|chunk, off| file.write_at(chunk, off), buf, offset, "write")?;
-            return checkpoint_or_abort(cx);
-        }
         let data = buf.to_vec();
         spawn_blocking_io(move || write_owned_at(file, data, offset))
             .await
@@ -4170,12 +4778,18 @@ impl VfsFile for UnixFile {
     }
 
     fn truncate(&mut self, _cx: &Cx, size: u64) -> Result<()> {
+        // Unmap before shrinking the file so no active mapping extends past
+        // the truncated EOF (preventing SIGBUS on subsequent reads).
+        self.mmap.prepare_for_truncate();
         self.file_ref().set_len(size).map_err(FrankenError::Io)?;
+        if let Some(file) = self.file.as_ref() {
+            self.mmap.refresh_after_truncate(file, size);
+        }
         Ok(())
     }
 
     fn sync(&mut self, _cx: &Cx, flags: SyncFlags) -> Result<()> {
-        if flags.contains(SyncFlags::DATAONLY) {
+        if sync_writes_data_only(flags.contains(SyncFlags::DATAONLY)) {
             self.file_ref().sync_data().map_err(FrankenError::Io)
         } else {
             self.file_ref().sync_all().map_err(FrankenError::Io)
@@ -4198,11 +4812,10 @@ impl VfsFile for UnixFile {
             return Err(FrankenError::Io(std::io::Error::last_os_error()));
         }
 
-        match kind {
-            SyncKind::DataOnly => self.file_ref().sync_data().map_err(FrankenError::Io),
-            SyncKind::DataAndMetadata | SyncKind::FullDurable => {
-                self.file_ref().sync_all().map_err(FrankenError::Io)
-            }
+        if sync_writes_data_only(kind == SyncKind::DataOnly) {
+            self.file_ref().sync_data().map_err(FrankenError::Io)
+        } else {
+            self.file_ref().sync_all().map_err(FrankenError::Io)
         }
     }
 
@@ -4213,12 +4826,17 @@ impl VfsFile for UnixFile {
 
     fn lock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
         checkpoint_or_abort_if_cancel_published(cx)?;
+        self.main_lock_refused_by_local_transaction = false;
+        if self.takes_no_locks() {
+            return Self::refuse_write_lock_without_locking(level);
+        }
         let timeout = Duration::from_millis(self.busy_timeout_ms);
         let prior_level = self.lock_level;
         let mut wait_started = None;
         let mut backoff = Duration::from_millis(1);
         loop {
             let mut native_contention = None;
+            let mut refused_by_local_transaction = false;
             // The first attempt follows the entry check with no wait between
             // them. Every retry follows a backoff sleep and takes the full
             // checkpoint.
@@ -4368,6 +4986,7 @@ impl VfsFile for UnixFile {
                 if self.lock_level < LockLevel::Reserved && level >= LockLevel::Reserved {
                     if info.n_reserved > 0 {
                         // Another handle in this process already holds RESERVED.
+                        refused_by_local_transaction = !info.reserved_by_attempt;
                         return Self::return_after_main_lock_failure(
                             &mut info,
                             &mut self.lock_level,
@@ -4408,6 +5027,8 @@ impl VfsFile for UnixFile {
                         }
                     }
                     info.n_reserved = next_reserved;
+                    info.reserved_by_attempt = self.external_append_attempt.is_some()
+                        || self.external_maintenance_attempt.is_some();
                     self.lock_level = LockLevel::Reserved;
                 }
 
@@ -4519,6 +5140,8 @@ impl VfsFile for UnixFile {
                 // Local owners must run on their executor to make progress. A
                 // synchronous VFS wait here would prevent that handoff. All
                 // partial acquisition/error cleanup above retains its exact owner.
+                self.main_lock_refused_by_local_transaction =
+                    refused_by_local_transaction && matches!(error, FrankenError::Busy);
                 return Err(error);
             };
             debug_assert!(matches!(error, FrankenError::Busy));
@@ -4558,7 +5181,9 @@ impl VfsFile for UnixFile {
     }
 
     fn unlock(&mut self, _cx: &Cx, level: LockLevel) -> Result<()> {
-        if level >= self.lock_level && !self.transient_shared_pending_gate {
+        if self.takes_no_locks()
+            || (level >= self.lock_level && !self.transient_shared_pending_gate)
+        {
             return Ok(());
         }
 
@@ -4576,6 +5201,9 @@ impl VfsFile for UnixFile {
     }
 
     fn lock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+        if self.takes_no_locks() {
+            return checkpoint_or_abort_if_cancel_published(cx);
+        }
         if self.external_append_attempt.is_some() {
             return Err(FrankenError::internal(
                 "cannot acquire a Unix snapshot inside a WAL append attempt",
@@ -4600,6 +5228,9 @@ impl VfsFile for UnixFile {
     }
 
     fn restore_external_shared_snapshot_attempt(&mut self, _cx: &Cx) -> Result<()> {
+        if self.takes_no_locks() {
+            return Ok(());
+        }
         if self.external_append_attempt.is_some() {
             return Err(FrankenError::internal(
                 "restore the Unix WAL append attempt before its enclosing snapshot",
@@ -4624,6 +5255,9 @@ impl VfsFile for UnixFile {
 
     fn lock_external_wal_append(&mut self, cx: &Cx) -> Result<()> {
         checkpoint_or_abort(cx)?;
+        if self.takes_no_locks() {
+            return Err(FrankenError::ReadOnly);
+        }
         if self.external_append_attempt.is_some() || self.external_maintenance_attempt.is_some() {
             return Err(FrankenError::internal(
                 "Unix WAL append cannot overlap another append or maintenance attempt",
@@ -4640,7 +5274,12 @@ impl VfsFile for UnixFile {
         // Concurrent commits use the same main-before-WAL order as
         // IMMEDIATE transactions and every maintenance/checkpoint path.
         // Waiting here must leave WRITE available to the RESERVED owner.
-        self.lock(cx, LockLevel::Reserved)?;
+        self.external_append_blocked_by_local_transaction = false;
+        if let Err(error) = self.lock(cx, LockLevel::Reserved) {
+            self.external_append_blocked_by_local_transaction =
+                self.main_lock_refused_by_local_transaction;
+            return Err(error);
+        }
         if self.acquire_external_wal_slot(cx, WAL_WRITE_LOCK)?
             && let Some(attempt) = self.external_append_attempt.as_mut()
         {
@@ -4651,6 +5290,10 @@ impl VfsFile for UnixFile {
             .expect("successful append acquisition retains its exact attempt")
             .acquisition_complete = true;
         Ok(())
+    }
+
+    fn external_wal_append_blocked_by_local_transaction(&self) -> bool {
+        self.external_append_blocked_by_local_transaction
     }
 
     fn owns_external_wal_append_write(&self, cx: &Cx) -> Result<bool> {
@@ -4760,10 +5403,16 @@ impl VfsFile for UnixFile {
     }
 
     fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
+        if self.takes_no_locks() {
+            return Err(FrankenError::ReadOnly);
+        }
         self.acquire_external_maintenance_fence(cx, wal_mode, LockLevel::Exclusive, false)
     }
 
     fn lock_external_wal_checkpoint(&mut self, cx: &Cx) -> Result<()> {
+        if self.takes_no_locks() {
+            return Err(FrankenError::ReadOnly);
+        }
         // FrankenSQLite appends under the main-file RESERVED byte; stock
         // SQLite appends under WAL_WRITE_LOCK. Hold both, plus CKPT, while
         // allowing foreign idle WAL-lifetime SHARED claims. The caller must
@@ -4773,6 +5422,9 @@ impl VfsFile for UnixFile {
 
     fn lock_external_wal_recovery(&mut self, cx: &Cx) -> Result<()> {
         checkpoint_or_abort(cx)?;
+        if self.takes_no_locks() {
+            return Err(FrankenError::ReadOnly);
+        }
         // A database this process cannot write has only a read-only canonical
         // descriptor, and a POSIX write lock on one fails with EBADF, so its
         // reader recovers under SHARED, as stock's walIndexRecover always
@@ -4911,12 +5563,15 @@ impl VfsFile for UnixFile {
     }
 
     fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
-        // F_GETLK never reports classic fcntl locks owned by this process.
-        // Consult the coalesced inode state first so a different connection in
-        // this process observes RESERVED, PENDING, or EXCLUSIVE exactly as
-        // SQLite's xCheckReservedLock contract requires. Keep the inode mutex
-        // through F_GETLK so a local writer cannot enter the gap between the
-        // process-local and kernel-level checks.
+        if self.takes_no_locks() {
+            return Ok(false);
+        }
+        // A kernel query ignores locks owned by its own OFD (or process on
+        // classic platforms). Consult the coalesced inode state first so a
+        // sibling connection observes RESERVED, PENDING, or EXCLUSIVE exactly
+        // as SQLite's xCheckReservedLock contract requires. Keep the inode
+        // mutex through the query so a local writer cannot enter the gap
+        // between the logical-owner and kernel-level checks.
         let inode_info = Arc::clone(self.inode_info_ref());
         let info = inode_info
             .lock()
@@ -4942,6 +5597,9 @@ impl VfsFile for UnixFile {
     }
 
     fn claim_wal_lifetime_before_join(&mut self, cx: &Cx) -> Result<bool> {
+        if self.takes_no_locks() {
+            return Ok(false);
+        }
         if self.wal_lifetime_claim == WalLifetimeClaim::Held {
             return Ok(true);
         }
@@ -4977,6 +5635,11 @@ impl VfsFile for UnixFile {
         use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
         checkpoint_or_abort(cx)?;
+        if self.takes_no_locks() {
+            return Err(FrankenError::CannotOpen {
+                path: self.shm_path.clone(),
+            });
+        }
         if self.closed || !self.open_flags.contains(VfsOpenFlags::MAIN_DB) {
             return Err(FrankenError::Unsupported);
         }
@@ -5141,6 +5804,11 @@ impl VfsFile for UnixFile {
         size: u32,
         extend: bool,
     ) -> Result<crate::shm::ShmRegion> {
+        if self.takes_no_locks() {
+            return Err(FrankenError::CannotOpen {
+                path: self.shm_path.clone(),
+            });
+        }
         if size == 0 {
             return Err(FrankenError::LockFailed {
                 detail: "shm_map size must be > 0".to_string(),
@@ -5226,7 +5894,8 @@ impl VfsFile for UnixFile {
         let mut info = shm_info
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let fd = info.file.as_raw_fd();
+        // Never the locking description (`shm_mapping_description`).
+        let fd = info.map_file.as_raw_fd();
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -5264,6 +5933,11 @@ impl VfsFile for UnixFile {
     }
 
     fn shm_lock(&mut self, cx: &Cx, offset: u32, n: u32, flags: u32) -> Result<()> {
+        if self.takes_no_locks() {
+            return Err(FrankenError::CannotOpen {
+                path: self.shm_path.clone(),
+            });
+        }
         Self::validate_shm_request(offset, n)?;
         let lock_requested = flags & SQLITE_SHM_LOCK != 0;
         let unlock_requested = flags & SQLITE_SHM_UNLOCK != 0;
@@ -5434,6 +6108,54 @@ impl VfsFile for UnixFile {
         self.shm_lock(cx, lock_slot, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED)
     }
 
+    fn wal_private_reader_claim_acquire(&mut self, cx: &Cx) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        if self.private_reader_shm.is_some() {
+            return Err(FrankenError::internal(
+                "private-index WAL reader claim is already held",
+            ));
+        }
+        let lock_byte = wal_lock_byte(wal_reader_lock_slot(0)?)
+            .ok_or_else(|| FrankenError::internal("WAL_READ_LOCK(0) has no lock byte"))?;
+        // Stock's unixOpenSharedMemory read-only fallback: never create the
+        // file, never ask for write access.
+        let shm = OpenOptions::new().read(true).open(&self.shm_path)?;
+        // The same busy budget as a shared reader slot (walTryBeginRead).
+        let budget = Duration::from_millis(self.busy_timeout_ms.max(WAL_READER_SLOT_MIN_BUDGET_MS));
+        let started = Instant::now();
+        let mut backoff = Duration::from_millis(1);
+        loop {
+            checkpoint_or_abort(cx)?;
+            if posix_lock(&shm, libc::F_RDLCK, lock_byte, 1)? {
+                self.private_reader_shm = Some(shm);
+                return Ok(());
+            }
+            let remaining = budget.saturating_sub(started.elapsed());
+            let remaining = cx
+                .busy_wait_budget()
+                .map_or(remaining, |shared| remaining.min(shared.remaining()));
+            if remaining.is_zero() {
+                return Err(FrankenError::Busy);
+            }
+            std::thread::sleep(backoff.min(remaining));
+            backoff = (backoff * 2).min(WAL_READER_SLOT_MAX_BACKOFF);
+        }
+    }
+
+    fn wal_private_reader_claim_release(&mut self, cx: &Cx) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        let Some(shm) = self.private_reader_shm.as_ref() else {
+            return Ok(());
+        };
+        let lock_byte = wal_lock_byte(wal_reader_lock_slot(0)?)
+            .ok_or_else(|| FrankenError::internal("WAL_READ_LOCK(0) has no lock byte"))?;
+        // Unlock before the descriptor closes; a failed unlock keeps the
+        // descriptor (and so the claim) for the retry.
+        posix_unlock(shm, lock_byte, 1)?;
+        self.private_reader_shm = None;
+        Ok(())
+    }
+
     fn wal_checkpoint_backfill_gate_acquire(&mut self, cx: &Cx) -> Result<bool> {
         checkpoint_or_abort(cx)?;
         match self.acquire_checkpoint_reader_slot(cx, 0) {
@@ -5532,6 +6254,38 @@ impl VfsFile for UnixFile {
 
     fn set_busy_timeout_ms(&mut self, ms: u64) {
         self.busy_timeout_ms = ms;
+    }
+
+    fn set_mmap_size(&self, cx: &Cx, limit_bytes: u64) -> Result<VfsMmapStatus> {
+        // Disabling mmap (0) is a resource teardown that must always release
+        // the OS VMA even if the caller's Cx is already cancelled (e.g., during
+        // Connection::close_in_place after releasing the runtime region).
+        if limit_bytes == 0 || self.closed {
+            self.mmap.unmap_all();
+            return Ok(self.mmap.status());
+        }
+        checkpoint_or_abort(cx)?;
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| FrankenError::internal("unix file is closed"))?;
+        Ok(self.mmap.configure(file, limit_bytes))
+    }
+
+    fn mmap_status(&self) -> VfsMmapStatus {
+        self.mmap.status()
+    }
+
+    fn read_only_mmap_view(&self) -> Option<ReadOnlyMmapView> {
+        if self.closed {
+            return None;
+        }
+        self.mmap.read_only_view()
+    }
+
+    fn inject_mmap_failure(&self, remaining_failures: u64) -> Result<()> {
+        self.mmap.inject_failure(remaining_failures);
+        Ok(())
     }
 }
 
@@ -5667,6 +6421,7 @@ impl UnixFile {
 
 impl Drop for UnixFile {
     fn drop(&mut self) {
+        self.mmap.unmap_all();
         if !self.closed {
             let cx = Cx::new();
             if let Err(error) = self.close(&cx) {
@@ -7651,6 +8406,15 @@ mod tests {
                         } else {
                             result.expect("try-once may succeed when the main fence is free");
                         }
+                        if operation == "append" {
+                            // bd-mc5pp: RESERVED is held by the parent process,
+                            // so a refusal here is native, never a local
+                            // transaction.
+                            assert!(
+                                !file.external_wal_append_blocked_by_local_transaction(),
+                                "a refusal by another process is not a local transaction's"
+                            );
+                        }
                         assert_eq!(file.busy_timeout_ms, 10_000, "preserve configured policy");
                         RESERVED_LOCK_WAIT_OBSERVER.with(|slot| {
                             assert!(slot.borrow_mut().take().is_some());
@@ -7802,6 +8566,73 @@ mod tests {
         file.close(&cx).unwrap();
     }
 
+    /// bd-mc5pp: an append refused at RESERVED is classified by the holder's
+    /// kind, both ways. A sibling holding RESERVED for its own append attempt
+    /// is not a local transaction, so the flush keeps waiting for it; a sibling
+    /// holding RESERVED as a transaction-level lock is, so the flush fails its
+    /// epoch. The inode records the kind with the claim and clears it with the
+    /// claim, and an attempt that finds RESERVED already held does not relabel
+    /// it.
+    #[test]
+    fn bd_mc5pp_append_refusal_is_classified_by_reserved_holder_kind() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("wal-append-holder-kind.db");
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let (mut peer, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let reserved_kind = |handle: &UnixFile| {
+            let info = handle.inode_info_ref().lock().unwrap();
+            (info.n_reserved, info.reserved_by_attempt)
+        };
+        file.lock_external_shared_snapshot(&cx).unwrap();
+
+        // The sibling holds RESERVED only for its own append window.
+        peer.lock_external_wal_append(&cx).expect("sibling append");
+        assert_eq!(reserved_kind(&peer), (1, true));
+        assert!(matches!(
+            file.lock_external_wal_append(&cx),
+            Err(FrankenError::Busy)
+        ));
+        assert!(
+            !file.external_wal_append_blocked_by_local_transaction(),
+            "a sibling's append window is not a transaction-level lock"
+        );
+        file.restore_external_wal_append_attempt(&cx).unwrap();
+        peer.restore_external_wal_append_attempt(&cx).unwrap();
+        assert_eq!(
+            reserved_kind(&peer),
+            (0, false),
+            "the kind leaves with the claim"
+        );
+
+        // The sibling holds RESERVED as a transaction-level lock.
+        peer.lock(&cx, LockLevel::Reserved).unwrap();
+        assert_eq!(reserved_kind(&peer), (1, false));
+        assert!(matches!(
+            file.lock_external_wal_append(&cx),
+            Err(FrankenError::Busy)
+        ));
+        assert!(
+            file.external_wal_append_blocked_by_local_transaction(),
+            "a sibling's transaction-level RESERVED blocks the append"
+        );
+        file.restore_external_wal_append_attempt(&cx).unwrap();
+        // The holder's own append finds RESERVED already held and keeps its kind.
+        peer.lock_external_wal_append(&cx)
+            .expect("holder's own append");
+        assert_eq!(reserved_kind(&peer), (1, false));
+        peer.restore_external_wal_append_attempt(&cx).unwrap();
+        assert_eq!(peer.lock_level, LockLevel::Reserved);
+
+        peer.unlock(&cx, LockLevel::None).unwrap();
+        assert_eq!(reserved_kind(&peer), (0, false));
+        file.lock_external_wal_append(&cx)
+            .expect("append once the sibling released RESERVED");
+        assert!(!file.external_wal_append_blocked_by_local_transaction());
+        file.restore_external_wal_append_attempt(&cx).unwrap();
+        peer.close(&cx).unwrap();
+    }
+
     #[test]
     fn wal_append_partial_acquisition_and_deferred_close_preserve_owners() {
         let cx = Cx::new();
@@ -7832,6 +8663,10 @@ mod tests {
             file.lock_external_wal_append(&cx),
             Err(FrankenError::Busy)
         ));
+        assert!(
+            !file.external_wal_append_blocked_by_local_transaction(),
+            "bd-mc5pp: a sibling's WAL WRITE slot is not a transaction-level lock"
+        );
         let refused = file
             .external_append_attempt
             .expect("retain refused attempt");
@@ -7864,6 +8699,10 @@ mod tests {
             file.lock_external_wal_append(&cx),
             Err(FrankenError::Busy)
         ));
+        assert!(
+            file.external_wal_append_blocked_by_local_transaction(),
+            "bd-mc5pp: a sibling's transaction-level RESERVED blocks the append"
+        );
         assert!(!file.external_append_attempt.unwrap().write_acquired);
         assert!(
             !file.owns_external_wal_append_write(&cx).unwrap(),
@@ -7890,6 +8729,10 @@ mod tests {
         peer.close(&cx).unwrap();
         file.lock_external_wal_append(&cx)
             .expect("retry after blocker leaves");
+        assert!(
+            !file.external_wal_append_blocked_by_local_transaction(),
+            "a successful append clears the classification"
+        );
 
         let inode = Arc::clone(file.inode_info_ref());
         let mut deferred = file.take_for_deferred_cleanup();
@@ -9493,6 +10336,46 @@ mod tests {
         file.close(&cx).unwrap();
     }
 
+    /// bd-w4pr1.7 lever S: on Linux every file sync is `fdatasync`, as stock
+    /// SQLite's `unixSync` is there; elsewhere only a data-only request is.
+    /// The syncs must still succeed for every flag and kind, then a directory
+    /// sync, on a grown file whose new size a reopen must read back.
+    #[test]
+    fn test_unix_vfs_sync_calls_match_stock_sqlite_on_linux() {
+        assert!(super::sync_writes_data_only(true));
+        assert_eq!(
+            super::sync_writes_data_only(false),
+            cfg!(target_os = "linux"),
+            "a non-data-only sync is fdatasync exactly on Linux"
+        );
+
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("sync_kinds.db");
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        file.write(&cx, &[0x5a; 4096], 0).unwrap();
+        for kind in [
+            SyncKind::DataOnly,
+            SyncKind::DataAndMetadata,
+            SyncKind::FullDurable,
+        ] {
+            file.durable_sync(&cx, kind).unwrap();
+        }
+        file.write(&cx, &[0xa5; 4096], 4096).unwrap();
+        file.sync(&cx, SyncFlags::FULL).unwrap();
+        vfs.sync_parent_directory(&cx, &path).unwrap();
+        file.close(&cx).unwrap();
+
+        let (reopened, _) = vfs
+            .open(
+                &cx,
+                Some(&path),
+                VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB,
+            )
+            .unwrap();
+        assert_eq!(reopened.file_size(&cx).unwrap(), 8192);
+    }
+
     #[test]
     fn test_unix_vfs_delete_on_close() {
         let cx = Cx::new();
@@ -10953,8 +11836,8 @@ mod tests {
             ForeignWalParticipation::NoParticipant
         );
 
-        // Once this process registers the inode, its own locks are invisible
-        // to F_GETLK, so the probe must not claim a verdict.
+        // Once this VFS registers the inode, a separate descriptor cannot
+        // distinguish its own participation from a peer on every platform.
         let cx = Cx::new();
         let vfs = UnixVfs::new();
         let (mut file, _) = vfs
@@ -10973,7 +11856,7 @@ mod tests {
     }
 
     /// A classic per-process `F_SETLK`/`F_GETLK` request, as stock SQLite
-    /// issues on Linux and macOS (this VFS uses OFD locks on macOS).
+    /// issues on Linux and macOS (this VFS uses OFD locks on both).
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     fn classic_flock(lock_type: impl Into<i32>, start: u64, len: u64) -> libc::flock {
@@ -11099,7 +11982,7 @@ mod tests {
         file.close(&cx).unwrap();
     }
 
-    /// GH #343 / bd-qll76: on a local filesystem (Linux `F_SETLK`, Darwin
+    /// GH #343 / bd-qll76: on a local filesystem (Linux/Darwin
     /// `F_OFD_SETLK`) byte-range locking succeeds, so the whole-file `flock(2)`
     /// fallback is never taken and the handle reports no downgrade. This pins
     /// the accessor plumbing end-to-end for the non-degraded case (the degraded
@@ -12188,8 +13071,37 @@ mod tests {
         assert!(!inode.lock().unwrap().has_lock_claims());
     }
 
+    /// bd-crqlt: the deferred-cleanup queue is process-wide, and every
+    /// `UnixVfs::open` first runs `retry_deferred_unix_cleanups`, which takes
+    /// the whole queue, closes each owner without the mutex and re-queues the
+    /// failures. An `open` in a parallel test therefore hides this test's
+    /// owner while the test looks for it. The body runs in a child process of
+    /// this test binary, filtered to this test alone, so no other test opens
+    /// a file meanwhile.
     #[test]
     fn shm_mapping_drop_retains_failed_main_lifetime_cleanup_for_exact_retry() {
+        const CHILD_ENV: &str = "FSQLITE_BD_CRQLT_CHILD";
+        const TEST: &str =
+            "unix::tests::shm_mapping_drop_retains_failed_main_lifetime_cleanup_for_exact_retry";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            shm_mapping_drop_cleanup_retry_body();
+            return;
+        }
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([TEST, "--exact", "--test-threads=1", "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("run the isolated cleanup-retry child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "isolated cleanup-retry child failed: {}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn shm_mapping_drop_cleanup_retry_body() {
         let cx = Cx::new();
         let vfs = UnixVfs::new();
         let (_dir, path) = make_temp_path("shm-mapping-cleanup-retry.db");
@@ -12306,6 +13218,115 @@ mod tests {
         reader.shm_unmap(&cx, true).unwrap();
         writer.close(&cx).unwrap();
         reader.close(&cx).unwrap();
+    }
+
+    /// bd-cdgfp: a Busy SHM slot attempt is routine contention, retried by its
+    /// caller inside the busy budget, so its conflict line is a DEBUG event.
+    /// Red on main, where every such retry logged at WARN. Negative: the
+    /// conflict line itself is still emitted (lowered, not removed), and the
+    /// attempt still answers Busy.
+    #[test]
+    fn bd_cdgfp_busy_shm_slot_conflict_logs_at_debug_not_warn() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        #[derive(Clone, Default)]
+        struct Events(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Events {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut message = Message(String::new());
+                event.record(&mut message);
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((*event.metadata().level(), message.0));
+            }
+        }
+
+        let events = Events::default();
+        let subscriber = tracing_subscriber::registry().with(events.clone());
+        let busy = tracing::subscriber::with_default(subscriber, || {
+            let cx = Cx::new();
+            let vfs = UnixVfs::new();
+            let (_dir, path) = make_temp_path("bd_cdgfp_conflict.db");
+            let (mut writer, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+            let (mut peer, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+            writer.write(&cx, b"x", 0).unwrap();
+            let _w_region = writer.shm_map(&cx, 0, 32768, true).unwrap();
+            let _p_region = peer.shm_map(&cx, 0, 32768, true).unwrap();
+            writer
+                .shm_lock(
+                    &cx,
+                    WAL_WRITE_LOCK,
+                    1,
+                    SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+                )
+                .unwrap();
+            // A callsite's interest is process-global. In a parallel run,
+            // another test can hit the conflict callsite first, with no
+            // subscriber alive, and cache it as "never" while this test
+            // installs its own, so the asserted event is never delivered.
+            // Hit the callsite once so it is registered, then rebuild every
+            // callsite's interest under this subscriber, and assert on the
+            // attempt after that.
+            let warm_up = peer.shm_lock(
+                &cx,
+                WAL_WRITE_LOCK,
+                1,
+                SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+            );
+            assert!(
+                matches!(warm_up, Err(FrankenError::Busy)),
+                "the warm-up attempt must answer Busy, got {warm_up:?}"
+            );
+            tracing::callsite::rebuild_interest_cache();
+            events.0.lock().unwrap().clear();
+            let busy = peer.shm_lock(
+                &cx,
+                WAL_WRITE_LOCK,
+                1,
+                SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+            );
+            writer
+                .shm_lock(
+                    &cx,
+                    WAL_WRITE_LOCK,
+                    1,
+                    SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+                )
+                .unwrap();
+            busy
+        });
+        assert!(
+            matches!(busy, Err(FrankenError::Busy)),
+            "the contended slot attempt must still answer Busy, got {busy:?}"
+        );
+        let events = events.0.lock().unwrap().clone();
+        let conflicts: Vec<_> = events
+            .iter()
+            .filter(|(_, message)| message.contains("legacy shm lock protocol conflict"))
+            .collect();
+        assert!(
+            !conflicts.is_empty(),
+            "negative: the conflict must still be logged, at DEBUG; events: {events:?}"
+        );
+        assert!(
+            conflicts
+                .iter()
+                .all(|(level, _)| *level == tracing::Level::DEBUG),
+            "a routine Busy retry must not log above DEBUG: {conflicts:?}"
+        );
     }
 
     #[test]
@@ -12696,5 +13717,94 @@ mod tests {
         let mut buf = vec![0_u8; 4096];
         assert_eq!(file.read(&cx, &mut buf, 0).unwrap(), 4096);
         assert_eq!(buf, payload);
+    }
+
+    #[test]
+    fn test_unix_file_mmap_admission_growth_truncate_fault_and_close() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("mmap-lifecycle.db");
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+
+        // Default is disabled (`configured_limit_bytes == 0`, `mapped_bytes == 0`).
+        let initial = file.mmap_status();
+        assert!(initial.supported);
+        assert_eq!(initial.configured_limit_bytes, 0);
+        assert_eq!(initial.mapped_bytes, 0);
+
+        // Write 3 x 4096-byte pages with distinct patterns.
+        let p0 = vec![0x11_u8; 4096];
+        let p1 = vec![0x22_u8; 4096];
+        let p2 = vec![0x33_u8; 4096];
+        file.write(&cx, &p0, 0).unwrap();
+        file.write(&cx, &p1, 4096).unwrap();
+        file.write(&cx, &p2, 8192).unwrap();
+
+        // Small cap (4096): maps only the first 4096 bytes; page 0 hits mmap,
+        // page 1 falls back cleanly to pread.
+        let s_small = file.set_mmap_size(&cx, 4096).unwrap();
+        assert_eq!(s_small.configured_limit_bytes, 4096);
+        assert_eq!(s_small.mapped_bytes, 4096);
+        assert!(s_small.is_active());
+
+        let mut buf = vec![0_u8; 4096];
+        assert_eq!(file.read(&cx, &mut buf, 0).unwrap(), 4096);
+        assert_eq!(buf, p0);
+        assert_eq!(file.mmap_status().mmap_read_hits, 1);
+
+        assert_eq!(file.read(&cx, &mut buf, 4096).unwrap(), 4096);
+        assert_eq!(buf, p1);
+        assert_eq!(file.mmap_status().pread_fallbacks, 1);
+
+        // Large cap (65536): maps full 12288-byte file, then grows dynamically to 16384.
+        let s_large = file.set_mmap_size(&cx, 65_536).unwrap();
+        assert_eq!(s_large.mapped_bytes, 12_288);
+        assert!(s_large.unmap_count >= 1);
+        let p3 = vec![0x44_u8; 4096];
+        file.write(&cx, &p3, 12_288).unwrap();
+        assert_eq!(file.read(&cx, &mut buf, 12_288).unwrap(), 4096);
+        assert_eq!(buf, p3);
+        let s_grown = file.mmap_status();
+        assert_eq!(s_grown.mapped_bytes, 16_384);
+        assert!(s_grown.mmap_read_hits >= 2);
+
+        // Concurrent ReadOnlyMmapView serves page 2 cleanly.
+        let view = file.read_only_mmap_view().expect("active mmap view");
+        assert_eq!(view.len(), 16_384);
+        let mut view_buf = vec![0_u8; 4096];
+        assert!(view.read_exact_at(8192, &mut view_buf));
+        assert_eq!(view_buf, p2);
+        drop(view);
+
+        // Truncate shrinks mapping BEFORE set_len (no SIGBUS) and remaps to 8192.
+        file.truncate(&cx, 8192).unwrap();
+        let s_trunc = file.mmap_status();
+        assert_eq!(s_trunc.mapped_bytes, 8192);
+        assert_eq!(file.read(&cx, &mut buf, 4096).unwrap(), 4096);
+        assert_eq!(buf, p1);
+
+        // Unmap via 0, then verify mapping failure injection degrades cleanly
+        // to pread without error.
+        let s_zero = file.set_mmap_size(&cx, 0).unwrap();
+        assert_eq!(s_zero.mapped_bytes, 0);
+        assert_eq!(s_zero.configured_limit_bytes, 0);
+        file.inject_mmap_failure(1).unwrap();
+        let s_fail = file.set_mmap_size(&cx, 32_768).unwrap();
+        assert_eq!(s_fail.mapped_bytes, 0);
+        assert!(s_fail.map_failures >= 1);
+        let fallbacks_before = s_fail.pread_fallbacks;
+        assert_eq!(file.read(&cx, &mut buf, 0).unwrap(), 4096);
+        assert_eq!(buf, p0);
+        assert!(file.mmap_status().pread_fallbacks > fallbacks_before);
+
+        // Re-enable and then close: mapping must unmap before close returns.
+        let s_re = file.set_mmap_size(&cx, 32_768).unwrap();
+        assert_eq!(s_re.mapped_bytes, 8192);
+        let unmaps_before = s_re.unmap_count;
+        file.close(&cx).unwrap();
+        let s_closed = file.mmap_status();
+        assert_eq!(s_closed.mapped_bytes, 0);
+        assert_eq!(s_closed.configured_limit_bytes, 0);
+        assert!(s_closed.unmap_count > unmaps_before);
     }
 }

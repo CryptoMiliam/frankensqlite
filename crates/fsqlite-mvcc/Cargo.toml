@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-mvcc"
-version = "0.5.0"
+version = "0.5.1"
 description = "MVCC page-level versioning for concurrent writers"
 edition.workspace = true
 license-file.workspace = true
@@ -30,6 +30,7 @@ ebr-reclaim-test-support = []
 blake3 = { workspace = true }
 crc32c = { workspace = true }
 crossbeam-epoch = { workspace = true }
+foldhash = "0.2.0"
 fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
 fsqlite-observability = { workspace = true }

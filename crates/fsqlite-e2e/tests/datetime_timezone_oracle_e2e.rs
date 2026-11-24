@@ -73,7 +73,9 @@ async fn assert_scalar(queries: &[&str], label: &str) {
             (Ok(a), Err(e)) => {
                 mismatches.push(format!("CSQL_ERR: {q}\n  frank: {a:?}\n  csql: ERROR({e})"))
             }
-            (Err(_), Err(_)) => {}
+            (Err(a), Err(b)) => mismatches.push(format!(
+                "BOTH_ERR: {q}\n  frank: ERROR({a})\n  csql: ERROR({b})"
+            )),
         }
     }
     eprintln!(
@@ -87,6 +89,47 @@ async fn assert_scalar(queries: &[&str], label: &str) {
         mismatches.len(),
         mismatches.join("\n")
     );
+}
+
+/// Stock reads indexes backfilled and maintained by FrankenSQLite.
+#[test]
+fn hour_24_expression_indexes_match_stock_table_scans_after_reopen() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE events(id INTEGER PRIMARY KEY, stamp TEXT);
+                 INSERT INTO events VALUES (1,'2024-12-31 23:59'),(2,'2024-12-31 24:00');",
+            )
+            .unwrap();
+        let writer = Connection::open(path.to_str().unwrap()).await.unwrap();
+        writer
+            .execute_batch(
+                "CREATE INDEX by_day ON events(date(stamp));
+                 CREATE INDEX by_time ON events(datetime(stamp));
+                 INSERT INTO events VALUES (3,'2025-01-01 00:00'),(4,'2024-12-31 24:01');",
+            )
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+
+        let reader = rusqlite::Connection::open(&path).unwrap();
+        for (index, predicate) in [
+            ("by_day", "date(stamp)='2025-01-01'"),
+            ("by_time", "datetime(stamp)='2025-01-01 00:00:00'"),
+        ] {
+            for access in ["NOT INDEXED".to_owned(), format!("INDEXED BY {index}")] {
+                let sql = format!("SELECT id FROM events {access} WHERE {predicate} ORDER BY id");
+                assert_eq!(sqlite_rows(&reader, &sql).unwrap(), [["2"], ["3"]], "{sql}");
+            }
+        }
+        assert_eq!(
+            sqlite_rows(&reader, "PRAGMA integrity_check").unwrap(),
+            [["'ok'"]]
+        );
+    });
 }
 
 /// date.c parseYyyyMmDd / parseHhMmSs / parseTimezone: separators, hour 24,
@@ -111,6 +154,10 @@ fn time_string_grammar_matches_stock() {
                 "SELECT datetime('2024-01-01' || char(11))",
                 "SELECT datetime('2024-01-01 24:00')",
                 "SELECT datetime('2024-01-01 24:59:59')",
+                "SELECT datetime('24:00:01'), datetime('24:00:00.0000Z'), datetime('24:00:00.0001Z')",
+                "SELECT datetime('9999-12-30 24:00'), datetime('9999-12-31 24:00+01:00')",
+                "SELECT datetime('-0001-12-31 24:00'), datetime('-0000-12-31 24:00+01:00')",
+                "SELECT datetime('-4713-11-23 24:00-13:00'), datetime('-4713-11-24 24:00+14:00')",
                 "SELECT datetime('2024-01-01 25:00')",
                 "SELECT datetime('24:00')",
                 "SELECT time('24:00:00')",
@@ -192,6 +239,10 @@ fn floor_state_and_fields_as_written_match_stock() {
                 "SELECT date('2023-02-30', 'floor')",
                 "SELECT date('2023-02-30', 'ceiling')",
                 "SELECT date('2023-02-30 12:00+01:00', 'floor')",
+                "SELECT date('2023-02-30 24:00', 'floor'), date('2023-02-30 24:00+01:00', 'floor')",
+                "SELECT datetime('24:00', 'subsec', 'start of day'), datetime('24:00', '+0 days', 'start of day')",
+                "SELECT datetime('24:00-13:00', 'end of day'), datetime('24:00-13:00', 'weekday 6')",
+                "SELECT date('00:30+02:00', 'start of year'), datetime('23:00-03:00', 'weekday 0')",
                 "SELECT datetime('2023-02-30 12:00+01:00')",
                 "SELECT date('2023-02-30 12:00+01:00', 'subsec')",
                 "SELECT datetime('2024-02-30', 'subsec')",
@@ -305,6 +356,7 @@ const ZONE_QUERIES: &[&str] = &[
     "SELECT unixepoch('2024-06-15 12:00', 'utc')",
     "SELECT julianday('2024-06-15 12:00', 'localtime')",
     "SELECT time('12:00', 'localtime')",
+    "SELECT datetime('24:00Z','utc','start of day'), datetime('24:00+01:00','utc','start of day')",
     "SELECT date('2024-06-15', 'localtime', 'start of month')",
     "SELECT date('2024-01-31', '+1 month', 'localtime', 'floor')",
     "SELECT date('2024-01-31', '+1 month', 'utc', 'floor')",

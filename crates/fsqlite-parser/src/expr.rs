@@ -2067,6 +2067,18 @@ impl<'a> ParseMachine<'a> {
                 ParsedExpr::leaf(Expr::Literal(Literal::Blob(value), token_span))
             }
             TokenKind::KwNull => ParsedExpr::leaf(Expr::Literal(Literal::Null, token_span)),
+            TokenKind::KwTrue
+                if self.parser.at_kind(&TokenKind::Dot)
+                    || self.parser.at_kind(&TokenKind::LeftParen) =>
+            {
+                return self.identifier_or_function(Arc::<str>::from("true"), token_span, min_bp);
+            }
+            TokenKind::KwFalse
+                if self.parser.at_kind(&TokenKind::Dot)
+                    || self.parser.at_kind(&TokenKind::LeftParen) =>
+            {
+                return self.identifier_or_function(Arc::<str>::from("false"), token_span, min_bp);
+            }
             TokenKind::KwTrue => ParsedExpr::leaf(Expr::Literal(Literal::True, token_span)),
             TokenKind::KwFalse => ParsedExpr::leaf(Expr::Literal(Literal::False, token_span)),
             TokenKind::KwCurrentTime => {
@@ -2141,24 +2153,17 @@ impl<'a> ParseMachine<'a> {
                 return Ok(());
             }
             TokenKind::KwNot => {
-                if self.parser.eat_kind(&TokenKind::KwExists) {
-                    self.parser.expect_kind(&TokenKind::LeftParen)?;
-                    self.controls.push(ParseControl::ExistsDone {
-                        outer_min_bp: min_bp,
-                        not: true,
-                        start: token_span,
-                    });
-                    self.controls.push(ParseControl::SubqueryStart);
-                } else {
-                    self.controls.push(ParseControl::UnaryDone {
-                        outer_min_bp: min_bp,
-                        op: UnaryOp::Not,
-                        span: token_span,
-                    });
-                    self.controls.push(ParseControl::ExprStart {
-                        min_bp: bp::NOT_PREFIX,
-                    });
-                }
+                // EXISTS is an operand of prefix NOT, not a higher-precedence
+                // NOT EXISTS production (bd-pnrr8). Finish the whole operand
+                // before folding a plain NOT EXISTS into its compact AST form.
+                self.controls.push(ParseControl::UnaryDone {
+                    outer_min_bp: min_bp,
+                    op: UnaryOp::Not,
+                    span: token_span,
+                });
+                self.controls.push(ParseControl::ExprStart {
+                    min_bp: bp::NOT_PREFIX,
+                });
                 return Ok(());
             }
             TokenKind::KwExists => {
@@ -3512,9 +3517,11 @@ impl<'a> ParseMachine<'a> {
         let join_type = if let Some(join_type) = self.parser.try_join_type()? {
             Some(join_type)
         } else if self.parser.eat_kind(&TokenKind::Comma) {
+            // SQLite treats `,` as `JT_INNER` (reorderable); only explicit
+            // `CROSS JOIN` sets `JT_CROSS` to lock join order (bd-hexz0).
             Some(JoinType {
                 natural: false,
-                kind: JoinKind::Cross,
+                kind: JoinKind::Inner,
             })
         } else {
             None
@@ -3732,6 +3739,21 @@ impl Parser {
         mut inner: ParsedExpr,
         span: Span,
     ) -> Result<ParsedExpr, ParseError> {
+        if op == UnaryOp::Not
+            && let Expr::Exists {
+                not,
+                span: inner_span,
+                ..
+            } = &mut inner.expr
+            && !*not
+        {
+            *not = true;
+            *inner_span = span;
+            // The compact AST still represents both NOT and EXISTS for the
+            // expression-depth limit and cached-height oracle.
+            return self.add_cached_parent(inner);
+        }
+
         if matches!(op, UnaryOp::Plus | UnaryOp::Negate)
             && inner.root == CachedRoot::UnaryPlus
             && let Expr::UnaryOp {
@@ -3841,15 +3863,7 @@ impl Parser {
                 }
                 TokenKind::Plus => Some((UnaryOp::Plus, bp::UNARY)),
                 TokenKind::Tilde => Some((UnaryOp::BitNot, bp::UNARY)),
-                TokenKind::KwNot => {
-                    if matches!(
-                        self.tokens.get(self.pos + 1).map(|token| &token.kind),
-                        Some(TokenKind::KwExists)
-                    ) {
-                        break;
-                    }
-                    Some((UnaryOp::Not, bp::NOT_PREFIX))
-                }
+                TokenKind::KwNot => Some((UnaryOp::Not, bp::NOT_PREFIX)),
                 TokenKind::LeftParen => {
                     let starts_subquery = matches!(
                         self.tokens.get(self.pos + 1).map(|token| &token.kind),
@@ -4023,6 +4037,16 @@ impl Parser {
                 token_span,
             ))),
             TokenKind::KwNull => Ok(ParsedExpr::leaf(Expr::Literal(Literal::Null, token_span))),
+            TokenKind::KwTrue
+                if matches!(self.peek_kind(), TokenKind::Dot | TokenKind::LeftParen) =>
+            {
+                self.parse_ident_expr("true", token_span)
+            }
+            TokenKind::KwFalse
+                if matches!(self.peek_kind(), TokenKind::Dot | TokenKind::LeftParen) =>
+            {
+                self.parse_ident_expr("false", token_span)
+            }
             TokenKind::KwTrue => Ok(ParsedExpr::leaf(Expr::Literal(Literal::True, token_span))),
             TokenKind::KwFalse => Ok(ParsedExpr::leaf(Expr::Literal(Literal::False, token_span))),
             TokenKind::KwCurrentTime => Ok(ParsedExpr::leaf(Expr::Literal(
@@ -4094,26 +4118,6 @@ impl Parser {
 
             // ── Prefix NOT ──────────────────────────────────────────────
             TokenKind::KwNot => {
-                // NOT EXISTS (subquery)
-                if matches!(self.peek_kind(), TokenKind::KwExists) {
-                    self.advance_token();
-                    self.expect_kind(&TokenKind::LeftParen)?;
-                    let subquery = self.parse_subquery_minimal()?;
-                    let end = self.expect_kind(&TokenKind::RightParen)?;
-                    let span = token_span.merge(end);
-                    let height = subquery.height;
-                    let exists = self.checked_expr(
-                        Expr::Exists {
-                            subquery: Box::new(subquery.value),
-                            not: true,
-                            span,
-                        },
-                        height,
-                        false,
-                        false,
-                    )?;
-                    return self.add_cached_parent(exists);
-                }
                 let inner = self.parse_expr_bp(bp::NOT_PREFIX)?;
                 let span = token_span.merge(inner.expr.span());
                 self.finish_unary(UnaryOp::Not, inner, span)
@@ -6097,6 +6101,10 @@ mod tests {
         for (sql, expected_height) in [
             ("NOT 1", 2),
             ("NOT EXISTS (SELECT 1)", 3),
+            ("NOT EXISTS (SELECT 1) + 10", 4),
+            ("NOT NOT EXISTS (SELECT 1)", 4),
+            ("NOT NOT EXISTS (SELECT 1) + 10", 5),
+            ("(NOT EXISTS (SELECT 1)) + 10", 4),
             ("1 BETWEEN 2 AND 3", 2),
             ("1 NOT BETWEEN 2 AND 3", 3),
             ("1 LIKE 2", 2),
@@ -6459,6 +6467,107 @@ mod tests {
     fn test_not_exists_subquery() {
         let expr = parse("NOT EXISTS (SELECT 1)");
         assert!(matches!(expr, Expr::Exists { not: true, .. }));
+    }
+
+    #[test]
+    fn test_not_exists_obeys_prefix_not_precedence() {
+        for suffix in [
+            "+ 10",
+            "- 1",
+            "* 0",
+            "/ 2",
+            "% 2",
+            "|| '0'",
+            "<< 1",
+            ">> 1",
+            "& 1",
+            "| 2",
+            "= 0",
+            "!= 1",
+            "< 2",
+            ">= 0",
+            "IS 0",
+            "IS NOT NULL",
+            "BETWEEN 0 AND 1",
+            "IN (0, 1)",
+            "LIKE '1'",
+            "GLOB '1'",
+            "COLLATE BINARY",
+            "ISNULL",
+            "NOTNULL",
+        ] {
+            let sql = format!("NOT EXISTS (SELECT 1) {suffix}");
+            let grouped = format!("NOT (EXISTS (SELECT 1) {suffix})");
+            let expr = parse(&sql);
+            assert!(
+                matches!(
+                    &expr,
+                    Expr::UnaryOp {
+                        op: UnaryOp::Not,
+                        ..
+                    }
+                ),
+                "NOT must enclose the higher-precedence operand: {sql}"
+            );
+            assert_eq!(
+                expr.to_string(),
+                parse(&grouped).to_string(),
+                "NOT EXISTS must use ordinary prefix-NOT precedence: {sql}"
+            );
+            assert_machine_matches_recursive_oracle(&sql);
+            parsed_expr_height(&sql);
+        }
+    }
+
+    #[test]
+    fn test_not_exists_boolean_boundaries_and_parentheses() {
+        for (sql, grouped) in [
+            (
+                "NOT EXISTS (SELECT 1) AND 0",
+                "(NOT EXISTS (SELECT 1)) AND 0",
+            ),
+            ("NOT EXISTS (SELECT 1) OR 1", "(NOT EXISTS (SELECT 1)) OR 1"),
+            (
+                "2 + NOT EXISTS (SELECT 1) + 10",
+                "2 + (NOT (EXISTS (SELECT 1) + 10))",
+            ),
+            (
+                "NOT NOT EXISTS (SELECT 1) + 10",
+                "NOT (NOT (EXISTS (SELECT 1) + 10))",
+            ),
+        ] {
+            assert_eq!(
+                parse(sql).to_string(),
+                parse(grouped).to_string(),
+                "prefix-NOT boundary differs: {sql}"
+            );
+            assert_machine_matches_recursive_oracle(sql);
+            parsed_expr_height(sql);
+        }
+
+        let grouped = parse("(NOT EXISTS (SELECT 1)) + 10");
+        assert!(matches!(
+            grouped,
+            Expr::BinaryOp {
+                op: BinaryOp::Add,
+                ..
+            }
+        ));
+        assert_ne!(
+            parse("NOT EXISTS (SELECT 1) + 10").to_string(),
+            parse("(NOT EXISTS (SELECT 1)) + 10").to_string(),
+            "explicit parentheses must still change the grouping"
+        );
+        assert!(matches!(
+            parse("NOT NOT EXISTS (SELECT 1)"),
+            Expr::UnaryOp {
+                op: UnaryOp::Not,
+                expr,
+                ..
+            } if matches!(*expr, Expr::Exists { not: true, .. })
+        ));
+        assert_machine_matches_recursive_oracle("NOT NOT EXISTS (SELECT 1)");
+        parsed_expr_height("NOT NOT EXISTS (SELECT 1)");
     }
 
     #[test]

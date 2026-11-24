@@ -2284,6 +2284,18 @@ impl NormalizedColumnComparison {
     }
 }
 
+/// Whether membership implies a non-NULL left operand for partial-index selection.
+///
+/// SQLite folds a literal empty list to a constant. A table or subquery may
+/// be empty at execution, making `NULL NOT IN` that set true.
+#[must_use]
+pub fn membership_proves_non_null_lhs(set: &InSet, negated: bool) -> bool {
+    match set {
+        InSet::List(items) => !items.is_empty(),
+        InSet::Subquery(_) | InSet::Table(_) => !negated,
+    }
+}
+
 fn expr_guarantees_non_null(
     expr: &Expr,
     predicate_column: &WhereColumn,
@@ -2323,13 +2335,7 @@ fn expr_guarantees_non_null(
             not,
             ..
         } => {
-            // SQLite makes `NULL NOT IN` true when the RHS is empty. A
-            // subquery/table may be empty at execution, and an explicit empty
-            // list is empty by construction, so those negative forms do not
-            // prove the left operand non-NULL. A non-empty literal list does:
-            // with a NULL left operand its result is NULL, never true.
-            let proves_non_null = !*not || matches!(set, InSet::List(items) if !items.is_empty());
-            proves_non_null
+            membership_proves_non_null_lhs(set, *not)
                 && extract_where_column(inner).is_some_and(|column| {
                     where_columns_match_partial_index(
                         &column,
@@ -2361,12 +2367,6 @@ fn direct_comparison_guarantees_non_null(
     index_table: &str,
     unqualified_terms_are_table_local: bool,
 ) -> bool {
-    let Expr::BinaryOp {
-        left, op, right, ..
-    } = expr
-    else {
-        return false;
-    };
     let column_matches = |candidate: &Expr| {
         extract_where_column(candidate).is_some_and(|column| {
             where_columns_match_partial_index(
@@ -2376,6 +2376,20 @@ fn direct_comparison_guarantees_non_null(
                 unqualified_terms_are_table_local,
             )
         })
+    };
+    let Expr::BinaryOp {
+        left, op, right, ..
+    } = expr
+    else {
+        return match expr {
+            Expr::Column(..) => column_matches(expr),
+            Expr::UnaryOp {
+                op: fsqlite_ast::UnaryOp::Not,
+                expr,
+                ..
+            } => column_matches(expr),
+            _ => false,
+        };
     };
     let is_explicit_null = |candidate: &Expr| {
         let mut candidate = candidate;
@@ -2410,14 +2424,8 @@ fn direct_comparison_guarantees_non_null(
             (column_matches(left) && !is_explicit_null(right))
                 || (column_matches(right) && !is_explicit_null(left))
         }
-        // Unlike ordinary comparisons, `NULL IS NULL` is TRUE. Only admit an
-        // IS proof when the opposite side is a source-level non-NULL literal;
-        // a placeholder may bind NULL and must remain fail-closed.
-        AstBinaryOp::Is => {
-            let is_non_null_literal = |candidate: &Expr| matches!(candidate, Expr::Literal(literal, _) if !matches!(literal, Literal::Null));
-            (column_matches(left) && is_non_null_literal(right))
-                || (column_matches(right) && is_non_null_literal(left))
-        }
+        // SQLite uses truth tests as proof. Ordinary IS is a value comparison.
+        AstBinaryOp::Is => op.truth_test(right).is_some() && column_matches(left),
         _ => false,
     }
 }
@@ -6112,6 +6120,7 @@ pub fn try_constant_fold(expr: &Expr) -> FoldResult {
     enum FoldTask<'a> {
         Visit(&'a Expr),
         ApplyUnary(fsqlite_ast::UnaryOp),
+        ApplyTruth { expected: bool, negated: bool },
         ApplyBinary(AstBinaryOp),
     }
 
@@ -6132,8 +6141,15 @@ pub fn try_constant_fold(expr: &Expr) -> FoldResult {
             FoldTask::Visit(Expr::BinaryOp {
                 left, op, right, ..
             }) => {
-                tasks.push(FoldTask::ApplyBinary(*op));
-                tasks.push(FoldTask::Visit(right));
+                if let Some(expected) = op.truth_test(right) {
+                    tasks.push(FoldTask::ApplyTruth {
+                        expected,
+                        negated: *op == AstBinaryOp::IsNot,
+                    });
+                } else {
+                    tasks.push(FoldTask::ApplyBinary(*op));
+                    tasks.push(FoldTask::Visit(right));
+                }
                 tasks.push(FoldTask::Visit(left));
             }
             FoldTask::Visit(_) => values.push(FoldResult::NotConstant),
@@ -6151,6 +6167,19 @@ pub fn try_constant_fold(expr: &Expr) -> FoldResult {
                     return FoldResult::NotConstant;
                 };
                 values.push(fold_binary_literals(op, left, right));
+            }
+            FoldTask::ApplyTruth { expected, negated } => {
+                let result = match values.pop() {
+                    Some(FoldResult::Literal(left)) => fold_truth(&left).map(|truth| {
+                        let matches = matches!(
+                            (truth, expected),
+                            (FoldTruth::True, true) | (FoldTruth::False, false)
+                        );
+                        FoldResult::Literal(boolean_literal(matches != negated))
+                    }),
+                    _ => None,
+                };
+                values.push(result.unwrap_or(FoldResult::NotConstant));
             }
         }
     }
@@ -6309,14 +6338,6 @@ fn sqlite_is_equal(left: &Literal, right: &Literal) -> Option<bool> {
     }
 }
 
-fn sqlite_is_result(left: &Literal, right: &Literal) -> Option<bool> {
-    match right {
-        Literal::True => fold_truth(left).map(|truth| matches!(truth, FoldTruth::True)),
-        Literal::False => fold_truth(left).map(|truth| matches!(truth, FoldTruth::False)),
-        _ => sqlite_is_equal(left, right),
-    }
-}
-
 fn fold_logical(op: AstBinaryOp, left: &Literal, right: &Literal) -> FoldResult {
     let (Some(left), Some(right)) = (fold_truth(left), fold_truth(right)) else {
         return FoldResult::NotConstant;
@@ -6443,7 +6464,7 @@ fn fold_binary_literals(op: AstBinaryOp, left: FoldResult, right: FoldResult) ->
 
     match op {
         AstBinaryOp::Is | AstBinaryOp::IsNot => {
-            let Some(equal) = sqlite_is_result(&left, &right) else {
+            let Some(equal) = sqlite_is_equal(&left, &right) else {
                 return FoldResult::NotConstant;
             };
             return FoldResult::Literal(boolean_literal(if op == AstBinaryOp::Is {
@@ -8398,7 +8419,7 @@ mod tests {
             right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
             span: Span::ZERO,
         };
-        assert!(expr_implies_partial_predicate(
+        assert!(!expr_implies_partial_predicate(
             &is_non_null_literal,
             &is_not_null,
             "t",
@@ -8799,8 +8820,8 @@ mod tests {
     fn test_partial_index_expr_guarantees_non_null_for_matching_column() {
         // expr_guarantees_non_null reports whether a WHERE expression can be
         // true only when the target column is non-NULL. Explicit IS NOT NULL,
-        // comparisons, positive IN, and non-empty literal NOT IN can qualify;
-        // empty or runtime-sized NOT IN right-hand sides, function-backed
+        // comparisons, IN with a non-empty list or a subquery, and non-empty
+        // literal NOT IN can qualify. Empty lists, runtime-sized NOT IN, function-backed
         // pattern operators, IS NULL, and predicates on another column do not.
         let pcol = WhereColumn {
             table: None,
@@ -8905,8 +8926,20 @@ mod tests {
             "a table-form NOT IN RHS may be empty at execution"
         );
         assert!(
-            expr_guarantees_non_null(&in_expr(InSet::List(Vec::new()), false), &pcol, "t", true),
-            "positive IN can only be true for a non-NULL left operand"
+            !expr_guarantees_non_null(&in_expr(InSet::List(Vec::new()), false), &pcol, "t", true),
+            "SQLite folds an explicit empty IN list to false before choosing indexes"
+        );
+        assert!(
+            expr_guarantees_non_null(
+                &in_expr(
+                    InSet::List(vec![Expr::Literal(Literal::Integer(9), Span::ZERO)]),
+                    false,
+                ),
+                &pcol,
+                "t",
+                true,
+            ),
+            "a non-empty positive IN list excludes a NULL left operand"
         );
 
         // An IS NOT NULL on a DIFFERENT column does not help.
@@ -14901,6 +14934,20 @@ mod tests {
             let expr = fold_binary(fold_literal(left), op, fold_literal(right));
             assert_eq!(try_constant_fold(&expr), FoldResult::Literal(expected));
         }
+
+        let computed_true = fold_binary(
+            fold_literal(Literal::Integer(1)),
+            AstBinaryOp::Eq,
+            fold_literal(Literal::Integer(1)),
+        );
+        assert_eq!(
+            try_constant_fold(&fold_binary(
+                fold_literal(Literal::Integer(2)),
+                AstBinaryOp::Is,
+                computed_true
+            )),
+            FoldResult::Literal(Literal::False)
+        );
 
         let ordinary_equality = fold_binary(
             fold_literal(Literal::Null),

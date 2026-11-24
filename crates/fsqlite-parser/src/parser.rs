@@ -294,8 +294,8 @@ pub(crate) struct HeightTracked<T> {
 pub struct Parser {
     pub(crate) tokens: Vec<Token>,
     // The source text, kept only where token spelling matters: cache PRAGMAs
-    // interpret a number's spelling, not the decoded value, and a virtual
-    // table's module arguments are their source text, as in stock. Only
+    // interpret a number's spelling, virtual table modules receive their
+    // argument text, and ATTACH retains the case of keyword aliases. Only
     // from_sql can retain it; caller-built token streams have already lost
     // e.g. the distinction between 1e3 and 1000.0.
     source_sql: Option<String>,
@@ -388,11 +388,12 @@ impl Parser {
 
     fn preserve_source_where_needed(&mut self, sql: &str) {
         // Ordinary SQL does not need a second copy of its source text.
-        if self
-            .tokens
-            .iter()
-            .any(|token| matches!(token.kind, TokenKind::KwPragma | TokenKind::KwVirtual))
-        {
+        if self.tokens.iter().any(|token| {
+            matches!(
+                token.kind,
+                TokenKind::KwPragma | TokenKind::KwVirtual | TokenKind::KwAttach
+            )
+        }) {
             self.source_sql = Some(sql.to_owned());
         }
     }
@@ -773,18 +774,12 @@ impl Parser {
         }
     }
 
-    fn parse_dml_target_name(
-        &mut self,
-        context: DmlParseContext,
-    ) -> Result<QualifiedName, ParseError> {
+    /// A trigger body's qualified target parses here: whether stock allows it
+    /// depends on the schema the trigger lands in (a TEMP trigger may write
+    /// `main.t`, bd-82fon), which the connection decides with the catalog.
+    fn parse_dml_target_name(&mut self) -> Result<QualifiedName, ParseError> {
         let first = self.parse_identifier()?;
         if self.check(&TokenKind::Dot) {
-            if context == DmlParseContext::TriggerBody {
-                return Err(self.err_semantic(
-                    "qualified table names are not allowed on INSERT, UPDATE, and DELETE \
-                     statements within triggers",
-                ));
-            }
             self.advance();
             let second = self.parse_identifier()?;
             Ok(QualifiedName::qualified(first, second))
@@ -797,7 +792,7 @@ impl Parser {
         &mut self,
         context: DmlParseContext,
     ) -> Result<QualifiedTableRef, ParseError> {
-        let name = self.parse_dml_target_name(context)?;
+        let name = self.parse_dml_target_name()?;
         let alias = if context == DmlParseContext::TriggerBody {
             if self.eat_kw(&TokenKind::KwAs) {
                 Some(self.parse_identifier()?)
@@ -1340,7 +1335,7 @@ impl Parser {
                 joins.push(JoinClause {
                     join_type: JoinType {
                         natural: false,
-                        kind: JoinKind::Cross,
+                        kind: JoinKind::Inner,
                     },
                     table,
                     constraint,
@@ -1593,7 +1588,7 @@ impl Parser {
             }
         };
         self.eat_kw(&TokenKind::KwInto);
-        let table = self.parse_dml_target_name(context)?;
+        let table = self.parse_dml_target_name()?;
         let alias = if self.eat_kw(&TokenKind::KwAs) {
             Some(self.parse_identifier()?)
         } else {
@@ -1786,6 +1781,25 @@ impl Parser {
         };
         self.expect_token(&TokenKind::Eq)?;
         let value = self.parse_expr()?;
+        // bd-65jog: stock checks `SET (a, b) = <source>` as it parses it
+        // (sqlite3ExprListAppendVector), so a source that is not a subquery
+        // must give one value per column before any name resolves, in UPDATE,
+        // in an upsert and in a trigger body at CREATE TRIGGER. A subquery's
+        // width is checked after its names resolve, at codegen.
+        if let AssignmentTarget::ColumnList(columns) = &target
+            && !matches!(value, Expr::Subquery(..))
+        {
+            let values = match &value {
+                Expr::RowValue(items, _) => items.len(),
+                _ => 1,
+            };
+            if values != columns.len() {
+                return Err(self.err_semantic(format!(
+                    "{} columns assigned {values} values",
+                    columns.len()
+                )));
+            }
+        }
         Ok(Assignment { target, value })
     }
 
@@ -2699,7 +2713,17 @@ impl Parser {
         let _ = self.eat_kw(&TokenKind::KwDatabase);
         let expr = self.parse_expr()?;
         self.expect_kw(&TokenKind::KwAs)?;
-        let schema = self.parse_identifier()?;
+        let alias_pos = self.pos;
+        let mut schema = self.parse_identifier()?;
+        // Keyword tokens carry only their kind. Database names also appear
+        // in database_list, grouped integrity findings and SQL diagnostics.
+        let token = &self.tokens[alias_pos];
+        if token.kind.keyword_str().is_some()
+            && let Some(sql) = &self.source_sql
+            && let Some(spelling) = sql.get(token.span.start as usize..token.span.end as usize)
+        {
+            spelling.clone_into(&mut schema);
+        }
         Ok(Statement::Attach(AttachStatement { expr, schema }))
     }
 
@@ -2772,7 +2796,8 @@ impl Parser {
         self.expect_kw(&TokenKind::KwPragma)?;
         let name = self.parse_qualified_name()?;
         let preserve_numeric_spelling = name.name.eq_ignore_ascii_case("cache_size")
-            || name.name.eq_ignore_ascii_case("default_cache_size");
+            || name.name.eq_ignore_ascii_case("default_cache_size")
+            || name.name.eq_ignore_ascii_case("secure_delete");
         let value = if self.eat(&TokenKind::Eq) || self.eat(&TokenKind::EqEq) {
             Some(PragmaValue::Assign(
                 self.parse_pragma_value_expr(preserve_numeric_spelling)?,
@@ -3451,7 +3476,7 @@ mod tests {
         values
     }
 
-    fn only_join(select: &SelectStatement) -> &JoinClause {
+    fn only_join(select: &SelectStatement, expected_kind: JoinKind) -> &JoinClause {
         let SelectCore::Select {
             from: Some(from), ..
         } = &select.body.select
@@ -3461,7 +3486,7 @@ mod tests {
         let [join] = from.joins.as_slice() else {
             panic!("expected exactly one join");
         };
-        assert_eq!(join.join_type.kind, JoinKind::Cross);
+        assert_eq!(join.join_type.kind, expected_kind);
         assert!(!join.join_type.natural);
         join
     }
@@ -3470,7 +3495,7 @@ mod tests {
     fn test_comma_join_accepts_on_constraint_and_consumes_full_statement() {
         let select = parse_full_select("SELECT * FROM a, b ON a.id = b.id");
         assert!(matches!(
-            &only_join(&select).constraint,
+            &only_join(&select, JoinKind::Inner).constraint,
             Some(JoinConstraint::On(Expr::BinaryOp {
                 op: fsqlite_ast::BinaryOp::Eq,
                 ..
@@ -3482,7 +3507,7 @@ mod tests {
     fn test_comma_join_accepts_using_constraint_and_consumes_full_statement() {
         let select = parse_full_select("SELECT * FROM a, b USING(id)");
         assert!(matches!(
-            &only_join(&select).constraint,
+            &only_join(&select, JoinKind::Inner).constraint,
             Some(JoinConstraint::Using(columns))
                 if columns.len() == 1 && columns[0] == "id"
         ));
@@ -3492,7 +3517,7 @@ mod tests {
     fn test_explicit_cross_join_accepts_on_constraint_and_consumes_full_statement() {
         let select = parse_full_select("SELECT * FROM a CROSS JOIN b ON a.id = b.id");
         assert!(matches!(
-            &only_join(&select).constraint,
+            &only_join(&select, JoinKind::Cross).constraint,
             Some(JoinConstraint::On(Expr::BinaryOp {
                 op: fsqlite_ast::BinaryOp::Eq,
                 ..
@@ -4492,22 +4517,11 @@ mod tests {
 
     #[test]
     fn test_trigger_body_rejects_stock_forbidden_dml_forms_at_exact_tokens() {
+        // A qualified INSERT/UPDATE/DELETE target is not here (bd-82fon):
+        // stock refuses it only outside a TEMP trigger, which needs the
+        // catalog (an unqualified trigger on a TEMP table is TEMP), so the
+        // connection refuses it; see test_trigger_body_keeps_a_qualified_dml_target.
         for (sql, rejected) in [
-            (
-                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
-                 INSERT INTO main.audit VALUES (1); END",
-                ".",
-            ),
-            (
-                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
-                 UPDATE main.audit SET value = 1; END",
-                ".",
-            ),
-            (
-                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
-                 DELETE FROM main.audit; END",
-                ".",
-            ),
             (
                 "CREATE TRIGGER trg AFTER INSERT ON t BEGIN \
                  INSERT INTO audit DEFAULT VALUES; END",
@@ -4598,6 +4612,32 @@ mod tests {
                 rejected,
                 "the diagnostic for `{sql}` must identify the forbidden token"
             );
+        }
+    }
+
+    #[test]
+    fn test_trigger_body_keeps_a_qualified_dml_target() {
+        // bd-82fon: the parser keeps the schema; whether stock allows it (only
+        // in a TEMP trigger) is decided by the connection with the catalog.
+        for sql in [
+            "CREATE TRIGGER trg AFTER INSERT ON t BEGIN INSERT INTO main.audit VALUES (1); END",
+            "CREATE TEMP TRIGGER trg AFTER INSERT ON t BEGIN UPDATE main.audit SET value = 1; END",
+            "CREATE TRIGGER temp.trg AFTER INSERT ON t BEGIN DELETE FROM main.audit; END",
+        ] {
+            let Ok(Some((statement, _))) = parse_first_statement_with_tail(sql) else {
+                panic!("`{sql}` must parse");
+            };
+            let Statement::CreateTrigger(trigger) = statement else {
+                panic!("`{sql}` must parse to CREATE TRIGGER");
+            };
+            let target = match &trigger.body[..] {
+                [Statement::Insert(insert)] => &insert.table,
+                [Statement::Update(update)] => &update.table.name,
+                [Statement::Delete(delete)] => &delete.table.name,
+                other => panic!("unexpected body for `{sql}`: {other:?}"),
+            };
+            assert_eq!(target.schema.as_deref(), Some("main"), "`{sql}`");
+            assert_eq!(target.name, "audit", "`{sql}`");
         }
     }
 
@@ -5633,13 +5673,14 @@ mod tests {
 
     #[test]
     fn test_parser_join_comma() {
-        // Comma-join is an implicit cross join.
+        // Comma-join is a reorderable inner join (`JT_INNER`), distinct from
+        // explicit `CROSS JOIN` (`JT_CROSS`, which locks join order).
         let stmt = parse_one("SELECT * FROM a, b WHERE a.id = b.a_id");
         if let Statement::Select(s) = stmt {
             if let SelectCore::Select { from, .. } = &s.body.select {
                 let from = from.as_ref().expect("FROM clause");
                 assert!(!from.joins.is_empty());
-                assert_eq!(from.joins[0].join_type.kind, JoinKind::Cross);
+                assert_eq!(from.joins[0].join_type.kind, JoinKind::Inner);
             } else {
                 unreachable!("expected Select core");
             }
@@ -9810,11 +9851,19 @@ mod tests {
 
     #[test]
     fn test_attach_database() {
-        let stmt = parse_one("ATTACH DATABASE 'other.db' AS other");
-        if let Statement::Attach(a) = stmt {
-            assert_eq!(a.schema, "other");
-        } else {
-            unreachable!("expected Attach");
+        for (spelling, expected) in [
+            ("other", "other"),
+            ("FiRst", "FiRst"),
+            ("LaSt", "LaSt"),
+            ("\"FiRst\"", "FiRst"),
+            ("'FiRst''Db'", "FiRst'Db"),
+        ] {
+            let Statement::Attach(attach) =
+                parse_one(&format!("ATTACH DATABASE 'other.db' AS {spelling}"))
+            else {
+                unreachable!("expected Attach");
+            };
+            assert_eq!(attach.schema, expected);
         }
     }
 
@@ -11570,6 +11619,40 @@ mod tests {
             }
         } else {
             unreachable!("expected Select");
+        }
+    }
+
+    /// bd-65jog: stock's parser checks a column list's source size.
+    #[test]
+    fn set_column_list_source_size_is_checked_while_parsing() {
+        for (sql, message) in [
+            (
+                "UPDATE t SET (a, b) = (1, 2, 3)",
+                "2 columns assigned 3 values",
+            ),
+            ("UPDATE t SET (a, b) = 1", "2 columns assigned 1 values"),
+            ("UPDATE t SET (a) = (1, 2)", "1 columns assigned 2 values"),
+            (
+                "INSERT INTO t VALUES (1) ON CONFLICT DO UPDATE SET (a, b) = (1, 2, 3)",
+                "2 columns assigned 3 values",
+            ),
+            (
+                "CREATE TRIGGER r AFTER INSERT ON t BEGIN UPDATE t SET (a, b, c) = (1, 2); END",
+                "3 columns assigned 2 values",
+            ),
+        ] {
+            let error = parse_first_statement_with_tail(sql).expect_err(sql);
+            assert_eq!(error.kind, ParseErrorKind::Semantic, "`{sql}`");
+            assert_eq!(error.message, message, "`{sql}`");
+        }
+        // A subquery's width is not known here; matching sizes parse.
+        for sql in [
+            "UPDATE t SET (a, b) = (SELECT 1, 2, 3)",
+            "UPDATE t SET (a, b) = (1, 2)",
+            "UPDATE t SET (a) = 5",
+            "UPDATE t SET a = (1, 2)",
+        ] {
+            parse_one(sql);
         }
     }
 }
