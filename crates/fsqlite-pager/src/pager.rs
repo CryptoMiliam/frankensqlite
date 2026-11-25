@@ -10532,6 +10532,16 @@ impl<F: VfsFile> PagerInner<F> {
         self.read_page_copy_outside_wal(cx, cache, page_no).await
     }
 
+    /// Page 1 of the empty database a read-only pager reads while its
+    /// committed main file is zero-length (see the read-only open), served
+    /// from memory: the file holds no page to read. `None` for any other read.
+    fn zero_length_page1(&self, page_no: PageNumber, file_size: u64) -> Result<Option<Vec<u8>>> {
+        if page_no != PageNumber::ONE || file_size != 0 || !self.access_mode.is_readonly() {
+            return Ok(None);
+        }
+        empty_database_page1(&empty_database_header(self.page_size)).map(Some)
+    }
+
     /// [`Self::read_page_copy`] for a page the WAL is already known not to
     /// hold for this reader: cache → disk.
     async fn read_page_copy_outside_wal(
@@ -10545,6 +10555,9 @@ impl<F: VfsFile> PagerInner<F> {
         // were allocated and then rolled back before commit.
         if page_no.get() > self.db_size {
             return Ok(vec![0_u8; self.page_size.as_usize()]);
+        }
+        if let Some(page1) = self.zero_length_page1(page_no, self.committed_db_file_size_bytes)? {
+            return Ok(page1);
         }
 
         if self.page_cipher.is_enabled() {
@@ -10582,6 +10595,9 @@ impl<F: VfsFile> PagerInner<F> {
     }
 
     async fn read_page_copy_uncached(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
+        if let Some(page1) = self.zero_length_page1(page_no, self.committed_db_file_size_bytes)? {
+            return Ok(page1);
+        }
         let page_size = self.page_size.as_usize();
         let mut out = vec![0_u8; page_size];
         let db_file = shared_db_file_read(&self.db_file, cx).await?;
@@ -10633,6 +10649,9 @@ impl<F: VfsFile> PagerInner<F> {
         let offset = u64::from(page_no.get().saturating_sub(1)) * page_size as u64;
         let db_file = shared_db_file_read(&self.db_file, cx).await?;
         let file_size = db_file.file_size(cx)?;
+        if let Some(page1) = self.zero_length_page1(page_no, file_size)? {
+            return Ok(page1);
+        }
         if offset >= file_size {
             if dk9ra_trace_enabled() && page_no.get() > 1 {
                 eprintln!(
@@ -10666,6 +10685,11 @@ impl<F: VfsFile> PagerInner<F> {
         cx: &Cx,
         file_size: u64,
     ) -> Result<[u8; DATABASE_HEADER_SIZE]> {
+        if let Some(page1) = self.zero_length_page1(PageNumber::ONE, file_size)? {
+            let mut out = [0_u8; DATABASE_HEADER_SIZE];
+            out.copy_from_slice(&page1[..DATABASE_HEADER_SIZE]);
+            return Ok(out);
+        }
         if file_size == 0 {
             return Ok([0_u8; DATABASE_HEADER_SIZE]);
         }
@@ -16024,6 +16048,32 @@ fn generate_db_file_id() -> [u8; 16] {
     id
 }
 
+/// The header of a database with no schema: one page, as a create stamps it
+/// before giving it a fresh `db_file_id`.
+fn empty_database_header(page_size: PageSize) -> DatabaseHeader {
+    DatabaseHeader {
+        page_size,
+        page_count: 1,
+        sqlite_version: FRANKENSQLITE_SQLITE_VERSION_NUMBER,
+        ..DatabaseHeader::default()
+    }
+}
+
+/// Page 1 of a database with no schema: `header`, then `sqlite_master`'s root
+/// as an empty leaf table B-tree page (type 0x0D) with zero cells. A create
+/// writes it; a read-only open of a zero-length main file reads it, as stock
+/// reads a zero-page file as an empty database.
+fn empty_database_page1(header: &DatabaseHeader) -> Result<Vec<u8>> {
+    let mut page1 = vec![0_u8; header.page_size.as_usize()];
+    let header_bytes = header.to_bytes().map_err(|err| {
+        FrankenError::internal(format!("failed to encode new database header: {err}"))
+    })?;
+    page1[..DATABASE_HEADER_SIZE].copy_from_slice(&header_bytes);
+    let usable = header.page_size.usable(header.reserved_per_page);
+    BTreePageHeader::write_empty_leaf_table(&mut page1, DATABASE_HEADER_SIZE, usable);
+    Ok(page1)
+}
+
 fn bootstrap_header_from_stale_main_file(
     header_bytes: &[u8; DATABASE_HEADER_SIZE],
     page_size: PageSize,
@@ -21312,9 +21362,15 @@ where
             .await?
                 == 0
         {
-            // Existing-only open never lets a sidecar bootstrap an empty main
-            // file, even if that sidecar looks like a valid hot journal.
-            return Err(FrankenError::CannotOpen { path: db_path });
+            // A zero-length main file is an empty database, as stock opens it
+            // (a create killed before its first page-1 write leaves one), and
+            // is bootstrapped below as a create bootstraps it. Existing-only
+            // open still never lets a sidecar bootstrap an empty main file,
+            // even if that sidecar looks like a valid hot journal: stock
+            // deletes a journal or WAL beside a zero-page database, and this
+            // open neither deletes nor replays one. Rechecked under the
+            // bootstrap's EXCLUSIVE lock.
+            Self::ensure_reserved_recovery_artifacts_absent(cx, &*vfs, &db_path)?;
         }
 
         // bd-qgh42 (GH#366): a ReservedEmpty open whose file is ALREADY a coherent
@@ -21428,7 +21484,12 @@ where
                         }
                     }
                     let file_size = db_file.file_size(cx)?;
-                    if *disposition == ReadWriteOpenDisposition::ExistingOnly && file_size == 0 {
+                    // A journal proven non-hot above still never bootstraps an
+                    // empty main file under existing-only open.
+                    if *disposition == ReadWriteOpenDisposition::ExistingOnly
+                        && file_size == 0
+                        && vfs.access(cx, journal_path, AccessFlags::EXISTS)?
+                    {
                         return Err(FrankenError::CannotOpen {
                             path: db_path.clone(),
                         });
@@ -21470,7 +21531,7 @@ where
                 }
                 Err(_) => requested_page_size,
             }
-        } else if disposition == ReadWriteOpenDisposition::ExistingOnly {
+        } else if disposition == ReadWriteOpenDisposition::ExistingOnly && file_size != 0 {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
                     "database file too small for header: {file_size} bytes (< {DATABASE_HEADER_SIZE})"
@@ -21490,17 +21551,20 @@ where
                 true,
             )
         } else if file_size == 0 {
-            if disposition == ReadWriteOpenDisposition::ExistingOnly {
-                return Err(FrankenError::CannotOpen { path: db_path });
-            }
             let reserved_bootstrap = disposition == ReadWriteOpenDisposition::ReservedEmpty;
+            // An existing-only open of a zero-length main file bootstraps the
+            // empty database it is (see the size probe above) under the same
+            // EXCLUSIVE lock as a reserved slot, so a peer that wrote page 1
+            // since that probe is never overwritten: the open answers Busy,
+            // its bootstrap retry opens the file as it now is.
+            let existing_bootstrap = disposition == ReadWriteOpenDisposition::ExistingOnly;
             // bd-dd24l (GH#376): `pre_open_lock_sidecars` is snapshotted ABOVE,
             // before the VFS open that creates our own advisory-lock sidecars.
             // Snapshotting it HERE (after that open) captured our own sidecars
             // and made the AllowExpected reserved validation reject the target,
             // breaking Windows `VACUUM INTO`. The reserved bootstrap still runs
             // the cooperative lock below; only the witness capture moved earlier.
-            let mut bootstrap_lock = reserved_bootstrap.then(|| {
+            let mut bootstrap_lock = (reserved_bootstrap || existing_bootstrap).then(|| {
                 BeginExternalLockState::new(&group_commit_queue, Arc::clone(&db_file), cx)
             });
             if let Some(lock) = bootstrap_lock.as_mut() {
@@ -21528,36 +21592,37 @@ where
                     }
                     Self::ensure_reserved_recovery_artifacts_absent(cx, &*vfs, &db_path)?;
                 }
+                if existing_bootstrap {
+                    if file.file_size(cx)? != 0 {
+                        return Err(FrankenError::Busy);
+                    }
+                    if expected_identity.is_some() && file.file_identity()? != expected_identity {
+                        return Err(FrankenError::CannotOpen {
+                            path: db_path.clone(),
+                        });
+                    }
+                    #[cfg(all(feature = "native", any(unix, windows)))]
+                    if let Some(binding) = &namespace_binding {
+                        binding.validate_path_identity()?;
+                    }
+                    Self::ensure_reserved_recovery_artifacts_absent(cx, &*vfs, &db_path)?;
+                }
 
                 // SQLite databases are never truly empty: page 1 contains the
                 // 100-byte database header followed by the sqlite_master root page.
                 //
                 // This makes newly-created databases valid for downstream layers
                 // (B-tree, schema) and avoids surprising "empty file" semantics.
-                let page_len = page_size.as_usize();
-                let mut page1 = vec![0u8; page_len];
-
                 let header = DatabaseHeader {
-                    page_size,
-                    page_count: 1,
-                    sqlite_version: FRANKENSQLITE_SQLITE_VERSION_NUMBER,
                     // bd-85x9y / GH#364: stamp a fresh creation-stable db-file
                     // identity at create time so durable parallel-WAL commit
                     // certificates bind to this exact physical database and a
                     // stale certificate from a replaced file is rejected on
                     // reopen. Byte-faithful to stock (reserved region 76..92).
                     db_file_id: generate_db_file_id(),
-                    ..DatabaseHeader::default()
+                    ..empty_database_header(page_size)
                 };
-                let hdr_bytes = header.to_bytes().map_err(|err| {
-                    FrankenError::internal(format!("failed to encode new database header: {err}"))
-                })?;
-                page1[..DATABASE_HEADER_SIZE].copy_from_slice(&hdr_bytes);
-
-                // Initialize sqlite_master root page as an empty leaf table B-tree
-                // page (type 0x0D) with zero cells.
-                let usable = page_size.usable(header.reserved_per_page);
-                BTreePageHeader::write_empty_leaf_table(&mut page1, DATABASE_HEADER_SIZE, usable);
+                let page1 = empty_database_page1(&header)?;
 
                 file.write(cx, &page1, 0).await?;
                 file.sync(cx, SyncFlags::NORMAL)?;
@@ -22174,9 +22239,20 @@ where
                         }
                         let file_size = db_file.file_size(cx)?;
                         if file_size == 0 {
-                            return Err(FrankenError::CannotOpen {
-                                path: db_path.clone(),
-                            });
+                            // A zero-length main file is an empty database, as
+                            // stock reads one (a create killed before its first
+                            // page-1 write leaves one); its header is filled in
+                            // below. A journal, WAL, WAL FEC or WAL index beside
+                            // it keeps the open refused: stock deletes a journal
+                            // or WAL beside a zero-page database, and a reader
+                            // neither deletes nor replays one. An immutable open
+                            // reads the main file alone.
+                            if !*immutable {
+                                Self::ensure_reserved_recovery_artifacts_absent(
+                                    cx, &**vfs, db_path,
+                                )?;
+                            }
+                            return Ok((0, [0_u8; DATABASE_HEADER_SIZE]));
                         }
                         if file_size < DATABASE_HEADER_SIZE as u64 {
                             return Err(FrankenError::DatabaseCorrupt {
@@ -22200,9 +22276,24 @@ where
                 },
             )
             .await?;
+            // The empty database a zero-length main file is: the header of
+            // the page 1 its reads are served from memory (see
+            // `PagerInner::zero_length_page1`).
+            let header_bytes = if file_size == 0 {
+                empty_database_header(_requested_page_size)
+                    .to_bytes()
+                    .map_err(|err| {
+                        FrankenError::internal(format!(
+                            "failed to encode the empty database header: {err}"
+                        ))
+                    })?
+            } else {
+                header_bytes
+            };
             let (header, page_size) = match DatabaseHeader::from_bytes(&header_bytes) {
                 Ok(header)
-                    if !immutable
+                    if file_size != 0
+                        && !immutable
                         && stale_main_header_can_be_recovered_from_live_wal(
                             cx,
                             &*vfs,
@@ -22249,6 +22340,9 @@ where
         // corruption — floor to whole pages (see the read-write open above).
         let db_pages = if defer_locked_header {
             0
+        } else if file_size == 0 {
+            // The empty database's one page, served from memory.
+            1
         } else {
             file_size
                 .checked_div(page_size_u64)

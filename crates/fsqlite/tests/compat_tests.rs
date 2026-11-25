@@ -805,20 +805,42 @@ fn open_with_flags_read_write_without_create_does_not_create_missing_db() {
     });
 }
 
+/// Stock opens a zero-length file READ_WRITE as an empty database, which a
+/// create killed before its first page-1 write leaves behind (see
+/// `zero_length_main_file_opens_empty.rs`). This open writes that empty
+/// database's page 1, as a CREATE open of a zero-length file always has;
+/// stock writes it with the first write.
 #[test]
-fn open_with_flags_read_write_without_create_preserves_empty_db() {
+fn open_with_flags_read_write_without_create_opens_empty_db_as_stock() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("empty.db");
         std::fs::write(&path, []).unwrap();
-        let before = std::fs::read(&path).unwrap();
 
-        let error = open_with_flags(path.to_str().unwrap(), OpenFlags::SQLITE_OPEN_READ_WRITE)
+        let conn = open_with_flags(path.to_str().unwrap(), OpenFlags::SQLITE_OPEN_READ_WRITE)
             .await
-            .expect_err("READ_WRITE without CREATE must not initialize an empty database");
+            .expect("READ_WRITE without CREATE opens a zero-length file as an empty database");
+        let tables = conn
+            .query("SELECT name FROM sqlite_master")
+            .await
+            .expect("read the empty schema");
+        assert!(
+            tables.is_empty(),
+            "an empty database has no schema: {tables:?}"
+        );
+        conn.execute("CREATE TABLE t(x INTEGER)")
+            .await
+            .expect("the first write creates the schema");
+        conn.execute("INSERT INTO t VALUES (7)")
+            .await
+            .expect("insert into the new table");
+        conn.close().await.expect("close");
 
-        assert!(matches!(error, FrankenError::CannotOpen { .. }));
-        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let stock = RusqliteConnection::open(&path).unwrap();
+        let value: i64 = stock
+            .query_row("SELECT x FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, 7, "stock reads what the open wrote");
     });
 }
 
